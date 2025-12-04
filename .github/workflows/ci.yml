@@ -97,7 +97,7 @@ jobs:
         working-directory: consensus
     env:
       # Reduce property-test volume so Miri doesn't become prohibitively slow.
-      PROPTEST_CASES: 50
+      PROPTEST_CASES: 5
       MIRIFLAGS: "-Zmiri-strict-provenance"
     steps:
       - uses: actions/checkout@v4
