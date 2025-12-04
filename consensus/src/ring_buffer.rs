@@ -137,7 +137,7 @@ impl<T, const N: usize> RingBuffer<T, N> {
     }
 
     /// Borrows the oldest element without removal.
-    pub fn front(&mut self) -> Option<&T> {
+    pub fn front(&self) -> Option<&T> {
         if self.is_empty() {
             return None;
         }
@@ -238,7 +238,10 @@ impl<T, const N: usize> Drop for RingBuffer<T, N> {
 mod tests {
     use super::RingBuffer;
     use std::cell::Cell;
+    use std::collections::VecDeque;
     use std::rc::Rc;
+
+    use proptest::prelude::*;
 
     #[derive(Debug)]
     struct DropTracker {
@@ -259,10 +262,34 @@ mod tests {
     }
 
     #[test]
-    fn ring_buffer_construction() {
-        let r: RingBuffer<u32, 8> = RingBuffer::new();
-        assert_eq!(r.head, 0);
-        assert_eq!(r.len, 0);
+    fn new_buffer_is_empty_with_correct_capacity() {
+        let mut rb: RingBuffer<i32, 8> = RingBuffer::new();
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+        assert_eq!(rb.capacity(), 8);
+        assert_eq!(rb.front(), None);
+        assert_eq!(rb.pop_front(), None);
+    }
+
+    #[test]
+    fn default_creates_empty_buffer() {
+        let rb: RingBuffer<i32, 4> = RingBuffer::default();
+        assert!(rb.is_empty());
+        assert_eq!(rb.len(), 0);
+        assert_eq!(rb.capacity(), 4);
+    }
+
+    #[test]
+    fn operations_on_empty_buffer_return_none() {
+        let mut rb: RingBuffer<i32, 4> = RingBuffer::new();
+        assert_eq!(rb.pop_front(), None);
+        assert_eq!(rb.front(), None);
+        assert_eq!(rb.front_mut(), None);
+        assert_eq!(rb.get(0), None);
+        assert_eq!(rb.get_mut(0), None);
+        // Verify buffer is still usable after operations on empty
+        rb.push_back_assume_capacity(42);
+        assert_eq!(rb.front(), Some(&42));
     }
 
     #[test]
@@ -360,5 +387,287 @@ mod tests {
         }
         // Drop should also clear any remaining elements.
         assert_eq!(drops.get(), 4);
+    }
+
+    #[test]
+    fn drop_clears_elements_with_head_offset() {
+        let drops = Rc::new(Cell::new(0));
+        {
+            let mut rb: RingBuffer<DropTracker, 4> = RingBuffer::new();
+            rb.push_back_assume_capacity(DropTracker::new(1, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(2, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(3, Rc::clone(&drops)));
+
+            // Advance head so Drop must walk from a non-zero offset.
+            drop(rb.pop_front());
+
+            // Remaining elements should be released when rb drops.
+            assert_eq!(drops.get(), 1);
+        }
+
+        assert_eq!(drops.get(), 3);
+    }
+
+    #[test]
+    fn drop_with_buffer_in_wrapped_state() {
+        let drops = Rc::new(Cell::new(0));
+        {
+            let mut rb: RingBuffer<DropTracker, 3> = RingBuffer::new();
+
+            // Fill: physical [1, 2, 3], head=0, len=3
+            rb.push_back_assume_capacity(DropTracker::new(1, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(2, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(3, Rc::clone(&drops)));
+
+            // Pop two: physical [_, _, 3], head=2, len=1
+            rb.pop_front(); // drops 1
+            rb.pop_front(); // drops 2
+
+            // Push two: physical [4, 5, 3], head=2, len=3 (WRAPPED: tail < head)
+            rb.push_back_assume_capacity(DropTracker::new(4, Rc::clone(&drops)));
+            rb.push_back_assume_capacity(DropTracker::new(5, Rc::clone(&drops)));
+
+            assert_eq!(drops.get(), 2); // Only 1 and 2 dropped so far
+            assert!(rb.is_full());
+
+            // Verify logical order is [3, 4, 5]
+            assert_eq!(rb.get(0).map(|t| t.value), Some(3));
+            assert_eq!(rb.get(1).map(|t| t.value), Some(4));
+            assert_eq!(rb.get(2).map(|t| t.value), Some(5));
+
+            // Buffer drops here - must correctly drop 3, 4, 5
+        }
+
+        // All 5 elements should have been dropped exactly once
+        assert_eq!(drops.get(), 5);
+    }
+
+    #[derive(Debug)]
+    struct OrderTracker {
+        value: i32,
+        order: Rc<std::cell::RefCell<Vec<i32>>>,
+    }
+
+    impl OrderTracker {
+        fn new(value: i32, order: Rc<std::cell::RefCell<Vec<i32>>>) -> Self {
+            Self { value, order }
+        }
+    }
+
+    impl Drop for OrderTracker {
+        fn drop(&mut self) {
+            self.order.borrow_mut().push(self.value);
+        }
+    }
+
+    #[test]
+    fn drops_occur_in_fifo_order() {
+        let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let mut rb: RingBuffer<OrderTracker, 3> = RingBuffer::new();
+            rb.push_back_assume_capacity(OrderTracker::new(1, Rc::clone(&order)));
+            rb.push_back_assume_capacity(OrderTracker::new(2, Rc::clone(&order)));
+            rb.push_back_assume_capacity(OrderTracker::new(3, Rc::clone(&order)));
+            // rb drops here via Drop trait
+        }
+        // clear() uses pop_front() which should drop in FIFO order
+        assert_eq!(*order.borrow(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn drops_occur_in_fifo_order_wrapped() {
+        let order = Rc::new(std::cell::RefCell::new(Vec::new()));
+        {
+            let mut rb: RingBuffer<OrderTracker, 3> = RingBuffer::new();
+            rb.push_back_assume_capacity(OrderTracker::new(1, Rc::clone(&order)));
+            rb.push_back_assume_capacity(OrderTracker::new(2, Rc::clone(&order)));
+            rb.pop_front(); // drops 1
+            rb.push_back_assume_capacity(OrderTracker::new(3, Rc::clone(&order)));
+            rb.push_back_assume_capacity(OrderTracker::new(4, Rc::clone(&order)));
+            // Buffer is wrapped: logical [2, 3, 4]
+        }
+        // Should drop in FIFO order: 1 (from pop), then 2, 3, 4 (from Drop)
+        assert_eq!(*order.borrow(), vec![1, 2, 3, 4]);
+    }
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Push(i32),
+        Pop,
+        Get(u8),
+        Front,
+        Clear,
+    }
+
+    proptest! {
+        #[test]
+        fn prop_sequence_matches_vecdeque(ops in prop::collection::vec(
+            prop_oneof![
+                any::<i32>().prop_map(Op::Push),
+                Just(Op::Pop),
+                any::<u8>().prop_map(Op::Get),
+                Just(Op::Front),
+                Just(Op::Clear),
+            ],
+            1..200,
+        )) {
+            const CAPACITY: usize = 8;
+
+            let mut rb: RingBuffer<i32, CAPACITY> = RingBuffer::new();
+            let mut dq: VecDeque<i32> = VecDeque::with_capacity(CAPACITY);
+
+            for op in ops {
+                match op {
+                    Op::Push(v) => {
+                        let was_full = dq.len() == CAPACITY;
+                        let rb_res = rb.push_back(v);
+                        if was_full {
+                            prop_assert!(rb_res.is_err());
+                            prop_assert_eq!(rb_res.unwrap_err(), v);
+                        } else {
+                            prop_assert!(rb_res.is_ok());
+                            dq.push_back(v);
+                        }
+                    }
+                    Op::Pop => {
+                        prop_assert_eq!(rb.pop_front(), dq.pop_front());
+                    }
+                    Op::Get(idx) => {
+                        let idx = (idx as usize) % (CAPACITY + 2);
+                        prop_assert_eq!(rb.get(idx as u32).copied(), dq.get(idx).copied());
+                    }
+                    Op::Front => {
+                        prop_assert_eq!(rb.front().copied(), dq.front().copied());
+                    }
+                    Op::Clear => {
+                        rb.clear();
+                        dq.clear();
+                    }
+                }
+
+                prop_assert_eq!(rb.len() as usize, dq.len());
+                prop_assert_eq!(rb.is_empty(), dq.is_empty());
+                prop_assert_eq!(rb.is_full(), dq.len() == CAPACITY);
+                prop_assert!(rb.len() <= rb.capacity());
+            }
+        }
+
+        #[test]
+        fn prop_sequence_capacity_one(ops in prop::collection::vec(
+            prop_oneof![
+                any::<i32>().prop_map(Op::Push),
+                Just(Op::Pop),
+                any::<u8>().prop_map(Op::Get),
+                Just(Op::Front),
+                Just(Op::Clear),
+            ],
+            1..200,
+        )) {
+            const CAPACITY: usize = 1;
+
+            let mut rb: RingBuffer<i32, CAPACITY> = RingBuffer::new();
+            let mut dq: VecDeque<i32> = VecDeque::with_capacity(CAPACITY);
+
+            for op in ops {
+                match op {
+                    Op::Push(v) => {
+                        let was_full = dq.len() == CAPACITY;
+                        let rb_res = rb.push_back(v);
+                        if was_full {
+                            prop_assert!(rb_res.is_err());
+                            prop_assert_eq!(rb_res.unwrap_err(), v);
+                        } else {
+                            prop_assert!(rb_res.is_ok());
+                            dq.push_back(v);
+                        }
+                    }
+                    Op::Pop => {
+                        prop_assert_eq!(rb.pop_front(), dq.pop_front());
+                    }
+                    Op::Get(idx) => {
+                        let idx = (idx as usize) % (CAPACITY + 2);
+                        prop_assert_eq!(rb.get(idx as u32).copied(), dq.get(idx).copied());
+                    }
+                    Op::Front => {
+                        prop_assert_eq!(rb.front().copied(), dq.front().copied());
+                    }
+                    Op::Clear => {
+                        rb.clear();
+                        dq.clear();
+                    }
+                }
+
+                prop_assert_eq!(rb.len() as usize, dq.len());
+                prop_assert_eq!(rb.is_empty(), dq.is_empty());
+                prop_assert_eq!(rb.is_full(), dq.len() == CAPACITY);
+                prop_assert!(rb.len() <= rb.capacity());
+            }
+        }
+    }
+
+    /// Property test for verifying drop count equals successful push count.
+    /// Only creates DropTrackers for pushes that will succeed to avoid
+    /// counting failed push attempts (which return Err(value) and drop immediately).
+    #[test]
+    fn prop_drop_count_matches_push_count() {
+        use proptest::test_runner::{Config, TestRunner};
+
+        #[derive(Debug, Clone)]
+        enum DropOp {
+            Push,
+            Pop,
+            Clear,
+        }
+
+        let mut runner = TestRunner::new(Config::with_cases(500));
+        runner
+            .run(
+                &prop::collection::vec(
+                    prop_oneof![Just(DropOp::Push), Just(DropOp::Pop), Just(DropOp::Clear),],
+                    1..100,
+                ),
+                |ops| {
+                    let drops = Rc::new(Cell::new(0usize));
+                    let mut push_count = 0usize;
+
+                    {
+                        let mut rb: RingBuffer<DropTracker, 8> = RingBuffer::new();
+
+                        for op in ops {
+                            match op {
+                                DropOp::Push => {
+                                    // Only create DropTracker if there's capacity
+                                    // to avoid counting failed push drops
+                                    if !rb.is_full() {
+                                        rb.push_back_assume_capacity(DropTracker::new(
+                                            0,
+                                            Rc::clone(&drops),
+                                        ));
+                                        push_count += 1;
+                                    }
+                                }
+                                DropOp::Pop => {
+                                    rb.pop_front();
+                                }
+                                DropOp::Clear => {
+                                    rb.clear();
+                                }
+                            }
+                        }
+                        // rb drops here, remaining elements should be dropped
+                    }
+
+                    // After buffer drops, drop count must equal push count
+                    prop_assert_eq!(
+                        drops.get(),
+                        push_count,
+                        "Drop count {} != push count {}",
+                        drops.get(),
+                        push_count
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 }
