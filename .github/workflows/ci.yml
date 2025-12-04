@@ -97,7 +97,7 @@ jobs:
     env:
       # Reduce property-test volume so Miri doesn't become prohibitively slow.
       PROPTEST_CASES: 50
-      MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-tag-raw-pointers"
+      MIRIFLAGS: "-Zmiri-strict-provenance"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
