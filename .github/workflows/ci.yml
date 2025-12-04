@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 2 * * *" # nightly at 02:00 UTC
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,6 +95,8 @@ jobs:
   miri:
     name: Miri
     runs-on: ubuntu-latest
+    # Run only on the nightly schedule or manual dispatch to avoid slowing every push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     defaults:
       run:
         working-directory: consensus
