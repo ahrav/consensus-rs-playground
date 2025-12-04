@@ -23,9 +23,10 @@ jobs:
         with:
           workspaces: |
             consensus -> consensus/target
-      - uses: actions-rust-lang/audit@v1
-        with:
-          args: --manifest-path consensus/Cargo.toml
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Cargo audit
+        run: cargo audit --json
 
   fmt:
     name: Format
