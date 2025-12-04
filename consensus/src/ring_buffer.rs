@@ -1,4 +1,6 @@
-use std::{mem::MaybeUninit, usize};
+#![allow(dead_code)] // API is exercised in tests; main wiring is pending.
+
+use std::mem::MaybeUninit;
 
 // Compile-time proof that u32 -> usize is safe on this platform.
 // This fails to compile on 16-bit platforms.
