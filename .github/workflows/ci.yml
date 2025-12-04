@@ -16,16 +16,10 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: consensus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            consensus -> consensus/target
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Cargo audit
@@ -34,9 +28,6 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: consensus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,49 +38,31 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: consensus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            consensus -> consensus/target
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build:
     name: Build
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: consensus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            consensus -> consensus/target
       - run: cargo build --all-features
       - run: cargo build --no-default-features
 
   test:
     name: Test
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: consensus
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            consensus -> consensus/target
       - run: cargo test --all-features
 
   miri:
@@ -97,9 +70,6 @@ jobs:
     runs-on: ubuntu-latest
     # Run only on the nightly schedule or manual dispatch to avoid slowing every push/PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    defaults:
-      run:
-        working-directory: consensus
     env:
       # Reduce property-test volume so Miri doesn't become prohibitively slow.
       PROPTEST_CASES: 5
@@ -111,8 +81,6 @@ jobs:
           components: miri
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            consensus -> consensus/target
           shared-key: miri
       - run: cargo miri setup
       - run: cargo miri test --all-features
