@@ -14,7 +14,7 @@ const _: () = assert!(
 ///
 /// # Examples
 /// ```
-/// use crate::stdx::bitset::BitSet;
+/// use consensus::stdx::bitset::BitSet;
 ///
 /// let mut bits: BitSet<8> = BitSet::empty();
 /// bits.set(1);
