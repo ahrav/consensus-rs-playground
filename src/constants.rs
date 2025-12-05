@@ -100,7 +100,7 @@ const _: () = assert!(VSR_VERSION > 0);
 ///
 /// # Examples
 /// ```
-/// # use consensus_rs_playground::constants::*;
+/// # use consensus::constants::*;
 /// assert_eq!(sector_ceil(0), 0);
 /// assert_eq!(sector_ceil(1), SECTOR_SIZE);
 /// assert_eq!(sector_ceil(SECTOR_SIZE), SECTOR_SIZE);
@@ -127,7 +127,7 @@ pub const fn sector_ceil(n: u32) -> u32 {
 ///
 /// # Examples
 /// ```
-/// # use consensus_rs_playground::constants::*;
+/// # use consensus::constants::*;
 /// let buffer = [0u8; as_usize(MESSAGE_SIZE_MAX)];
 /// ```
 #[inline(always)]
