@@ -48,7 +48,7 @@ pub type ClusterId = u128;
 const _: () = assert!(HEADER_SIZE > 0);
 const _: () = assert!(HEADER_SIZE == 256, "Header must be exactly 256 bytes");
 const _: () = assert!(
-    HEADER_SIZE % 16 == 0,
+    HEADER_SIZE.is_multiple_of(16),
     "Header must be 16-byte aligned for checksums"
 );
 
@@ -116,7 +116,7 @@ pub const fn sector_ceil(n: u32) -> u32 {
 
     let result = (n + mask) & !mask;
     assert!(
-        result % SECTOR_SIZE == 0,
+        result.is_multiple_of(SECTOR_SIZE),
         "sector_ceil produced unaligned result"
     );
 
@@ -186,7 +186,6 @@ mod tests {
 
     #[test]
     fn header_fits_in_sector() {
-        assert!(HEADER_SIZE <= SECTOR_SIZE);
         assert_eq!(sector_ceil(HEADER_SIZE), SECTOR_SIZE);
     }
 
