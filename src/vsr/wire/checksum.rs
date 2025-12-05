@@ -5,6 +5,8 @@
 //! secret-key authenticator.
 use aegis::aegis128l::Aegis128L;
 
+pub type Checksum128 = u128;
+
 /// Computes the deterministic AEGIS-128L tag for `data`.
 ///
 /// Input bytes are fed as associated data with an empty payload; the zero key and
