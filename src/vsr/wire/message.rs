@@ -1,3 +1,20 @@
+//! Wire-format message container for VSR protocol communication.
+//!
+//! A [`Message`] owns a 16-byte aligned buffer that holds a [`Header`] followed by an
+//! optional body. Messages are designed for zero-copy network I/O—[`as_bytes`] returns
+//! the exact bytes to send on the wire.
+//!
+//! # Lifecycle
+//!
+//! 1. Create with [`Message::new_zeroed`]
+//! 2. Initialize header via [`reset`]
+//! 3. Set body via [`set_body`] (computes checksums)
+//! 4. Send via [`as_bytes`]
+//!
+//! [`as_bytes`]: Message::as_bytes
+//! [`reset`]: Message::reset
+//! [`set_body`]: Message::set_body
+
 use super::{Command, Header};
 use crate::constants::{
     HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
@@ -38,17 +55,28 @@ impl AlignedBuffer {
     }
 }
 
+/// A protocol message containing a [`Header`] and optional body.
+///
+/// The internal buffer is 16-byte aligned to allow direct casting to [`Header`].
+/// Use [`ref_acquire`]/[`ref_release`] for reference counting in message pools.
+///
+/// [`ref_acquire`]: Message::ref_acquire
+/// [`ref_release`]: Message::ref_release
 pub struct Message {
+    /// Reference count for pool management. Not thread-safe.
     pub reference: Cell<u32>,
     buffer: Box<AlignedBuffer>,
-    // cached length of currently valid bytes in `buffer`.
+    /// Cached length of valid bytes (header + body).
     len: u32,
 }
 
 impl Message {
+    /// Minimum message length (header only, no body).
     pub const LEN_MIN: u32 = HEADER_SIZE;
+    /// Maximum message length (header + max body).
     pub const LEN_MAX: u32 = MESSAGE_SIZE_MAX;
 
+    /// Creates a message with zeroed buffer. Call [`reset`](Self::reset) before use.
     pub fn new_zeroed() -> Self {
         let buffer = AlignedBuffer::new_zeroed();
         assert!((buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
@@ -127,6 +155,7 @@ impl Message {
         body
     }
 
+    /// Returns a mutable slice of the body. Modifications invalidate the body checksum.
     #[inline]
     pub fn body_mut(&mut self) -> &mut [u8] {
         let total_len = self.header().total_len();
@@ -142,6 +171,10 @@ impl Message {
         body
     }
 
+    /// Initializes the header and clears any existing body.
+    ///
+    /// Must be called before [`body`](Self::body), [`body_mut`](Self::body_mut),
+    /// or [`set_body`](Self::set_body).
     pub fn reset(&mut self, command: Command, cluster: u128, replica: u8) {
         let header = Header::new(command, cluster, replica);
         let header_bytes = header.as_bytes();
@@ -157,6 +190,10 @@ impl Message {
         assert!(self.header().size == Self::LEN_MIN);
     }
 
+    /// Copies `body` into the message and computes both checksums.
+    ///
+    /// Checksums are computed in the required order: body checksum first, then header.
+    /// Returns `Err` if body exceeds [`MESSAGE_BODY_SIZE_MAX`].
     pub fn set_body(&mut self, body: &[u8]) -> Result<(), &'static str> {
         // Preconditions
         assert!(body.len() <= u32::MAX as usize);
@@ -198,6 +235,7 @@ impl Message {
         Ok(())
     }
 
+    /// Returns the wire-format bytes: header followed by body.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         assert!(self.len() >= Self::LEN_MIN);
@@ -209,6 +247,7 @@ impl Message {
         bytes
     }
 
+    /// Increments reference count. Panics at `u32::MAX`.
     #[inline]
     pub fn ref_acquire(&self) {
         let old = self.reference.get();
@@ -222,6 +261,7 @@ impl Message {
         assert!(self.reference.get() == old + 1);
     }
 
+    /// Decrements reference count. Returns `true` when count reaches zero. Panics on underflow.
     #[inline]
     pub fn ref_release(&self) -> bool {
         let old = self.reference.get();
