@@ -658,4 +658,183 @@ mod tests {
             }
         }
     }
+
+    // =========================================================================
+    // Invariant Preservation Tests
+    // =========================================================================
+
+    #[test]
+    fn set_body_error_preserves_state() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        // Set initial valid body
+        let initial_body = b"initial data";
+        msg.set_body(initial_body).unwrap();
+
+        // Capture state before error
+        let len_before = msg.len();
+        let header_size_before = msg.header().size;
+        let body_before = msg.body().to_vec();
+        let checksum_before = msg.header().checksum;
+        let checksum_body_before = msg.header().checksum_body;
+
+        // Attempt to set oversized body (should fail)
+        let oversized = vec![0xFFu8; MESSAGE_BODY_SIZE_MAX as usize + 1];
+        assert!(msg.set_body(&oversized).is_err());
+
+        // Verify state is completely unchanged
+        assert!(msg.len() == len_before, "len must be unchanged after error");
+        assert!(
+            msg.header().size == header_size_before,
+            "header.size must be unchanged after error"
+        );
+        assert!(
+            msg.body() == body_before.as_slice(),
+            "body content must be unchanged after error"
+        );
+        assert!(
+            msg.header().checksum == checksum_before,
+            "checksum must be unchanged after error"
+        );
+        assert!(
+            msg.header().checksum_body == checksum_body_before,
+            "checksum_body must be unchanged after error"
+        );
+        assert!(
+            msg.header().is_valid_checksum(),
+            "checksum must still be valid after error"
+        );
+    }
+
+    #[test]
+    fn ref_acquire_near_overflow_panics() {
+        let msg = Message::new_zeroed();
+
+        // Set reference count near maximum
+        msg.reference.set(u32::MAX - 1);
+        assert!(msg.ref_count() == u32::MAX - 1);
+
+        // One more acquire should succeed
+        msg.ref_acquire();
+        assert!(msg.ref_count() == u32::MAX);
+    }
+
+    #[test]
+    #[should_panic(expected = "u32::MAX")]
+    fn ref_acquire_at_max_panics() {
+        let msg = Message::new_zeroed();
+
+        // Set reference count to maximum
+        msg.reference.set(u32::MAX);
+
+        // This acquire must panic
+        msg.ref_acquire();
+    }
+
+    #[test]
+    fn validate_basic_after_reset() {
+        let mut msg = Message::new_zeroed();
+
+        for &cmd in Command::ALL.iter() {
+            msg.reset(cmd, 12345, 7);
+
+            // Header must pass basic validation after reset
+            assert!(
+                msg.header().validate_basic().is_ok(),
+                "validate_basic must pass after reset with command {:?}",
+                cmd
+            );
+        }
+    }
+
+    #[test]
+    fn validate_basic_after_set_body() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 42, 3);
+
+        let body_sizes = [0, 1, 100, 1024, 4096];
+
+        for &size in &body_sizes {
+            let body = vec![0xABu8; size];
+            msg.set_body(&body).unwrap();
+
+            // Header must pass basic validation after set_body
+            assert!(
+                msg.header().validate_basic().is_ok(),
+                "validate_basic must pass after set_body with size {}",
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn validate_basic_after_set_body_max_size() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let max_body = vec![0xCDu8; MESSAGE_BODY_SIZE_MAX as usize];
+        msg.set_body(&max_body).unwrap();
+
+        assert!(
+            msg.header().validate_basic().is_ok(),
+            "validate_basic must pass at maximum body size"
+        );
+    }
+
+    #[test]
+    fn large_body_checksum_correctness() {
+        // Test checksum at various large sizes near the maximum
+        let large_sizes = [
+            MESSAGE_BODY_SIZE_MAX as usize - 4096,
+            MESSAGE_BODY_SIZE_MAX as usize - 1,
+            MESSAGE_BODY_SIZE_MAX as usize,
+        ];
+
+        for &size in &large_sizes {
+            let mut msg = Message::new_zeroed();
+            msg.reset(Command::Request, 1, 0);
+
+            // Use non-zero pattern to ensure checksum is meaningful
+            let body: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
+            msg.set_body(&body).unwrap();
+
+            assert!(
+                msg.header().is_valid_checksum(),
+                "header checksum must be valid at size {}",
+                size
+            );
+            assert!(
+                msg.header().is_valid_checksum_body(&body),
+                "body checksum must be valid at size {}",
+                size
+            );
+
+            // Verify body content preserved
+            assert!(
+                msg.body() == body.as_slice(),
+                "body content must match at size {}",
+                size
+            );
+        }
+    }
+
+    #[test]
+    fn is_empty_consistency() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Ping, 1, 0);
+
+        // Header-only message is "empty" (no body)
+        assert!(msg.is_empty());
+        assert!(msg.body_len() == 0);
+
+        // With body, no longer empty
+        msg.set_body(b"data").unwrap();
+        assert!(!msg.is_empty());
+        assert!(msg.body_len() > 0);
+
+        // Reset clears body, back to empty
+        msg.reset(Command::Pong, 2, 1);
+        assert!(msg.is_empty());
+    }
 }
