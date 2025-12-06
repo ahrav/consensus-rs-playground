@@ -3,6 +3,7 @@ use crate::constants::{
     HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
 };
 use core::cell::Cell;
+use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 
 // Compile-time: verify alignment requirements
 const _: () = assert!(align_of::<Header>() <= 16);
@@ -22,11 +23,17 @@ const _: () = assert!(size_of::<AlignedBuffer>() == MESSAGE_SIZE_MAX_USIZE);
 
 impl AlignedBuffer {
     fn new_zeroed() -> Box<Self> {
-        let buffer = Box::new(AlignedBuffer {
-            bytes: [0; MESSAGE_SIZE_MAX_USIZE],
-        });
+        let layout = Layout::new::<Self>();
+        let ptr = unsafe { alloc_zeroed(layout) } as *mut Self;
 
-        assert!(buffer.bytes.as_ptr() as usize % align_of::<Header>() == 0);
+        if ptr.is_null() {
+            handle_alloc_error(layout);
+        }
+
+        // SAFETY: Memory was allocated with the layout of Self and zeroed.
+        let buffer = unsafe { Box::from_raw(ptr) };
+
+        assert!((buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
         buffer
     }
 }
@@ -44,7 +51,7 @@ impl Message {
 
     pub fn new_zeroed() -> Self {
         let buffer = AlignedBuffer::new_zeroed();
-        assert!(buffer.bytes.as_ptr() as usize % align_of::<Header>() == 0);
+        assert!((buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
 
         let msg = Message {
             reference: Cell::new(0),
@@ -66,6 +73,12 @@ impl Message {
         self.len
     }
 
+    /// Returns `true` if the message has no body (header only).
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == Self::LEN_MIN
+    }
+
     #[inline]
     pub fn body_len(&self) -> u32 {
         assert!(self.len >= Self::LEN_MIN);
@@ -76,7 +89,7 @@ impl Message {
     #[inline]
     pub fn header(&self) -> &Header {
         assert!(self.len >= Self::LEN_MIN);
-        assert!(self.buffer.bytes.as_ptr() as usize % align_of::<Header>() == 0);
+        assert!((self.buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
 
         // SAFETY:
         // - Buffer is aligned to 16 bytes (AlignedBuffer)
@@ -89,7 +102,7 @@ impl Message {
     #[inline]
     pub fn header_mut(&mut self) -> &mut Header {
         assert!(self.len >= Self::LEN_MIN);
-        assert!(self.buffer.bytes.as_ptr() as usize % align_of::<Header>() == 0);
+        assert!((self.buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
 
         // SAFETY:
         // - Buffer is aligned to 16 bytes (AlignedBuffer)
@@ -239,8 +252,8 @@ mod tests {
         let msg = Message::new_zeroed();
         let ptr = msg.buffer.bytes.as_ptr() as usize;
 
-        assert!(ptr % align_of::<Header>() == 0);
-        assert!(ptr % 16 == 0);
+        assert!(ptr.is_multiple_of(align_of::<Header>()));
+        assert!(ptr.is_multiple_of(16));
     }
 
     #[test]
@@ -328,5 +341,321 @@ mod tests {
         msg.set_body(original).unwrap();
 
         assert!(msg.body() == original);
+    }
+
+    #[test]
+    #[should_panic(expected = "SIZE_MIN")]
+    fn body_panics_without_reset() {
+        let msg = Message::new_zeroed();
+        let _ = msg.body();
+    }
+
+    // =========================================================================
+    // Boundary Tests
+    // =========================================================================
+
+    #[test]
+    fn set_body_empty() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let empty: &[u8] = &[];
+        assert!(msg.set_body(empty).is_ok());
+
+        assert!(msg.len() == Message::LEN_MIN);
+        assert!(msg.body_len() == 0);
+        assert!(msg.body().is_empty());
+        assert!(msg.header().is_valid_checksum());
+        assert!(msg.header().is_valid_checksum_body(empty));
+    }
+
+    #[test]
+    fn set_body_single_byte() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let body = &[0x42u8];
+        assert!(msg.set_body(body).is_ok());
+
+        assert!(msg.len() == Message::LEN_MIN + 1);
+        assert!(msg.body_len() == 1);
+        assert!(msg.body() == body);
+    }
+
+    #[test]
+    fn set_body_exact_max_size() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let max_body = vec![0xAAu8; MESSAGE_BODY_SIZE_MAX as usize];
+        assert!(msg.set_body(&max_body).is_ok());
+
+        assert!(msg.len() == Message::LEN_MAX);
+        assert!(msg.body_len() == MESSAGE_BODY_SIZE_MAX);
+        assert!(msg.body() == max_body.as_slice());
+        assert!(msg.header().is_valid_checksum());
+    }
+
+    // =========================================================================
+    // body_mut() Tests
+    // =========================================================================
+
+    #[test]
+    fn body_mut_allows_modification() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let initial = b"hello world";
+        msg.set_body(initial).unwrap();
+
+        // Modify via body_mut()
+        let body = msg.body_mut();
+        body[0] = b'H';
+        body[6] = b'W';
+
+        assert!(msg.body() == b"Hello World");
+    }
+
+    #[test]
+    fn body_mut_invalidates_checksum() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let body = b"valid body";
+        msg.set_body(body).unwrap();
+
+        assert!(msg.header().is_valid_checksum_body(body));
+
+        // Modify body directly
+        msg.body_mut()[0] = b'X'; // "Xalid body"
+
+        // Checksum is now invalid for the current body content
+        assert!(!msg.header().is_valid_checksum_body(msg.body()));
+    }
+
+    #[test]
+    fn body_mut_length_matches_body() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        let body_data = b"test data";
+        msg.set_body(body_data).unwrap();
+
+        assert!(msg.body_mut().len() == msg.body().len());
+        assert!(msg.body_mut().len() == body_data.len());
+    }
+
+    #[test]
+    #[should_panic(expected = "SIZE_MIN")]
+    fn body_mut_panics_without_reset() {
+        let mut msg = Message::new_zeroed();
+        let _ = msg.body_mut();
+    }
+
+    // =========================================================================
+    // Reference Counting Edge Cases
+    // =========================================================================
+
+    #[test]
+    #[should_panic(expected = "reference count underflow")]
+    fn ref_release_underflow_panics() {
+        let msg = Message::new_zeroed();
+        // ref_count is 0, release should panic
+        msg.ref_release();
+    }
+
+    #[test]
+    fn ref_counting_stress() {
+        let msg = Message::new_zeroed();
+
+        // Acquire many references
+        for i in 1..=1000 {
+            msg.ref_acquire();
+            assert!(msg.ref_count() == i);
+        }
+
+        // Release all but one
+        for i in (1..1000).rev() {
+            assert!(!msg.ref_release());
+            assert!(msg.ref_count() == i);
+        }
+
+        // Final release returns true
+        assert!(msg.ref_release());
+        assert!(msg.ref_count() == 0);
+    }
+
+    // =========================================================================
+    // Sequential Operations Tests
+    // =========================================================================
+
+    #[test]
+    fn multiple_reset_calls() {
+        let mut msg = Message::new_zeroed();
+
+        for &cmd in Command::ALL.iter() {
+            msg.reset(cmd, 42, 3);
+            assert!(msg.header().command == cmd);
+            assert!(msg.header().cluster == 42);
+            assert!(msg.header().replica == 3);
+            assert!(msg.len() == Message::LEN_MIN);
+        }
+    }
+
+    #[test]
+    fn set_body_shrink_then_grow() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 1, 0);
+
+        // Set large body
+        let large = vec![0xAAu8; 1000];
+        msg.set_body(&large).unwrap();
+        assert!(msg.body_len() == 1000);
+        assert!(msg.body() == large.as_slice());
+
+        // Shrink to small body
+        let small = b"tiny";
+        msg.set_body(small).unwrap();
+        assert!(msg.body_len() == 4);
+        assert!(msg.body() == small);
+
+        // Grow again
+        let medium = vec![0xBBu8; 500];
+        msg.set_body(&medium).unwrap();
+        assert!(msg.body_len() == 500);
+        assert!(msg.body() == medium.as_slice());
+    }
+
+    #[test]
+    fn as_bytes_content_verification() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 42, 3);
+
+        let body = b"payload data";
+        msg.set_body(body).unwrap();
+
+        let bytes = msg.as_bytes();
+
+        // Verify header portion
+        let header_bytes = &bytes[..HEADER_SIZE_USIZE];
+        assert!(header_bytes == msg.header().as_bytes());
+
+        // Verify body portion
+        let body_bytes = &bytes[HEADER_SIZE_USIZE..];
+        assert!(body_bytes == body);
+    }
+
+    #[test]
+    fn reset_clears_previous_state() {
+        let mut msg = Message::new_zeroed();
+        msg.reset(Command::Request, 100, 5);
+
+        let body = b"some data";
+        msg.set_body(body).unwrap();
+        assert!(msg.body_len() > 0);
+
+        // Reset should clear body
+        msg.reset(Command::Ping, 200, 10);
+        assert!(msg.len() == Message::LEN_MIN);
+        assert!(msg.body_len() == 0);
+        assert!(msg.header().command == Command::Ping);
+        assert!(msg.header().cluster == 200);
+        assert!(msg.header().replica == 10);
+    }
+
+    // =========================================================================
+    // Property-Based Tests
+    // =========================================================================
+
+    mod property_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_command() -> impl Strategy<Value = Command> {
+            (0u8..=Command::MAX).prop_map(|b| Command::try_from_u8(b).unwrap())
+        }
+
+        fn arb_body() -> impl Strategy<Value = Vec<u8>> {
+            // Use smaller bodies for faster property tests; boundary tests cover max size
+            prop::collection::vec(any::<u8>(), 0..=1024)
+        }
+
+        proptest! {
+            #[test]
+            fn prop_body_roundtrip(body in arb_body()) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(Command::Request, 1, 0);
+
+                msg.set_body(&body).unwrap();
+
+                prop_assert_eq!(msg.body(), body.as_slice());
+                prop_assert_eq!(msg.body_len() as usize, body.len());
+                prop_assert_eq!(msg.len(), Message::LEN_MIN + body.len() as u32);
+            }
+
+            #[test]
+            fn prop_checksum_valid_after_set_body(body in arb_body()) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(Command::Request, 1, 0);
+
+                msg.set_body(&body).unwrap();
+
+                prop_assert!(msg.header().is_valid_checksum());
+                prop_assert!(msg.header().is_valid_checksum_body(&body));
+            }
+
+            #[test]
+            fn prop_len_invariants(
+                cmd in arb_command(),
+                cluster in any::<u128>(),
+                replica in any::<u8>(),
+                body in arb_body(),
+            ) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(cmd, cluster, replica);
+                msg.set_body(&body).unwrap();
+
+                prop_assert!(msg.len() >= Message::LEN_MIN);
+                prop_assert!(msg.len() <= Message::LEN_MAX);
+                prop_assert_eq!(msg.len(), Message::LEN_MIN + msg.body_len());
+                prop_assert_eq!(msg.body_len() as usize, body.len());
+            }
+
+            #[test]
+            fn prop_as_bytes_length_consistent(body in arb_body()) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(Command::Request, 1, 0);
+                msg.set_body(&body).unwrap();
+
+                prop_assert_eq!(msg.as_bytes().len() as u32, msg.len());
+                prop_assert_eq!(msg.as_bytes().len(), HEADER_SIZE_USIZE + body.len());
+            }
+
+            #[test]
+            fn prop_header_fields_preserved(
+                cmd in arb_command(),
+                cluster in any::<u128>(),
+                replica in any::<u8>(),
+            ) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(cmd, cluster, replica);
+
+                prop_assert_eq!(msg.header().command, cmd);
+                prop_assert_eq!(msg.header().cluster, cluster);
+                prop_assert_eq!(msg.header().replica, replica);
+            }
+
+            #[test]
+            fn prop_body_mut_same_as_body(body in arb_body()) {
+                let mut msg = Message::new_zeroed();
+                msg.reset(Command::Request, 1, 0);
+                msg.set_body(&body).unwrap();
+
+                // body_mut() should return the same content as body()
+                let body_ref = msg.body().to_vec();
+                let body_mut_ref = msg.body_mut().to_vec();
+                prop_assert_eq!(body_ref, body_mut_ref);
+            }
+        }
     }
 }
