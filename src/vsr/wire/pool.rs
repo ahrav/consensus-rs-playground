@@ -663,6 +663,84 @@ mod tests {
         }
         pool.release(handle);
     }
+
+    #[test]
+    fn refcount_at_max_minus_one_can_acquire() {
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        let handle = pool.acquire();
+
+        // SAFETY: Handle is valid, we're directly setting refcount for testing
+        unsafe {
+            // Set refcount to u32::MAX - 1 (one below overflow threshold)
+            handle.as_ref().references.set(u32::MAX - 1);
+            assert!(handle.as_ref().references.get() == u32::MAX - 1);
+
+            // This acquire should succeed, bringing refcount to u32::MAX
+            let _ = handle.acquire();
+            assert!(handle.as_ref().references.get() == u32::MAX);
+        }
+
+        // Cleanup: reset refcount to allow proper release
+        unsafe {
+            handle.as_ref().references.set(1);
+        }
+        pool.release(handle);
+    }
+
+    #[test]
+    #[should_panic(expected = "reference count overflowed")]
+    fn refcount_overflow_panics_at_max() {
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        let handle = pool.acquire();
+
+        // SAFETY: Handle is valid, we're directly setting refcount for testing
+        unsafe {
+            // Set refcount to u32::MAX (at overflow threshold)
+            handle.as_ref().references.set(u32::MAX);
+
+            // This acquire should panic because we're already at MAX
+            let _ = handle.acquire(); // Should panic
+        }
+    }
+
+    // NOTE: This test documents a known safety invariant, not a bug.
+    // MessageHandle is Copy and holds raw pointers. If the pool is dropped
+    // while handles exist, those handles become dangling. This is documented
+    // in the safety requirements but cannot be enforced at compile time.
+    //
+    // Potential mitigations (not implemented):
+    // - Use indices instead of raw pointers
+    // - Add generation counters to detect stale handles
+    // - Make MessageHandle non-Copy with lifetime bounds
+    // - Use Arc<Message> instead of raw pointers
+    #[test]
+    fn documents_handle_lifetime_safety_requirement() {
+        // This test verifies the documented invariant:
+        // "ptr must point to a valid Message that outlives this handle"
+        //
+        // We cannot test UAF directly (undefined behavior), but we document
+        // that dropping the pool invalidates all outstanding handles.
+
+        let mut pool: MessagePool<4> = MessagePool::new();
+        let handle = pool.acquire();
+
+        // Handle is valid while pool exists
+        assert!(pool.owns(handle));
+
+        // After this point, if pool were dropped:
+        // - handle.ptr would be dangling
+        // - handle.as_ref() would be UAF (undefined behavior)
+        //
+        // Callers MUST ensure pool outlives all handles.
+
+        pool.release(handle);
+        drop(pool);
+
+        // handle still exists here (it's Copy), but using it would be UB
+        // We cannot safely test this - it would be undefined behavior
+    }
 }
 
 #[cfg(test)]
