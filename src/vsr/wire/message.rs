@@ -288,7 +288,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alignment_is_correct() {
+    fn buffer_alignment() {
         let msg = Message::new_zeroed();
         let ptr = msg.buffer.bytes.as_ptr() as usize;
 
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn new_message_is_valid() {
+    fn new_zeroed_initial_state() {
         let msg = Message::new_zeroed();
 
         assert!(msg.len() == Message::LEN_MIN);
@@ -423,17 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn set_body_exact_max_size() {
+    fn set_body_max_size() {
         let mut msg = Message::new_zeroed();
         msg.reset(Command::Request, 1, 0);
 
         let max_body = vec![0xAAu8; MESSAGE_BODY_SIZE_MAX as usize];
         assert!(msg.set_body(&max_body).is_ok());
 
+        // Length invariants
         assert!(msg.len() == Message::LEN_MAX);
         assert!(msg.body_len() == MESSAGE_BODY_SIZE_MAX);
+
+        // Content preserved
         assert!(msg.body() == max_body.as_slice());
+
+        // Checksums valid
         assert!(msg.header().is_valid_checksum());
+        assert!(msg.header().is_valid_checksum_body(&max_body));
+
+        // Passes basic validation
+        assert!(
+            msg.header().validate_basic().is_ok(),
+            "validate_basic must pass at maximum body size"
+        );
     }
 
     // =========================================================================
@@ -441,7 +453,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn body_mut_allows_modification() {
+    fn body_mut_modification() {
         let mut msg = Message::new_zeroed();
         msg.reset(Command::Request, 1, 0);
 
@@ -474,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn body_mut_length_matches_body() {
+    fn body_mut_length() {
         let mut msg = Message::new_zeroed();
         msg.reset(Command::Request, 1, 0);
 
@@ -505,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn ref_counting_stress() {
+    fn ref_count_many_cycles() {
         let msg = Message::new_zeroed();
 
         // Acquire many references
@@ -567,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn as_bytes_content_verification() {
+    fn as_bytes_content() {
         let mut msg = Message::new_zeroed();
         msg.reset(Command::Request, 42, 3);
 
@@ -748,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn ref_acquire_near_overflow_panics() {
+    fn ref_acquire_succeeds_near_max() {
         let msg = Message::new_zeroed();
 
         // Set reference count near maximum
@@ -809,26 +821,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_basic_after_set_body_max_size() {
-        let mut msg = Message::new_zeroed();
-        msg.reset(Command::Request, 1, 0);
-
-        let max_body = vec![0xCDu8; MESSAGE_BODY_SIZE_MAX as usize];
-        msg.set_body(&max_body).unwrap();
-
-        assert!(
-            msg.header().validate_basic().is_ok(),
-            "validate_basic must pass at maximum body size"
-        );
-    }
-
-    #[test]
-    fn large_body_checksum_correctness() {
+    fn set_body_near_max_sizes() {
         // Test checksum at various large sizes near the maximum
+        // (max size is covered by set_body_max_size)
         let large_sizes = [
             MESSAGE_BODY_SIZE_MAX as usize - 4096,
             MESSAGE_BODY_SIZE_MAX as usize - 1,
-            MESSAGE_BODY_SIZE_MAX as usize,
         ];
 
         for &size in &large_sizes {
@@ -860,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn is_empty_consistency() {
+    fn is_empty() {
         let mut msg = Message::new_zeroed();
         msg.reset(Command::Ping, 1, 0);
 
