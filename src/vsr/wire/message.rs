@@ -218,7 +218,7 @@ impl Message {
             let h = self.header_mut();
             h.size = total_len;
 
-            // TB ordering: set_checksum_body then set_checksum
+            // set_checksum_body then set_checksum
             h.set_checksum_body(body);
             h.set_checksum();
         }
