@@ -64,7 +64,7 @@ impl AlignedBuffer {
 /// [`ref_release`]: Message::ref_release
 pub struct Message {
     /// Reference count for pool management. Not thread-safe.
-    pub reference: Cell<u32>,
+    pub references: Cell<u32>,
     buffer: Box<AlignedBuffer>,
     /// Cached length of valid bytes (header + body).
     len: u32,
@@ -82,14 +82,14 @@ impl Message {
         assert!((buffer.bytes.as_ptr() as usize).is_multiple_of(align_of::<Header>()));
 
         let msg = Message {
-            reference: Cell::new(0),
+            references: Cell::new(0),
             buffer,
             len: HEADER_SIZE,
         };
 
         assert!(msg.len >= Self::LEN_MIN);
         assert!(msg.len <= Self::LEN_MAX);
-        assert!(msg.reference.get() == 0);
+        assert!(msg.references.get() == 0);
 
         msg
     }
@@ -250,36 +250,36 @@ impl Message {
     /// Increments reference count. Panics at `u32::MAX`.
     #[inline]
     pub fn ref_acquire(&self) {
-        let old = self.reference.get();
+        let old = self.references.get();
 
         assert!(old < u32::MAX);
 
         let new = old + 1;
-        self.reference.set(new);
+        self.references.set(new);
 
-        assert!(self.reference.get() == new);
-        assert!(self.reference.get() == old + 1);
+        assert!(self.references.get() == new);
+        assert!(self.references.get() == old + 1);
     }
 
     /// Decrements reference count. Returns `true` when count reaches zero. Panics on underflow.
     #[inline]
     pub fn ref_release(&self) -> bool {
-        let old = self.reference.get();
+        let old = self.references.get();
 
         assert!(old > 0, "reference count underflow");
 
         let new = old - 1;
-        self.reference.set(new);
+        self.references.set(new);
 
-        assert!(self.reference.get() == new);
-        assert!(self.reference.get() == old - 1);
+        assert!(self.references.get() == new);
+        assert!(self.references.get() == old - 1);
 
         new == 0
     }
 
     #[inline]
     pub fn ref_count(&self) -> u32 {
-        self.reference.get()
+        self.references.get()
     }
 }
 
@@ -764,7 +764,7 @@ mod tests {
         let msg = Message::new_zeroed();
 
         // Set reference count near maximum
-        msg.reference.set(u32::MAX - 1);
+        msg.references.set(u32::MAX - 1);
         assert!(msg.ref_count() == u32::MAX - 1);
 
         // One more acquire should succeed
@@ -778,7 +778,7 @@ mod tests {
         let msg = Message::new_zeroed();
 
         // Set reference count to maximum
-        msg.reference.set(u32::MAX);
+        msg.references.set(u32::MAX);
 
         // This acquire must panic
         msg.ref_acquire();
