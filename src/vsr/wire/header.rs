@@ -334,6 +334,8 @@ impl Header {
 mod tests {
     use super::*;
 
+    type FieldCorruptor = (&'static str, fn(&mut Header));
+
     #[test]
     fn new_header_is_valid() {
         let h = Header::new(Command::Ping, 1, 0);
@@ -545,7 +547,7 @@ mod tests {
     #[test]
     fn checksum_detects_all_field_corruption() {
         // Test that checksum protects all fields after the checksum itself
-        let field_corruptors: Vec<(&str, fn(&mut Header))> = vec![
+        let field_corruptors: [FieldCorruptor; 9] = [
             ("cluster", |h| h.cluster ^= 1),
             ("size", |h| h.size ^= 1),
             ("epoch", |h| h.epoch ^= 1),
