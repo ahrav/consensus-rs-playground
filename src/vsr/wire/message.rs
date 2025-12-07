@@ -31,8 +31,8 @@ const _: () = assert!(HEADER_SIZE_USIZE <= MESSAGE_SIZE_MAX_USIZE);
 const _: () = assert!(MESSAGE_BODY_SIZE_MAX == MESSAGE_SIZE_MAX - HEADER_SIZE);
 
 #[repr(C, align(16))]
-struct AlignedBuffer {
-    bytes: [u8; MESSAGE_SIZE_MAX_USIZE],
+pub(crate) struct AlignedBuffer {
+    pub(crate) bytes: [u8; MESSAGE_SIZE_MAX_USIZE],
 }
 
 const _: () = assert!(align_of::<AlignedBuffer>() >= align_of::<Header>());
@@ -65,9 +65,9 @@ impl AlignedBuffer {
 pub struct Message {
     /// Reference count for pool management. Not thread-safe.
     pub references: Cell<u32>,
-    buffer: Box<AlignedBuffer>,
+    pub(crate) buffer: Box<AlignedBuffer>,
     /// Cached length of valid bytes (header + body).
-    len: u32,
+    pub(crate) len: u32,
 }
 
 impl Message {
