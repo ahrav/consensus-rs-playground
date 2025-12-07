@@ -1,3 +1,31 @@
+//! Message framing for streaming byte input.
+//!
+//! Handles incremental decoding of wire messages from a byte stream. The [`MessageBuffer`]
+//! accumulates incoming bytes and extracts complete, validated messages on demand.
+//!
+//! # Buffer Model
+//!
+//! ```text
+//! [consumed bytes][available bytes]
+//!                 ^cursor          ^len
+//! ```
+//!
+//! The buffer tracks a `cursor` position separating consumed data from available data.
+//! [`MessageBuffer::decode`] advances the cursor; [`MessageBuffer::compact`] reclaims consumed space.
+//!
+//! # Design Rationale: Double Copy
+//!
+//! This implementation uses a double-copy strategy to prioritize safety and determinism over raw throughput:
+//!
+//! 1.  **Kernel $\to$ Buffer:** Raw bytes are read into `MessageBuffer`.
+//! 2.  **Buffer $\to$ Pool:** Validated messages are copied into a `Message` from the `MessagePool`.
+//!
+//! ## Reasoning
+//!
+//! *   **Validation:** Checksums are verified *before* acquiring a message handle or writing to the pool.
+//! *   **Pool Integrity:** The `MessagePool` contains only valid messages. Reading directly into the pool (Zero-Copy) would leave "dirty" objects on validation failure, complicating cleanup.
+//! *   **Resource Safety:** Invalid packets are rejected without allocating pool resources.
+
 use super::{Header, MessageHandle, MessagePool};
 use crate::constants::{HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE};
 
@@ -9,16 +37,29 @@ const _: () = assert!(MESSAGE_SIZE_MAX_USIZE <= u32::MAX as usize);
 const COMPACT_THRESHOLD_DIVISOR: u32 = 2;
 const _: () = assert!(COMPACT_THRESHOLD_DIVISOR > 0);
 
+/// Errors from [`MessageBuffer::decode`].
+///
+/// `NeedMoreBytes` is recoverable—feed more data and retry. Other variants indicate
+/// malformed or corrupted messages that should be handled as protocol errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
+    /// Insufficient data; call [`MessageBuffer::feed`] and retry.
     NeedMoreBytes,
-    HeaderSizeTooSmall,
-    HeaderSizeTooLarge,
+    /// Header failed [`Header::validate_basic`]; contains the reason.
+    ///
+    /// This includes size bound violations (`size < HEADER_SIZE` or `size > MESSAGE_SIZE_MAX`),
+    /// protocol version mismatch, and non-zero reserved fields.
     HeaderInvalid(&'static str),
+    /// Header checksum mismatch—header bytes corrupted.
     BadHeaderChecksum,
+    /// Body checksum mismatch—body bytes corrupted.
     BadBodyChecksum,
 }
 
+/// Accumulates bytes and decodes framed messages.
+///
+/// Use [`feed`](Self::feed) to append incoming bytes, then [`decode`](Self::decode) to
+/// extract validated messages. The buffer auto-compacts after decodes to bound memory.
 pub struct MessageBuffer {
     buf: Vec<u8>,
     cursor: u32,
@@ -54,6 +95,7 @@ impl MessageBuffer {
         buffer
     }
 
+    /// Bytes available for decoding (buffered minus consumed).
     #[inline]
     pub fn available(&self) -> u32 {
         assert!(self.buf.len() <= Self::MAX_BUF_SIZE as usize);
@@ -69,6 +111,7 @@ impl MessageBuffer {
         self.cursor
     }
 
+    /// Total bytes in buffer (consumed + available).
     #[inline]
     pub fn buffered(&self) -> u32 {
         assert!(self.buf.len() <= Self::MAX_BUF_SIZE as usize);
@@ -84,6 +127,11 @@ impl MessageBuffer {
         assert!(self.buf.is_empty());
     }
 
+    /// Appends bytes to the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if total buffered bytes would exceed `MAX_BUF_SIZE` (4 MiB).
     pub fn feed(&mut self, bytes: &[u8]) {
         assert!(bytes.len() <= Self::MAX_BUF_SIZE as usize);
         let bytes_len = bytes.len() as u32;
@@ -145,6 +193,14 @@ impl MessageBuffer {
         Some(Ok(header))
     }
 
+    /// Decodes the next message if complete and valid.
+    ///
+    /// On success, copies the message into a buffer from `pool`, advances the cursor,
+    /// and auto-compacts. On [`DecodeError::NeedMoreBytes`], buffer state is unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pool` is exhausted (use [`MessagePool::try_acquire`] for fallible allocation).
     pub fn decode<const N: usize>(
         &mut self,
         pool: &mut MessagePool<N>,
@@ -156,13 +212,17 @@ impl MessageBuffer {
         };
 
         let total_len = header.total_len();
-        if total_len < HEADER_SIZE {
-            return Err(DecodeError::HeaderSizeTooSmall);
-        }
 
-        if total_len > MESSAGE_SIZE_MAX {
-            return Err(DecodeError::HeaderSizeTooLarge);
-        }
+        // Defense-in-depth: validate_basic() already enforces these bounds, but we
+        // assert here to catch any regression in the validation logic.
+        assert!(
+            total_len >= HEADER_SIZE,
+            "validate_basic must reject size < HEADER_SIZE"
+        );
+        assert!(
+            total_len <= MESSAGE_SIZE_MAX,
+            "validate_basic must reject size > MESSAGE_SIZE_MAX"
+        );
 
         if total_len > self.available() {
             return Err(DecodeError::NeedMoreBytes);
@@ -208,6 +268,7 @@ impl MessageBuffer {
         Ok(handle)
     }
 
+    /// Compacts if consumed bytes exceed half the buffer, or clears if fully consumed.
     pub fn maybe_compact(&mut self) {
         let buf_len = self.buffered();
 
@@ -227,6 +288,7 @@ impl MessageBuffer {
         }
     }
 
+    /// Discards consumed bytes, shifting available data to the front.
     pub fn compact(&mut self) {
         if self.cursor == 0 {
             return;
@@ -237,7 +299,6 @@ impl MessageBuffer {
         self.buf.drain(0..self.cursor as usize);
         self.cursor = 0;
 
-        // Postconditions
         assert!(self.cursor == 0);
         assert!(self.available() == old_available);
     }
@@ -965,6 +1026,195 @@ mod tests {
             assert!(handle.as_ref().body() == body);
         }
         pool.release(handle);
+    }
+
+    // =========================================================================
+    // Compaction Data Integrity Tests
+    // =========================================================================
+
+    /// Verifies that maybe_compact preserves trailing bytes when compaction
+    /// is triggered by a large first message followed by partial second message data.
+    #[test]
+    fn maybe_compact_preserves_trailing_bytes_after_decode() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        // Create a large first message (larger body to ensure compaction triggers)
+        let large_body = vec![0xAA; 512];
+        let msg1 = make_valid_message(Command::Request, &large_body);
+
+        // Create a second message
+        let msg2_body = b"second message body";
+        let msg2 = make_valid_message(Command::Pong, msg2_body);
+
+        // Feed first message completely
+        buf.feed(&msg1);
+
+        // Feed only partial second message (header + partial body)
+        let partial_len = HEADER_SIZE_USIZE + 5;
+        buf.feed(&msg2[..partial_len]);
+
+        // Decode first message - this should trigger maybe_compact since
+        // cursor will exceed half the buffer after consuming msg1
+        let handle = buf.decode(&mut pool).expect("first decode should succeed");
+        unsafe {
+            assert!(handle.as_ref().body() == large_body.as_slice());
+        }
+        pool.release(handle);
+
+        // Verify the trailing bytes (partial second message) survived compaction
+        assert!(buf.cursor() == 0, "cursor should be reset after compaction");
+        assert!(
+            buf.available() == partial_len as u32,
+            "trailing bytes should be preserved"
+        );
+
+        // Verify the actual content of trailing bytes
+        let trailing = buf
+            .peek(partial_len as u32)
+            .expect("should have trailing data");
+        assert!(
+            trailing == &msg2[..partial_len],
+            "trailing byte content must match original partial message"
+        );
+
+        // Feed rest of second message and decode to prove data integrity
+        buf.feed(&msg2[partial_len..]);
+        let handle2 = buf.decode(&mut pool).expect("second decode should succeed");
+        unsafe {
+            assert!(handle2.as_ref().header().command == Command::Pong);
+            assert!(handle2.as_ref().body() == msg2_body);
+        }
+        pool.release(handle2);
+    }
+
+    // =========================================================================
+    // State Preservation Tests for All Error Paths
+    // =========================================================================
+
+    /// Verifies decode leaves state unchanged when returning NeedMoreBytes for partial header.
+    #[test]
+    fn decode_need_more_bytes_partial_header_preserves_state() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        // Feed partial header
+        buf.feed(&[0u8; HEADER_SIZE_USIZE - 10]);
+
+        let old_cursor = buf.cursor();
+        let old_available = buf.available();
+        let old_buffered = buf.buffered();
+
+        let result = buf.decode(&mut pool);
+        assert!(matches!(result, Err(DecodeError::NeedMoreBytes)));
+
+        // State must be unchanged
+        assert!(buf.cursor() == old_cursor);
+        assert!(buf.available() == old_available);
+        assert!(buf.buffered() == old_buffered);
+    }
+
+    /// Verifies decode leaves state unchanged when returning NeedMoreBytes for partial body.
+    #[test]
+    fn decode_need_more_bytes_partial_body_preserves_state() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        // Create valid message with body
+        let body = b"some body content";
+        let message = make_valid_message(Command::Ping, body);
+
+        // Feed header + partial body only
+        buf.feed(&message[..HEADER_SIZE_USIZE + 5]);
+
+        let old_cursor = buf.cursor();
+        let old_available = buf.available();
+        let old_buffered = buf.buffered();
+
+        let result = buf.decode(&mut pool);
+        assert!(matches!(result, Err(DecodeError::NeedMoreBytes)));
+
+        // State must be unchanged
+        assert!(buf.cursor() == old_cursor);
+        assert!(buf.available() == old_available);
+        assert!(buf.buffered() == old_buffered);
+    }
+
+    /// Verifies decode leaves state unchanged on BadHeaderChecksum error.
+    #[test]
+    fn decode_bad_header_checksum_preserves_state() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        let mut message = make_valid_message(Command::Ping, b"body");
+        // Corrupt header (not the checksum field, bytes 16+ are covered by checksum)
+        message[20] ^= 0xFF;
+
+        buf.feed(&message);
+
+        let old_cursor = buf.cursor();
+        let old_available = buf.available();
+        let old_buffered = buf.buffered();
+
+        let result = buf.decode(&mut pool);
+        assert!(matches!(result, Err(DecodeError::BadHeaderChecksum)));
+
+        // State must be unchanged
+        assert!(buf.cursor() == old_cursor);
+        assert!(buf.available() == old_available);
+        assert!(buf.buffered() == old_buffered);
+    }
+
+    /// Verifies decode leaves state unchanged on HeaderInvalid error.
+    #[test]
+    fn decode_header_invalid_preserves_state() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<4> = MessagePool::new();
+
+        let mut message = make_valid_message(Command::Ping, b"");
+        // Corrupt protocol version (offset 112-113)
+        message[112] ^= 0xFF;
+
+        buf.feed(&message);
+
+        let old_cursor = buf.cursor();
+        let old_available = buf.available();
+        let old_buffered = buf.buffered();
+
+        let result = buf.decode(&mut pool);
+        assert!(matches!(result, Err(DecodeError::HeaderInvalid(_))));
+
+        // State must be unchanged
+        assert!(buf.cursor() == old_cursor);
+        assert!(buf.available() == old_available);
+        assert!(buf.buffered() == old_buffered);
+    }
+
+    // =========================================================================
+    // Pool Exhaustion Test
+    // =========================================================================
+
+    /// Verifies decode panics when the MessagePool is exhausted.
+    #[test]
+    #[should_panic(expected = "message pool exhausted")]
+    fn decode_panics_on_exhausted_pool() {
+        let mut buf = MessageBuffer::new();
+        let mut pool: MessagePool<2> = MessagePool::new();
+
+        let msg1 = make_valid_message(Command::Ping, b"first");
+        let msg2 = make_valid_message(Command::Pong, b"second");
+        let msg3 = make_valid_message(Command::Request, b"third");
+
+        buf.feed(&msg1);
+        buf.feed(&msg2);
+        buf.feed(&msg3);
+
+        // Acquire all pool slots
+        let _h1 = buf.decode(&mut pool).expect("first decode");
+        let _h2 = buf.decode(&mut pool).expect("second decode");
+
+        // This should panic - pool exhausted
+        let _h3 = buf.decode(&mut pool);
     }
 
     // =========================================================================
