@@ -65,10 +65,18 @@ pub struct MessageBuffer {
     cursor: u32,
 }
 
+impl Default for MessageBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MessageBuffer {
     const MAX_BUF_SIZE: u32 = MESSAGE_SIZE_MAX * 4;
     const _MIN: () = assert!(Self::MAX_BUF_SIZE >= MESSAGE_SIZE_MAX);
-    const _MAX: () = assert!(Self::MAX_BUF_SIZE <= u32::MAX);
+    // Compile-time overflow check: MESSAGE_SIZE_MAX * 4 must not wrap.
+    // If it did, MAX_BUF_SIZE would be less than MESSAGE_SIZE_MAX.
+    const _NO_OVERFLOW: () = assert!(Self::MAX_BUF_SIZE > MESSAGE_SIZE_MAX);
 
     pub fn new() -> Self {
         let buffer = Self {
