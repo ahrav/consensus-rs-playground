@@ -52,6 +52,10 @@ impl<T, Tag> QueueLink<T, Tag> {
     ///
     /// `Queue::reset` does not clear node links for performance. Call this
     /// on each node before reuse if the queue was reset rather than drained.
+    ///
+    /// # Safety Note
+    /// Calling this on a node still in an active (non-reset) queue will corrupt
+    /// the queue. Only call after `Queue::reset()` or on unlinked nodes.
     pub fn reset(&mut self) {
         self.next = None;
         self.linked = false;
@@ -362,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn init_is_empty() {
+    fn init() {
         let q: Queue<Node, QTag> = Queue::init();
 
         assert!(q.is_empty());
@@ -371,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn push_pop_single() {
+    fn push_pop() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(42);
 
@@ -388,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_order() {
+    fn fifo() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -407,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn peek_does_not_remove() {
+    fn peek() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(42);
 
@@ -421,7 +425,27 @@ mod tests {
     }
 
     #[test]
-    fn take_all_transfers_ownership() {
+    fn peek_returns_head_in_multi_element_queue() {
+        let mut q: Queue<Node, QTag> = Queue::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        q.push(&mut a);
+        q.push(&mut b);
+        q.push(&mut c);
+
+        // Peek should return head (value 1), not tail (value 3)
+        let peeked = q.peek().unwrap();
+        assert!(unsafe { peeked.as_ref().value } == 1);
+
+        // Verify it's actually the head by checking pop returns same node
+        let popped = q.pop().unwrap();
+        assert!(peeked == popped);
+    }
+
+    #[test]
+    fn take_all() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -442,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_empties_queue() {
+    fn reset() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
 
@@ -456,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_finds_node() {
+    fn contains() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -471,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_push_pop() {
+    fn interleaved() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -490,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn node_link_cleared_after_pop() {
+    fn pop_clears_link() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -506,7 +530,7 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    fn check_invariants_on_valid_queue() {
+    fn invariants() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -528,7 +552,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "pushing already-linked node")]
-    fn push_linked_node_panics() {
+    fn push_linked_panics() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
 
@@ -539,27 +563,27 @@ mod tests {
     // ==================== Boundary Condition Tests ====================
 
     #[test]
-    fn pop_empty_returns_none() {
+    fn pop_empty() {
         let mut q: Queue<Node, QTag> = Queue::init();
         assert!(q.pop().is_none());
         assert!(q.pop().is_none()); // Multiple pops on empty
     }
 
     #[test]
-    fn peek_empty_returns_none() {
+    fn peek_empty() {
         let q: Queue<Node, QTag> = Queue::init();
         assert!(q.peek().is_none());
     }
 
     #[test]
-    fn contains_on_empty_is_false() {
+    fn contains_empty() {
         let q: Queue<Node, QTag> = Queue::init();
         let a = Node::new(1);
         assert!(!q.contains(&a));
     }
 
     #[test]
-    fn take_all_empty_returns_empty() {
+    fn take_all_empty() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let taken = q.take_all();
 
@@ -568,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn default_creates_empty_queue() {
+    fn default() {
         let q: Queue<Node, QTag> = Queue::default();
         assert!(q.is_empty());
         assert!(q.len() == 0);
@@ -577,7 +601,7 @@ mod tests {
     // ==================== QueueLink Direct API Tests ====================
 
     #[test]
-    fn queue_link_new_and_default_equivalent() {
+    fn link_default() {
         let link1: QueueLink<Node, QTag> = QueueLink::new();
         let link2: QueueLink<Node, QTag> = QueueLink::default();
         assert!(link1.is_unlinked());
@@ -585,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_link_reset_idempotent() {
+    fn link_reset() {
         let mut link: QueueLink<Node, QTag> = QueueLink::new();
         link.reset();
         assert!(link.is_unlinked());
@@ -596,7 +620,7 @@ mod tests {
     // ==================== State Transition Tests ====================
 
     #[test]
-    fn pop_until_empty_state_transitions() {
+    fn pop_until_empty() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -627,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn single_element_head_equals_tail() {
+    fn head_is_tail() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
 
@@ -709,6 +733,49 @@ mod tests {
         q.push(&mut b); // b is middle
         q.push(&mut c);
         q.push(&mut b); // Should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "pushing already-linked node")]
+    fn push_to_different_queue_same_tag_panics() {
+        let mut q1: Queue<Node, QTag> = Queue::init();
+        let mut q2: Queue<Node, QTag> = Queue::init();
+        let mut a = Node::new(1);
+
+        q1.push(&mut a);
+        q2.push(&mut a); // Should panic - same tag, already linked
+    }
+
+    #[test]
+    #[should_panic(expected = "pushing already-linked node")]
+    fn reset_then_repush_without_link_reset_panics() {
+        let mut q: Queue<Node, QTag> = Queue::init();
+        let mut a = Node::new(1);
+
+        q.push(&mut a);
+        q.reset(); // Queue empty, but a.link still marked as linked
+
+        q.push(&mut a); // Should panic - link not reset
+    }
+
+    #[test]
+    #[should_panic(expected = "cycle detected in queue")]
+    fn contains_detects_cycle() {
+        let mut q: Queue<Node, QTag> = Queue::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        q.push(&mut a);
+        q.push(&mut b);
+
+        // Manually create a cycle: b.next -> a (instead of None)
+        // This is intentionally creating invalid state for testing
+        let a_ptr = NonNull::from(&mut a);
+        b.link.next = Some(a_ptr);
+
+        let c = Node::new(999);
+        // contains will traverse: a -> b -> a -> b -> ... and should panic
+        let _ = q.contains(&c);
     }
 
     // ==================== Contains Edge Cases ====================
