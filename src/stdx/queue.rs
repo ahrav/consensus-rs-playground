@@ -36,3 +36,9 @@ impl<T, Tag> QueueLink<T, Tag> {
         assert!(self.is_unlinked());
     }
 }
+
+impl<T, Tag> Default for QueueLink<T, Tag> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
