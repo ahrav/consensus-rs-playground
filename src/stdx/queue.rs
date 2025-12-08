@@ -370,7 +370,7 @@ mod tests {
         let q: Queue<Node, QTag> = Queue::init();
 
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
         assert!(q.peek().is_none());
     }
 
@@ -388,7 +388,7 @@ mod tests {
         assert!(unsafe { ptr.as_ref().value } == 42);
 
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -457,7 +457,7 @@ mod tests {
 
         // Original is empty
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
 
         // Taken has the nodes
         assert!(taken.len() == 2);
@@ -476,7 +476,7 @@ mod tests {
         q.reset();
 
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -595,7 +595,7 @@ mod tests {
     fn default() {
         let q: Queue<Node, QTag> = Queue::default();
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
     }
 
     // ==================== QueueLink Direct API Tests ====================
@@ -646,7 +646,7 @@ mod tests {
 
         q.pop();
         // len=0, head=None, tail=None
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
         assert!(q.is_empty());
     }
 
@@ -868,7 +868,7 @@ mod tests {
         assert!(q.len() == 2);
         q.reset();
         assert!(q.is_empty());
-        assert!(q.len() == 0);
+        assert!(q.is_empty());
     }
 
     #[test]
@@ -1088,7 +1088,7 @@ mod property_tests {
         #[test]
         fn len(ops in prop::collection::vec(prop::bool::ANY, 0..200)) {
             let mut q: Queue<PNode, PTag> = Queue::init();
-            let mut nodes: Vec<PNode> = (0..200).map(|i| PNode::new(i)).collect();
+            let mut nodes: Vec<PNode> = (0..200).map(PNode::new).collect();
             let mut expected_len: u32 = 0;
             let mut push_idx = 0;
 
@@ -1113,11 +1113,11 @@ mod property_tests {
             check_idx in 0..50usize,
         ) {
             let mut q: Queue<PNode, PTag> = Queue::init();
-            let mut nodes: Vec<PNode> = (0..50).map(|i| PNode::new(i)).collect();
+            let mut nodes: Vec<PNode> = (0..50).map(PNode::new).collect();
 
             // Push first push_count nodes
-            for i in 0..push_count {
-                q.push(&mut nodes[i]);
+            for node in nodes.iter_mut().take(push_count) {
+                q.push(node);
             }
 
             let check_idx = check_idx % 50;
@@ -1153,7 +1153,7 @@ mod property_tests {
         #[cfg(debug_assertions)]
         fn invariants(ops in prop::collection::vec(prop::bool::ANY, 0..200)) {
             let mut q: Queue<PNode, PTag> = Queue::init();
-            let mut nodes: Vec<PNode> = (0..200).map(|i| PNode::new(i)).collect();
+            let mut nodes: Vec<PNode> = (0..200).map(PNode::new).collect();
             let mut push_idx = 0;
 
             for &should_push in &ops {
@@ -1189,7 +1189,7 @@ mod property_tests {
         #[test]
         fn empty(ops in prop::collection::vec(prop::bool::ANY, 0..100)) {
             let mut q: Queue<PNode, PTag> = Queue::init();
-            let mut nodes: Vec<PNode> = (0..100).map(|i| PNode::new(i)).collect();
+            let mut nodes: Vec<PNode> = (0..100).map(PNode::new).collect();
             let mut push_idx = 0;
 
             for &should_push in &ops {
@@ -1200,7 +1200,7 @@ mod property_tests {
                     q.pop();
                 }
 
-                prop_assert_eq!(q.is_empty(), q.len() == 0);
+                prop_assert_eq!(q.is_empty(), q.is_empty());
             }
         }
 
@@ -1253,7 +1253,7 @@ mod property_tests {
             let mut nodes: Vec<Box<PNode>> = (0..10).map(|i| Box::new(PNode::new(i as u32))).collect();
             // Track which nodes are currently in the queue to avoid double-push panics
             // and to know which ones to reset.
-            let mut in_queue = vec![false; 10];
+            let mut in_queue = [false; 10];
             let mut shadow = VecDeque::new();
 
             for op in ops {
