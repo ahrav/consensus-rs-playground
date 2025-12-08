@@ -337,7 +337,7 @@ mod tests {
     type FieldCorruptor = (&'static str, fn(&mut Header));
 
     #[test]
-    fn new_header_is_valid() {
+    fn new_header_defaults() {
         let h = Header::new(Command::Ping, 1, 0);
 
         assert!(h.command == Command::Ping);

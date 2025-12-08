@@ -102,10 +102,9 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn empty_input_produces_valid_mac() {
-        let result = checksum(b"");
-        // Should not panic; MAC should be valid (non-zero is typical but not required)
-        let _ = result;
+    fn empty_input_no_panic() {
+        let data: [u8; 0] = [];
+        let _ = checksum(&data);
     }
 
     #[test]
