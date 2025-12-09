@@ -265,11 +265,21 @@ impl<T, const N: usize> Iops<T, N> {
         assert!(self.in_use + self.available() == self.capacity());
     }
 
+    /// Checks if `ptr` points to a valid slot within this pool.
+    ///
+    /// Uses checked arithmetic to guard against overflow on platforms where
+    /// `len * size_of::<Iop<T>>()` could theoretically wrap.
     #[inline]
     fn contains_ptr(&self, ptr: NonNull<Iop<T>>) -> bool {
         let ptr_addr = ptr.as_ptr() as usize;
         let slots_start = self.slots.as_ptr() as usize;
-        let slots_end = slots_start + (self.slots.len() * size_of::<Iop<T>>());
+
+        let Some(byte_len) = self.slots.len().checked_mul(size_of::<Iop<T>>()) else {
+            return false;
+        };
+        let Some(slots_end) = slots_start.checked_add(byte_len) else {
+            return false;
+        };
 
         if ptr_addr < slots_start || ptr_addr >= slots_end {
             return false;
@@ -336,6 +346,20 @@ impl<T, const N: usize> Iops<T, N> {
 
         // Free list length matches available
         assert!(self.free.len() == self.capacity() - self.in_use);
+    }
+}
+
+#[cfg(debug_assertions)]
+impl<T, const N: usize> Drop for Iops<T, N> {
+    fn drop(&mut self) {
+        // Skip check if already panicking to avoid double-panic abort
+        if !std::thread::panicking() {
+            assert!(
+                self.in_use == 0,
+                "Iops dropped with {} slots still acquired - caller holds dangling pointers",
+                self.in_use
+            );
+        }
     }
 }
 
@@ -497,6 +521,51 @@ mod tests {
             pool.release(ptr);
             pool.get(ptr); // Should panic
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn release_from_different_pool_panics() {
+        let mut pool_a: Iops<u32, 4> = Iops::new(|i| i as u32);
+        let mut pool_b: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        let ptr_a = pool_a.acquire().unwrap();
+
+        // Attempt to release ptr_a into pool_b - should panic on contains_ptr check
+        unsafe { pool_b.release(ptr_a) };
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn get_from_different_pool_panics() {
+        let pool_a: Iops<u32, 4> = Iops::new(|i| i as u32);
+        let mut pool_b: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        let ptr_b = pool_b.acquire().unwrap();
+
+        // Attempt to get ptr_b from pool_a - should panic on contains_ptr check
+        unsafe { pool_a.get(ptr_b) };
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn fabricated_pointer_panics() {
+        let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        // Create a fabricated pointer that was never acquired
+        let fake_ptr = NonNull::dangling();
+
+        // Attempt to release fabricated pointer - should panic on contains_ptr check
+        unsafe { pool.release(fake_ptr) };
+    }
+
+    #[test]
+    #[should_panic(expected = "Iops dropped with")]
+    #[cfg(debug_assertions)]
+    fn drop_with_acquired_slots_panics() {
+        let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+        let _ptr = pool.acquire().unwrap();
+        // pool drops here with in_use > 0
     }
 
     // ==================== Boundary Condition Tests ====================
@@ -881,18 +950,25 @@ mod property_tests {
         #[test]
         fn acquired_pointers_unique(acquire_count in 1..=16usize) {
             let mut pool: Iops<u32, 16> = Iops::new(|i| i as u32);
-            let mut ptrs: HashSet<usize> = HashSet::new();
+            let mut ptrs: Vec<NonNull<Iop<u32>>> = Vec::new();
+            let mut addrs: HashSet<usize> = HashSet::new();
 
             for _ in 0..acquire_count {
                 let ptr = pool.acquire().unwrap();
                 let addr = ptr.as_ptr() as usize;
 
                 // Each pointer must be unique
-                prop_assert!(!ptrs.contains(&addr), "duplicate pointer allocated!");
-                ptrs.insert(addr);
+                prop_assert!(!addrs.contains(&addr), "duplicate pointer allocated!");
+                addrs.insert(addr);
+                ptrs.push(ptr);
             }
 
-            prop_assert_eq!(ptrs.len(), acquire_count);
+            prop_assert_eq!(addrs.len(), acquire_count);
+
+            // Cleanup
+            for ptr in ptrs {
+                unsafe { pool.release(ptr) };
+            }
         }
 
         /// Pool never allocates beyond capacity
