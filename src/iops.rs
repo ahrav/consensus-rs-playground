@@ -1,3 +1,40 @@
+//! Type-safe object pool for I/O operation slots.
+//!
+//! Provides fixed-capacity pools where slots are acquired by pointer and released back
+//! when complete. Uses an intrusive linked list internally for O(1) acquire/release
+//! without additional allocations.
+//!
+//! # Design Decisions
+//!
+//! **Pointer-based API**: Returns [`NonNull<Iop<T>>`] rather than RAII guards. This avoids
+//! lifetime complexity when slots must outlive the borrow of the pool (e.g., I/O callbacks).
+//! The tradeoff is that callers must manually release slots and ensure pointer validity.
+//!
+//! **FIFO ordering**: Released slots are reused in FIFO order for cache locality.
+//!
+//! **Not thread-safe**: The pool requires `&mut self` for all state-mutating operations.
+//! External synchronization is needed for concurrent access.
+//!
+//! # Example
+//!
+//! ```
+//! use consensus::iops::Iops;
+//!
+//! let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+//!
+//! // Acquire a slot
+//! let ptr = pool.acquire().expect("pool not exhausted");
+//!
+//! // Access the value
+//! unsafe {
+//!     pool.get_mut(ptr).value = 42;
+//!     assert_eq!(pool.get(ptr).value, 42);
+//!
+//!     // Release when done
+//!     pool.release(ptr);
+//! }
+//! ```
+
 use crate::stdx::queue::{Queue, QueueLink, QueueNode};
 use core::ptr::NonNull;
 
@@ -7,9 +44,15 @@ const _: () = assert!(
     "Platform must have at least 32-bit addressing"
 );
 
+/// Phantom tag for the free-list intrusive queue.
 enum FreeTag {}
 
+/// A single slot in an [`Iops`] pool.
+///
+/// Wraps user data (`value`) with pool bookkeeping. The `value` field is public
+/// for direct access; use [`Iops::get`] or [`Iops::get_mut`] to obtain references.
 pub struct Iop<T> {
+    /// User-provided data stored in this slot.
     pub value: T,
     free_link: QueueLink<Iop<T>, FreeTag>,
     acquired: bool,
@@ -40,15 +83,31 @@ impl<T> QueueNode<FreeTag> for Iop<T> {
     }
 }
 
+/// Fixed-capacity pool of [`Iop<T>`] slots.
+///
+/// Allocates `N` slots on construction. Slots are acquired and released by pointer,
+/// enabling zero-allocation I/O dispatch patterns where operations must outlive
+/// borrows of the pool.
+///
+/// # Capacity
+///
+/// The const generic `N` must be in `1..=u32::MAX`. Internally uses `u32` counters
+/// for portability across 32/64-bit platforms.
 pub struct Iops<T, const N: usize> {
     slots: Box<[Iop<T>]>,
-    free: Queue<Iop<T>, FreeTag>, // intrusive queue
+    free: Queue<Iop<T>, FreeTag>,
     in_use: u32,
 }
 
 impl<T, const N: usize> Iops<T, N> {
+    /// Maximum pool capacity, limited by `u32` counters.
     pub const MAX_CAPACITY: usize = u32::MAX as usize;
 
+    /// Creates a pool with `N` slots, initializing each with `init(index)`.
+    ///
+    /// # Panics
+    ///
+    /// Compile-time panic if `N == 0` or `N > u32::MAX`.
     pub fn new(mut init: impl FnMut(usize) -> T) -> Self {
         // Compile-time validations
         const { assert!(N > 0, "Pool capacity must be > 0") };
@@ -103,6 +162,7 @@ impl<T, const N: usize> Iops<T, N> {
         avail
     }
 
+    /// Returns `true` if all slots are currently acquired.
     #[inline]
     pub fn is_exhausted(&self) -> bool {
         let exhausted = self.free.is_empty();
@@ -110,6 +170,17 @@ impl<T, const N: usize> Iops<T, N> {
         exhausted
     }
 
+    /// Acquires a slot from the pool.
+    ///
+    /// Returns `None` if the pool is exhausted. The returned pointer remains valid
+    /// until [`release`](Self::release) is called with it. Slots are reused in FIFO
+    /// order.
+    ///
+    /// # Slot Lifecycle
+    ///
+    /// 1. Call `acquire()` to obtain a pointer
+    /// 2. Use [`get`](Self::get)/[`get_mut`](Self::get_mut) to access the slot
+    /// 3. Call [`release`](Self::release) when done (required, not automatic)
     pub fn acquire(&mut self) -> Option<NonNull<Iop<T>>> {
         let old_in_use = self.in_use();
         let old_avail = self.available();
