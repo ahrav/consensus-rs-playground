@@ -136,6 +136,13 @@ impl<T, const N: usize> Iops<T, N> {
         Some(ptr)
     }
 
+    /// Get mutable access to an acquired slot.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been returned by a prior call to `acquire()` on this pool
+    /// - `ptr` must not have been released since acquisition
+    /// - The caller must ensure no other references to this slot exist
     pub unsafe fn get_mut(&mut self, ptr: NonNull<Iop<T>>) -> &mut Iop<T> {
         assert!(self.contains_ptr(ptr));
         let iop = unsafe { &mut *ptr.as_ptr() };
@@ -143,6 +150,12 @@ impl<T, const N: usize> Iops<T, N> {
         iop
     }
 
+    /// Get shared access to an acquired slot.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been returned by a prior call to `acquire()` on this pool
+    /// - `ptr` must not have been released since acquisition
     pub unsafe fn get(&self, ptr: NonNull<Iop<T>>) -> &Iop<T> {
         assert!(self.contains_ptr(ptr));
         let iop = unsafe { &*ptr.as_ptr() };
@@ -150,6 +163,13 @@ impl<T, const N: usize> Iops<T, N> {
         iop
     }
 
+    /// Release an acquired slot back to the pool.
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` must have been returned by a prior call to `acquire()` on this pool
+    /// - `ptr` must not have been released since acquisition
+    /// - The caller must ensure no references to this slot exist after release
     pub unsafe fn release(&mut self, ptr: NonNull<Iop<T>>) {
         assert!(self.contains_ptr(ptr));
 
@@ -185,7 +205,7 @@ impl<T, const N: usize> Iops<T, N> {
         }
 
         let offset = ptr_addr - slots_start;
-        offset % size_of::<Iop<T>>() == 0
+        offset.is_multiple_of(size_of::<Iop<T>>())
     }
 
     /// Compute slot index from pointer. For debugging.
@@ -251,6 +271,8 @@ impl<T, const N: usize> Iops<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ==================== Basic Operations ====================
 
     #[test]
     fn new_pool_is_empty() {
@@ -392,14 +414,356 @@ mod tests {
             pool.get_mut(ptr); // Should panic
         }
     }
+
+    #[test]
+    #[should_panic(expected = "get on non-acquired slot")]
+    fn get_on_released_panics() {
+        let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        let ptr = pool.acquire().unwrap();
+
+        unsafe {
+            pool.release(ptr);
+            pool.get(ptr); // Should panic
+        }
+    }
+
+    // ==================== Boundary Condition Tests ====================
+
+    #[test]
+    fn single_slot_pool() {
+        let mut pool: Iops<u32, 1> = Iops::new(|i| i as u32);
+
+        assert!(pool.capacity() == 1);
+        assert!(pool.available() == 1);
+        assert!(!pool.is_exhausted());
+
+        let ptr = pool.acquire().unwrap();
+        assert!(pool.is_exhausted());
+        assert!(pool.acquire().is_none());
+
+        unsafe {
+            assert!(pool.get(ptr).value == 0);
+            pool.release(ptr);
+        }
+
+        assert!(!pool.is_exhausted());
+        assert!(pool.available() == 1);
+
+        // Acquire again
+        let ptr2 = pool.acquire().unwrap();
+        assert!(pool.is_exhausted());
+        unsafe { pool.release(ptr2) };
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn single_slot_invariants() {
+        let mut pool: Iops<u32, 1> = Iops::new(|_| 42);
+        pool.check_invariants();
+
+        let ptr = pool.acquire().unwrap();
+        pool.check_invariants();
+
+        unsafe { pool.release(ptr) };
+        pool.check_invariants();
+    }
+
+    // ==================== ZST (Zero-Sized Type) Tests ====================
+
+    #[test]
+    fn zst_pool() {
+        // Zero-sized type - Iop<()> still has non-zero size due to QueueLink and bool
+        let mut pool: Iops<(), 4> = Iops::new(|_| ());
+
+        assert!(pool.capacity() == 4);
+        assert!(pool.available() == 4);
+
+        // Verify Iop<()> is NOT zero-sized (has link and acquired fields)
+        assert!(size_of::<Iop<()>>() > 0);
+
+        let ptr = pool.acquire().unwrap();
+        assert!(pool.in_use() == 1);
+
+        unsafe { pool.release(ptr) };
+        assert!(pool.in_use() == 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn zst_invariants() {
+        let mut pool: Iops<(), 8> = Iops::new(|_| ());
+        pool.check_invariants();
+
+        let mut ptrs = Vec::new();
+        for _ in 0..8 {
+            ptrs.push(pool.acquire().unwrap());
+            pool.check_invariants();
+        }
+
+        for ptr in ptrs {
+            unsafe { pool.release(ptr) };
+            pool.check_invariants();
+        }
+    }
+
+    // ==================== Pointer Validation Tests ====================
+
+    #[test]
+    fn contains_ptr_alignment() {
+        let pool: Iops<u64, 4> = Iops::new(|i| i as u64);
+
+        // Get a valid pointer's address
+        let valid_ptr = NonNull::from(&pool.slots[0]);
+        assert!(pool.contains_ptr(valid_ptr));
+
+        // Create a misaligned pointer (offset by 1 byte)
+        let misaligned_addr = valid_ptr.as_ptr() as usize + 1;
+        let misaligned_ptr = NonNull::new(misaligned_addr as *mut Iop<u64>).unwrap();
+        assert!(!pool.contains_ptr(misaligned_ptr));
+    }
+
+    #[test]
+    fn contains_ptr_bounds() {
+        let pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        // Valid pointers
+        for i in 0..4 {
+            let ptr = NonNull::from(&pool.slots[i]);
+            assert!(pool.contains_ptr(ptr));
+        }
+
+        // Pointer before slots
+        let before_addr = pool.slots.as_ptr() as usize - size_of::<Iop<u32>>();
+        if let Some(before_ptr) = NonNull::new(before_addr as *mut Iop<u32>) {
+            assert!(!pool.contains_ptr(before_ptr));
+        }
+
+        // Pointer after slots
+        let after_addr = pool.slots.as_ptr() as usize + (4 * size_of::<Iop<u32>>());
+        if let Some(after_ptr) = NonNull::new(after_addr as *mut Iop<u32>) {
+            assert!(!pool.contains_ptr(after_ptr));
+        }
+    }
+
+    // ==================== ptr_to_index Tests ====================
+
+    #[test]
+    fn ptr_to_index_mapping() {
+        let mut pool: Iops<u32, 8> = Iops::new(|i| i as u32);
+
+        // Acquire all slots and verify ptr_to_index returns correct indices
+        let mut ptrs = Vec::new();
+        for _ in 0..8 {
+            ptrs.push(pool.acquire().unwrap());
+        }
+
+        // The indices should cover 0..8 (order depends on free list)
+        let mut indices: Vec<u32> = ptrs.iter().map(|&ptr| pool.ptr_to_index(ptr)).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        for ptr in ptrs {
+            unsafe { pool.release(ptr) };
+        }
+    }
+
+    #[test]
+    fn ptr_to_index_matches_value() {
+        let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        // Values are initialized with their index, so we can verify
+        for _ in 0..4 {
+            let ptr = pool.acquire().unwrap();
+            let idx = pool.ptr_to_index(ptr);
+            let value = unsafe { pool.get(ptr).value };
+            assert_eq!(idx, value);
+            unsafe { pool.release(ptr) };
+        }
+    }
+
+    // ==================== FIFO Ordering Tests ====================
+
+    #[test]
+    fn fifo_ordering() {
+        let mut pool: Iops<u32, 8> = Iops::new(|i| i as u32);
+
+        // Acquire all 8 slots - should get them in order 0,1,2,3,4,5,6,7
+        let mut first_round: Vec<NonNull<Iop<u32>>> = Vec::new();
+        let mut first_values: Vec<u32> = Vec::new();
+        for _ in 0..8 {
+            let ptr = pool.acquire().unwrap();
+            first_values.push(unsafe { pool.get(ptr).value });
+            first_round.push(ptr);
+        }
+
+        // Release in reverse order: 7,6,5,4,3,2,1,0
+        for ptr in first_round.into_iter().rev() {
+            unsafe { pool.release(ptr) };
+        }
+
+        // Now acquire again - FIFO means we should get them in the order they were released
+        // Released order was 7,6,5,4,3,2,1,0, so acquire should return 7,6,5,4,3,2,1,0
+        let mut second_values: Vec<u32> = Vec::new();
+        for _ in 0..8 {
+            let ptr = pool.acquire().unwrap();
+            second_values.push(unsafe { pool.get(ptr).value });
+            unsafe { pool.release(ptr) };
+        }
+
+        // The second round should be reverse of first round (FIFO after reverse release)
+        let expected: Vec<u32> = first_values.iter().rev().copied().collect();
+        assert_eq!(second_values, expected);
+    }
+
+    #[test]
+    fn interleaved_acquire_release() {
+        let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
+
+        // Acquire slots 0, 1
+        let p0 = pool.acquire().unwrap();
+        let p1 = pool.acquire().unwrap();
+
+        // Release slot 0
+        unsafe { pool.release(p0) };
+
+        // Acquire slot 2 (should be slot 2, not 0 - FIFO)
+        let p2 = pool.acquire().unwrap();
+
+        // Release slot 1
+        unsafe { pool.release(p1) };
+
+        // Acquire next (should be slot 3 - FIFO)
+        let p3 = pool.acquire().unwrap();
+
+        // Now acquire again (should be slot 0 - first released)
+        let p0_again = pool.acquire().unwrap();
+
+        // Verify we got distinct slots
+        let v2 = unsafe { pool.get(p2).value };
+        let v3 = unsafe { pool.get(p3).value };
+        let v0_again = unsafe { pool.get(p0_again).value };
+
+        // Values should be 2, 3, 0 respectively (FIFO ordering)
+        assert_eq!(v2, 2);
+        assert_eq!(v3, 3);
+        assert_eq!(v0_again, 0);
+
+        // Cleanup
+        unsafe {
+            pool.release(p2);
+            pool.release(p3);
+            pool.release(p0_again);
+        }
+    }
+
+    // ==================== Large Pool Tests ====================
+
+    #[test]
+    fn large_pool() {
+        const SIZE: usize = 1000;
+        let mut pool: Iops<u32, SIZE> = Iops::new(|i| i as u32);
+
+        assert!(pool.capacity() == SIZE as u32);
+
+        let mut ptrs = Vec::with_capacity(SIZE);
+        for _ in 0..SIZE {
+            ptrs.push(pool.acquire().unwrap());
+        }
+
+        assert!(pool.is_exhausted());
+        assert!(pool.acquire().is_none());
+
+        for ptr in ptrs {
+            unsafe { pool.release(ptr) };
+        }
+
+        assert!(!pool.is_exhausted());
+        assert!(pool.available() == SIZE as u32);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn large_pool_invariants() {
+        const SIZE: usize = 100;
+        let mut pool: Iops<u32, SIZE> = Iops::new(|i| i as u32);
+        pool.check_invariants();
+
+        // Acquire half
+        let mut ptrs = Vec::new();
+        for _ in 0..SIZE / 2 {
+            ptrs.push(pool.acquire().unwrap());
+        }
+        pool.check_invariants();
+
+        // Release all
+        for ptr in ptrs {
+            unsafe { pool.release(ptr) };
+        }
+        pool.check_invariants();
+    }
+
+    // ==================== Complex Value Type Tests ====================
+
+    #[test]
+    fn complex_value_type() {
+        #[derive(Debug, PartialEq)]
+        struct ComplexValue {
+            id: u64,
+            data: [u8; 32],
+            flag: bool,
+        }
+
+        let mut pool: Iops<ComplexValue, 4> = Iops::new(|i| ComplexValue {
+            id: i as u64,
+            data: [i as u8; 32],
+            flag: i % 2 == 0,
+        });
+
+        let ptr = pool.acquire().unwrap();
+
+        unsafe {
+            let val = &pool.get(ptr).value;
+            assert_eq!(val.data, [val.id as u8; 32]);
+
+            pool.get_mut(ptr).value.flag = true;
+            assert!(pool.get(ptr).value.flag);
+
+            pool.release(ptr);
+        }
+    }
+
+    // ==================== Stress Tests ====================
+
+    #[test]
+    fn repeated_exhaust_and_refill() {
+        let mut pool: Iops<u32, 8> = Iops::new(|i| i as u32);
+
+        for iteration in 0..100 {
+            // Exhaust pool
+            let mut ptrs = Vec::new();
+            for _ in 0..8 {
+                ptrs.push(pool.acquire().unwrap());
+            }
+            assert!(pool.is_exhausted(), "iteration {}", iteration);
+
+            // Refill
+            for ptr in ptrs {
+                unsafe { pool.release(ptr) };
+            }
+            assert!(!pool.is_exhausted(), "iteration {}", iteration);
+        }
+    }
 }
 
 #[cfg(test)]
 mod property_tests {
     use super::*;
     use proptest::prelude::*;
+    use std::collections::HashSet;
 
     proptest! {
+        /// Random acquire/release operations maintain invariants
         #[test]
         fn random_ops(ops in prop::collection::vec((prop::bool::ANY, any::<usize>()), 0..200)) {
             let mut pool: Iops<u32, 16> = Iops::new(|i| i as u32);
@@ -414,17 +778,15 @@ mod property_tests {
                     } else {
                         assert!(pool.is_exhausted());
                     }
-                } else {
-                    if !acquired.is_empty() {
-                        let remove_idx = idx % acquired.len();
-                        let ptr = acquired.swap_remove(remove_idx);
+                } else if !acquired.is_empty() {
+                    let remove_idx = idx % acquired.len();
+                    let ptr = acquired.swap_remove(remove_idx);
 
-                        unsafe {
-                            // Validate before release
-                            assert!(pool.get(ptr).is_acquired());
-                            pool.release(ptr)
-                        };
-                    }
+                    unsafe {
+                        // Validate before release
+                        assert!(pool.get(ptr).is_acquired());
+                        pool.release(ptr)
+                    };
                 }
 
                 // Check invariants after every operation
@@ -442,6 +804,199 @@ mod property_tests {
             pool.check_invariants();
             assert_eq!(pool.in_use(), 0);
             assert_eq!(pool.available(), 16);
+        }
+
+        /// Acquired pointers are always unique (no double-allocation)
+        #[test]
+        fn acquired_pointers_unique(acquire_count in 1..=16usize) {
+            let mut pool: Iops<u32, 16> = Iops::new(|i| i as u32);
+            let mut ptrs: HashSet<usize> = HashSet::new();
+
+            for _ in 0..acquire_count {
+                let ptr = pool.acquire().unwrap();
+                let addr = ptr.as_ptr() as usize;
+
+                // Each pointer must be unique
+                prop_assert!(!ptrs.contains(&addr), "duplicate pointer allocated!");
+                ptrs.insert(addr);
+            }
+
+            prop_assert_eq!(ptrs.len(), acquire_count);
+        }
+
+        /// Pool never allocates beyond capacity
+        #[test]
+        fn never_exceeds_capacity(extra_attempts in 0..100usize) {
+            let mut pool: Iops<u32, 8> = Iops::new(|i| i as u32);
+            let mut acquired = Vec::new();
+
+            // Fill to capacity
+            for _ in 0..8 {
+                acquired.push(pool.acquire().unwrap());
+            }
+
+            prop_assert!(pool.is_exhausted());
+            prop_assert_eq!(pool.in_use(), 8);
+
+            // Additional acquires should all fail
+            for _ in 0..extra_attempts {
+                prop_assert!(pool.acquire().is_none());
+                prop_assert!(pool.is_exhausted());
+            }
+
+            // Cleanup
+            for ptr in acquired {
+                unsafe { pool.release(ptr) };
+            }
+        }
+
+        /// Round-trip: acquire all, release all, acquire all again works correctly
+        #[test]
+        fn round_trip(iterations in 1..10usize) {
+            let mut pool: Iops<u32, 8> = Iops::new(|i| i as u32);
+
+            for _ in 0..iterations {
+                // Acquire all
+                let mut ptrs = Vec::new();
+                for _ in 0..8 {
+                    ptrs.push(pool.acquire().unwrap());
+                }
+                prop_assert!(pool.is_exhausted());
+
+                // Release all
+                for ptr in ptrs {
+                    unsafe { pool.release(ptr) };
+                }
+                prop_assert!(!pool.is_exhausted());
+                prop_assert_eq!(pool.available(), 8);
+            }
+        }
+
+        /// Values are preserved while slots are acquired (not zeroed on acquire)
+        #[test]
+        fn values_preserved_while_acquired(modifications in prop::collection::vec(any::<u32>(), 1..16)) {
+            let mut pool: Iops<u32, 16> = Iops::new(|i| i as u32);
+            let mut ptrs = Vec::new();
+
+            // Acquire slots and modify values
+            for &new_val in &modifications {
+                let ptr = pool.acquire().unwrap();
+                unsafe { pool.get_mut(ptr).value = new_val };
+                ptrs.push((ptr, new_val));
+            }
+
+            // Verify values are preserved while still acquired
+            for &(ptr, expected) in &ptrs {
+                let actual = unsafe { pool.get(ptr).value };
+                prop_assert_eq!(actual, expected);
+            }
+
+            // Read values multiple times - should be stable
+            for &(ptr, expected) in &ptrs {
+                let actual1 = unsafe { pool.get(ptr).value };
+                let actual2 = unsafe { pool.get(ptr).value };
+                prop_assert_eq!(actual1, expected);
+                prop_assert_eq!(actual2, expected);
+            }
+
+            // Cleanup
+            for (ptr, _) in ptrs {
+                unsafe { pool.release(ptr) };
+            }
+        }
+
+        /// Values in slots are not zeroed on release (for same-slot re-acquire)
+        #[test]
+        fn values_not_zeroed_on_release(_unused in Just(())) {
+            // Use a pool of size 1 to guarantee we get the same slot back
+            let mut pool: Iops<u32, 1> = Iops::new(|_| 0);
+
+            let ptr = pool.acquire().unwrap();
+            unsafe { pool.get_mut(ptr).value = 42 };
+            unsafe { pool.release(ptr) };
+
+            // Re-acquire same slot (only slot in pool)
+            let ptr2 = pool.acquire().unwrap();
+            let value = unsafe { pool.get(ptr2).value };
+
+            // Value should still be 42 (not zeroed)
+            prop_assert_eq!(value, 42);
+
+            unsafe { pool.release(ptr2) };
+        }
+
+        /// ptr_to_index is consistent and within bounds
+        #[test]
+        fn ptr_to_index_bounds(acquire_count in 1..=16usize) {
+            let mut pool: Iops<u32, 16> = Iops::new(|i| i as u32);
+            let mut ptrs = Vec::new();
+
+            for _ in 0..acquire_count {
+                ptrs.push(pool.acquire().unwrap());
+            }
+
+            // All indices should be valid and unique
+            let indices: Vec<u32> = ptrs.iter().map(|&ptr| pool.ptr_to_index(ptr)).collect();
+            let unique_count = indices.iter().collect::<HashSet<_>>().len();
+            prop_assert_eq!(unique_count, acquire_count);
+
+            // All indices should be in bounds
+            for &idx in &indices {
+                prop_assert!(idx < 16);
+            }
+
+            // Cleanup
+            for ptr in ptrs {
+                unsafe { pool.release(ptr) };
+            }
+        }
+
+        /// Different pool sizes work correctly
+        #[test]
+        fn various_sizes(ops in prop::collection::vec(prop::bool::ANY, 0..50)) {
+            // Test with size 4
+            let mut pool4: Iops<u32, 4> = Iops::new(|i| i as u32);
+            let mut acquired4 = Vec::new();
+
+            for &should_acquire in &ops {
+                if should_acquire {
+                    if let Some(ptr) = pool4.acquire() {
+                        acquired4.push(ptr);
+                    }
+                } else if let Some(ptr) = acquired4.pop() {
+                    unsafe { pool4.release(ptr) };
+                }
+                pool4.check_invariants();
+            }
+
+            for ptr in acquired4 {
+                unsafe { pool4.release(ptr) };
+            }
+        }
+
+        /// ZST pools work correctly under random operations
+        #[test]
+        fn zst_random_ops(ops in prop::collection::vec(prop::bool::ANY, 0..100)) {
+            let mut pool: Iops<(), 8> = Iops::new(|_| ());
+            let mut acquired = Vec::new();
+
+            for should_acquire in ops {
+                if should_acquire {
+                    if let Some(ptr) = pool.acquire() {
+                        acquired.push(ptr);
+                    }
+                } else if let Some(ptr) = acquired.pop() {
+                    unsafe { pool.release(ptr) };
+                }
+
+                pool.check_invariants();
+                prop_assert_eq!(pool.in_use(), acquired.len() as u32);
+            }
+
+            // Cleanup
+            for ptr in acquired {
+                unsafe { pool.release(ptr) };
+            }
         }
     }
 }
