@@ -793,7 +793,7 @@ mod tests {
     }
 
     #[test]
-    fn contains_finds_nodes() {
+    fn contains_present_and_absent() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -808,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn node_link_cleared_after_pop() {
+    fn pop_front_clears_link() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    fn check_invariants_throughout_lifecycle() {
+    fn lifecycle_invariants() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "push_back: node already linked")]
-    fn push_back_linked_node_panics() {
+    fn panic_double_push_back() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
 
@@ -865,7 +865,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "push_front: node already linked")]
-    fn push_front_linked_node_panics() {
+    fn panic_double_push_front() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
 
@@ -875,7 +875,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "remove: node not linked")]
-    fn remove_unlinked_node_panics() {
+    fn panic_remove_unlinked() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -1028,7 +1028,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn node_link_cleared_after_remove() {
+    fn remove_clears_link() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
@@ -1210,18 +1210,6 @@ mod tests {
     }
 
     #[test]
-    fn contains_single_element() {
-        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
-        let mut a = Node::new(1);
-        let b = Node::new(2);
-
-        list.push_back(&mut a);
-
-        assert!(list.contains(&a));
-        assert!(!list.contains(&b));
-    }
-
-    #[test]
     fn contains_after_removal() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
@@ -1244,7 +1232,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "remove from empty list")]
-    fn remove_from_empty_list_panics() {
+    fn panic_remove_empty() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut node = Node::new(1);
 
@@ -1350,7 +1338,7 @@ mod tests {
             /// Note: We use Box<Node> to ensure stable addresses - Vec reallocation
             /// would move nodes and invalidate pointers (this is expected for intrusive lists).
             #[test]
-            fn arbitrary_operations_maintain_length_invariant(ops in prop::collection::vec(any::<u8>(), 0..100)) {
+            fn prop_random_ops_length(ops in prop::collection::vec(any::<u8>(), 0..100)) {
                 let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
                 // Use Box to ensure stable addresses - Vec can reallocate and move items
                 let mut nodes: Vec<Box<Node>> = Vec::new();
@@ -1390,7 +1378,7 @@ mod tests {
             /// Property: Invariants always hold after any operation sequence
             #[test]
             #[cfg(debug_assertions)]
-            fn arbitrary_operations_pass_invariant_check(ops in prop::collection::vec(any::<u8>(), 0..50)) {
+            fn prop_random_ops_invariants(ops in prop::collection::vec(any::<u8>(), 0..50)) {
                 let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
                 // Use Box to ensure stable addresses
                 let mut nodes: Vec<Box<Node>> = Vec::new();
@@ -1495,7 +1483,7 @@ mod tests {
 
             /// Property: peek_front and peek_back return correct values
             #[test]
-            fn peek_returns_correct_endpoints(
+            fn prop_peek_endpoints(
                 front_values in prop::collection::vec(any::<u32>(), 1..10),
                 back_values in prop::collection::vec(any::<u32>(), 0..10),
             ) {
@@ -1538,7 +1526,7 @@ mod tests {
 
             /// Property: popped nodes are no longer linked
             #[test]
-            fn popped_nodes_unlinked(count in 1usize..10) {
+            fn prop_pop_unlinks(count in 1usize..10) {
                 let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
                 // Pre-allocate all nodes
                 let mut nodes: Vec<Node> = (0..count).map(|i| Node::new(i as u32)).collect();
@@ -1557,7 +1545,7 @@ mod tests {
 
             /// Property: contains returns true for all nodes in list
             #[test]
-            fn contains_finds_all_nodes(count in 1usize..15) {
+            fn prop_contains_all(count in 1usize..15) {
                 let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
                 // Pre-allocate all nodes
                 let mut nodes: Vec<Node> = (0..count).map(|i| Node::new(i as u32)).collect();
@@ -1571,6 +1559,6 @@ mod tests {
                     prop_assert!(list.contains(node));
                 }
             }
+            }
         }
     }
-}
