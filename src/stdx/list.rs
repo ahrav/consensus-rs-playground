@@ -438,7 +438,7 @@ where
             visited += 1;
             assert!(visited <= self.len, "cycle detected in list");
 
-            if ptr.as_ptr() == target as *mut T {
+            if std::ptr::eq(ptr.as_ptr(), target) {
                 return true;
             }
 
@@ -600,7 +600,6 @@ mod tests {
         let list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
 
         assert!(list.is_empty());
-        assert!(list.len() == 0);
         assert!(list.peek_front().is_none());
         assert!(list.peek_back().is_none());
     }
@@ -771,7 +770,7 @@ mod tests {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(1);
         let mut b = Node::new(2);
-        let mut c = Node::new(3);
+        let c = Node::new(3);
 
         list.push_back(&mut a);
         list.push_back(&mut b);
@@ -882,5 +881,669 @@ mod tests {
         assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 3);
         assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 1);
         assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 4);
+    }
+
+    // ========================================================================
+    // API Coverage Tests
+    // ========================================================================
+
+    #[test]
+    fn peek_operations() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        // Empty list
+        assert!(list.peek_front().is_none());
+        assert!(list.peek_back().is_none());
+
+        // Single element: head == tail
+        list.push_back(&mut a);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+        assert!(unsafe { list.peek_back().unwrap().as_ref().value } == 1);
+        assert!(list.peek_front() == list.peek_back());
+
+        // Multiple elements
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+        assert!(unsafe { list.peek_back().unwrap().as_ref().value } == 3);
+
+        // Verify peek doesn't modify list
+        assert!(list.len() == 3);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+    }
+
+    #[test]
+    fn default_trait() {
+        let list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::default();
+
+        assert!(list.is_empty());
+        assert!(list.peek_front().is_none());
+        assert!(list.peek_back().is_none());
+    }
+
+    #[test]
+    fn list_link_default_trait() {
+        let link: ListLink<Node, Tag> = ListLink::default();
+
+        assert!(!link.is_linked());
+        assert!(link.prev.is_none());
+        assert!(link.next.is_none());
+    }
+
+    // ========================================================================
+    // pop_back Order Verification (Critical Gap)
+    // ========================================================================
+
+    #[test]
+    fn pop_back_order() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+
+        // Pop in reverse order
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 3);
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 2);
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 1);
+        assert!(list.pop_back().is_none());
+    }
+
+    #[test]
+    fn alternating_pop_front_back() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+        let mut d = Node::new(4);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+        list.push_back(&mut d);
+        // [1, 2, 3, 4]
+
+        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 1); // [2, 3, 4]
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 4); // [2, 3]
+        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 2); // [3]
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 3); // []
+
+        assert!(list.is_empty());
+        assert!(list.pop_front().is_none());
+        assert!(list.pop_back().is_none());
+    }
+
+    #[test]
+    fn push_front_pop_back_order() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        list.push_front(&mut a); // [1]
+        list.push_front(&mut b); // [2, 1]
+        list.push_front(&mut c); // [3, 2, 1]
+
+        // Pop from back: should be FIFO for push_front
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 1);
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 2);
+        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 3);
+    }
+
+    // ========================================================================
+    // Node State After remove() Tests
+    // ========================================================================
+
+    #[test]
+    fn node_link_cleared_after_remove() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+
+        unsafe { list.remove(NonNull::from(&mut b)) };
+
+        // Removed node should be completely unlinked
+        assert!(!b.link.is_linked());
+        assert!(b.link.prev.is_none());
+        assert!(b.link.next.is_none());
+
+        // Should be able to reuse b immediately
+        list.push_back(&mut b);
+        assert!(list.len() == 3);
+        assert!(b.link.is_linked());
+    }
+
+    // ========================================================================
+    // Consecutive Remove Tests
+    // ========================================================================
+
+    #[test]
+    fn remove_consecutive_elements() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+        let mut d = Node::new(4);
+        let mut e = Node::new(5);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+        list.push_back(&mut d);
+        list.push_back(&mut e);
+        // [1, 2, 3, 4, 5]
+
+        // Remove consecutive middle elements
+        unsafe { list.remove(NonNull::from(&mut b)) }; // [1, 3, 4, 5]
+        unsafe { list.remove(NonNull::from(&mut c)) }; // [1, 4, 5]
+
+        assert!(list.len() == 3);
+        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 1);
+        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 4);
+        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 5);
+    }
+
+    #[test]
+    fn remove_all_via_remove() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+
+        // Remove in arbitrary order (middle, head, tail)
+        unsafe { list.remove(NonNull::from(&mut b)) };
+        assert!(list.len() == 2);
+
+        unsafe { list.remove(NonNull::from(&mut a)) };
+        assert!(list.len() == 1);
+
+        unsafe { list.remove(NonNull::from(&mut c)) };
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn remove_head_and_tail_consecutively() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+        let mut c = Node::new(3);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+        list.push_back(&mut c);
+        // [1, 2, 3]
+
+        // Remove head then tail
+        unsafe { list.remove(NonNull::from(&mut a)) }; // [2, 3]
+        unsafe { list.remove(NonNull::from(&mut c)) }; // [2]
+
+        assert!(list.len() == 1);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 2);
+        assert!(list.peek_front() == list.peek_back());
+    }
+
+    // ========================================================================
+    // Two-Element List Tests
+    // ========================================================================
+
+    #[test]
+    fn two_element_list_operations() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+
+        // Verify head/tail pointers are distinct
+        assert!(list.peek_front() != list.peek_back());
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+        assert!(unsafe { list.peek_back().unwrap().as_ref().value } == 2);
+
+        // Pop front leaves tail as only element
+        list.pop_front();
+        assert!(list.len() == 1);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 2);
+        assert!(list.peek_front() == list.peek_back());
+    }
+
+    #[test]
+    fn two_element_pop_back_leaves_single() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+
+        // Pop back leaves head as only element
+        list.pop_back();
+        assert!(list.len() == 1);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+        assert!(list.peek_front() == list.peek_back());
+    }
+
+    #[test]
+    fn two_element_remove_first() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+
+        unsafe { list.remove(NonNull::from(&mut a)) };
+
+        assert!(list.len() == 1);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 2);
+        assert!(list.peek_front() == list.peek_back());
+    }
+
+    #[test]
+    fn two_element_remove_second() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+
+        unsafe { list.remove(NonNull::from(&mut b)) };
+
+        assert!(list.len() == 1);
+        assert!(unsafe { list.peek_front().unwrap().as_ref().value } == 1);
+        assert!(list.peek_front() == list.peek_back());
+    }
+
+    // ========================================================================
+    // Enhanced contains() Tests
+    // ========================================================================
+
+    #[test]
+    fn contains_empty_list() {
+        let list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let a = Node::new(1);
+
+        assert!(!list.contains(&a));
+    }
+
+    #[test]
+    fn contains_single_element() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let b = Node::new(2);
+
+        list.push_back(&mut a);
+
+        assert!(list.contains(&a));
+        assert!(!list.contains(&b));
+    }
+
+    #[test]
+    fn contains_after_removal() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut a = Node::new(1);
+        let mut b = Node::new(2);
+
+        list.push_back(&mut a);
+        list.push_back(&mut b);
+
+        assert!(list.contains(&a));
+
+        unsafe { list.remove(NonNull::from(&mut a)) };
+
+        assert!(!list.contains(&a));
+        assert!(list.contains(&b));
+    }
+
+    // ========================================================================
+    // Safety Violation Tests
+    // ========================================================================
+
+    #[test]
+    #[should_panic(expected = "remove from empty list")]
+    fn remove_from_empty_list_panics() {
+        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+        let mut node = Node::new(1);
+
+        // Force the link to appear linked without actually being in the list
+        node.link.linked = true;
+
+        // List is empty but node claims to be linked
+        unsafe { list.remove(NonNull::from(&mut node)) };
+    }
+
+    #[test]
+    fn multi_tag_support() {
+        enum Tag1 {}
+        enum Tag2 {}
+
+        struct MultiNode {
+            #[allow(dead_code)]
+            val: u32,
+            link1: ListLink<MultiNode, Tag1>,
+            link2: ListLink<MultiNode, Tag2>,
+        }
+
+        impl MultiNode {
+            fn new(val: u32) -> Self {
+                Self {
+                    val,
+                    link1: ListLink::new(),
+                    link2: ListLink::new(),
+                }
+            }
+        }
+
+        impl ListNode<Tag1> for MultiNode {
+            fn list_link(&mut self) -> &mut ListLink<Self, Tag1> {
+                &mut self.link1
+            }
+            fn list_link_ref(&self) -> &ListLink<Self, Tag1> {
+                &self.link1
+            }
+        }
+
+        impl ListNode<Tag2> for MultiNode {
+            fn list_link(&mut self) -> &mut ListLink<Self, Tag2> {
+                &mut self.link2
+            }
+            fn list_link_ref(&self) -> &ListLink<Self, Tag2> {
+                &self.link2
+            }
+        }
+
+        let mut list1: DoublyLinkedList<MultiNode, Tag1> = DoublyLinkedList::init();
+        let mut list2: DoublyLinkedList<MultiNode, Tag2> = DoublyLinkedList::init();
+
+        let mut node = MultiNode::new(42);
+
+        list1.push_back(&mut node);
+        list2.push_front(&mut node);
+
+        assert!(list1.len() == 1);
+        assert!(list2.len() == 1);
+
+        assert!(node.link1.is_linked());
+        assert!(node.link2.is_linked());
+
+        list1.pop_back();
+        assert!(!node.link1.is_linked());
+        assert!(node.link2.is_linked());
+
+        list2.pop_front();
+        assert!(!node.link2.is_linked());
+    }
+
+    // ========================================================================
+    // Property-Based Tests
+    // ========================================================================
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Operations we can perform on the list
+        #[derive(Debug, Clone, Copy)]
+        enum ListOp {
+            PushBack,
+            PushFront,
+            PopFront,
+            PopBack,
+        }
+
+        impl ListOp {
+            fn from_byte(b: u8) -> Self {
+                match b % 4 {
+                    0 => ListOp::PushBack,
+                    1 => ListOp::PushFront,
+                    2 => ListOp::PopFront,
+                    _ => ListOp::PopBack,
+                }
+            }
+        }
+
+        proptest! {
+            /// Property: After any sequence of operations, length matches actual count
+            /// Note: We use Box<Node> to ensure stable addresses - Vec reallocation
+            /// would move nodes and invalidate pointers (this is expected for intrusive lists).
+            #[test]
+            fn arbitrary_operations_maintain_length_invariant(ops in prop::collection::vec(any::<u8>(), 0..100)) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Use Box to ensure stable addresses - Vec can reallocate and move items
+                let mut nodes: Vec<Box<Node>> = Vec::new();
+                let mut expected_len: usize = 0;
+
+                for (i, &op_byte) in ops.iter().enumerate() {
+                    match ListOp::from_byte(op_byte) {
+                        ListOp::PushBack => {
+                            nodes.push(Box::new(Node::new(i as u32)));
+                            list.push_back(nodes.last_mut().unwrap().as_mut());
+                            expected_len += 1;
+                        }
+                        ListOp::PushFront => {
+                            nodes.push(Box::new(Node::new(i as u32)));
+                            list.push_front(nodes.last_mut().unwrap().as_mut());
+                            expected_len += 1;
+                        }
+                        ListOp::PopFront => {
+                            if expected_len > 0 {
+                                list.pop_front();
+                                expected_len -= 1;
+                            }
+                        }
+                        ListOp::PopBack => {
+                            if expected_len > 0 {
+                                list.pop_back();
+                                expected_len -= 1;
+                            }
+                        }
+                    }
+
+                    // Invariant must hold after every operation
+                    prop_assert_eq!(list.len() as usize, expected_len);
+                }
+            }
+
+            /// Property: Invariants always hold after any operation sequence
+            #[test]
+            #[cfg(debug_assertions)]
+            fn arbitrary_operations_pass_invariant_check(ops in prop::collection::vec(any::<u8>(), 0..50)) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Use Box to ensure stable addresses
+                let mut nodes: Vec<Box<Node>> = Vec::new();
+                let mut count: usize = 0;
+
+                for (i, &op_byte) in ops.iter().enumerate() {
+                    match ListOp::from_byte(op_byte) {
+                        ListOp::PushBack => {
+                            nodes.push(Box::new(Node::new(i as u32)));
+                            list.push_back(nodes.last_mut().unwrap().as_mut());
+                            count += 1;
+                        }
+                        ListOp::PushFront => {
+                            nodes.push(Box::new(Node::new(i as u32)));
+                            list.push_front(nodes.last_mut().unwrap().as_mut());
+                            count += 1;
+                        }
+                        ListOp::PopFront => {
+                            if count > 0 {
+                                list.pop_front();
+                                count -= 1;
+                            }
+                        }
+                        ListOp::PopBack => {
+                            if count > 0 {
+                                list.pop_back();
+                                count -= 1;
+                            }
+                        }
+                    }
+
+                    // Invariants must hold after every operation
+                    list.check_invariants();
+                }
+            }
+
+            /// Property: push_back followed by pop_back returns same element (when list was empty)
+            #[test]
+            fn push_back_pop_back_roundtrip(value in any::<u32>()) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                let mut node = Node::new(value);
+
+                list.push_back(&mut node);
+                let ptr = list.pop_back().unwrap();
+
+                prop_assert_eq!(unsafe { ptr.as_ref().value }, value);
+                prop_assert!(list.is_empty());
+            }
+
+            /// Property: push_front followed by pop_front returns same element (when list was empty)
+            #[test]
+            fn push_front_pop_front_roundtrip(value in any::<u32>()) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                let mut node = Node::new(value);
+
+                list.push_front(&mut node);
+                let ptr = list.pop_front().unwrap();
+
+                prop_assert_eq!(unsafe { ptr.as_ref().value }, value);
+                prop_assert!(list.is_empty());
+            }
+
+            /// Property: push_back preserves FIFO order with pop_front
+            /// Pre-allocate all nodes before adding to list to avoid reallocation
+            #[test]
+            fn fifo_order_preserved(values in prop::collection::vec(any::<u32>(), 1..20)) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Pre-allocate all nodes before adding to list
+                let mut nodes: Vec<Node> = values.iter().map(|&v| Node::new(v)).collect();
+
+                for node in &mut nodes {
+                    list.push_back(node);
+                }
+
+                for &expected in &values {
+                    let ptr = list.pop_front().unwrap();
+                    prop_assert_eq!(unsafe { ptr.as_ref().value }, expected);
+                }
+
+                prop_assert!(list.is_empty());
+            }
+
+            /// Property: push_back preserves LIFO order with pop_back
+            #[test]
+            fn lifo_order_preserved(values in prop::collection::vec(any::<u32>(), 1..20)) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Pre-allocate all nodes before adding to list
+                let mut nodes: Vec<Node> = values.iter().map(|&v| Node::new(v)).collect();
+
+                for node in &mut nodes {
+                    list.push_back(node);
+                }
+
+                // Pop in reverse order
+                for &expected in values.iter().rev() {
+                    let ptr = list.pop_back().unwrap();
+                    prop_assert_eq!(unsafe { ptr.as_ref().value }, expected);
+                }
+
+                prop_assert!(list.is_empty());
+            }
+
+            /// Property: peek_front and peek_back return correct values
+            #[test]
+            fn peek_returns_correct_endpoints(
+                front_values in prop::collection::vec(any::<u32>(), 1..10),
+                back_values in prop::collection::vec(any::<u32>(), 0..10),
+            ) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+
+                // Pre-allocate all nodes with stable addresses (Box)
+                let total = front_values.len() + back_values.len();
+                let mut nodes: Vec<Box<Node>> = Vec::with_capacity(total);
+
+                // Create all nodes first
+                for &v in &front_values {
+                    nodes.push(Box::new(Node::new(v)));
+                }
+                for &v in &back_values {
+                    nodes.push(Box::new(Node::new(v)));
+                }
+
+                // Now add to list
+                for node in &mut nodes {
+                    list.push_back(node.as_mut());
+                }
+
+                // First value should be at front
+                prop_assert_eq!(
+                    unsafe { list.peek_front().unwrap().as_ref().value },
+                    front_values[0]
+                );
+
+                // Last value should be at back
+                let expected_back = if back_values.is_empty() {
+                    front_values[front_values.len() - 1]
+                } else {
+                    back_values[back_values.len() - 1]
+                };
+                prop_assert_eq!(
+                    unsafe { list.peek_back().unwrap().as_ref().value },
+                    expected_back
+                );
+            }
+
+            /// Property: popped nodes are no longer linked
+            #[test]
+            fn popped_nodes_unlinked(count in 1usize..10) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Pre-allocate all nodes
+                let mut nodes: Vec<Node> = (0..count).map(|i| Node::new(i as u32)).collect();
+
+                for node in &mut nodes {
+                    list.push_back(node);
+                }
+
+                // Pop all and verify each becomes unlinked
+                for _ in 0..count {
+                    let ptr = list.pop_front().unwrap();
+                    let is_linked = unsafe { ptr.as_ref().link.is_linked() };
+                    prop_assert!(!is_linked);
+                }
+            }
+
+            /// Property: contains returns true for all nodes in list
+            #[test]
+            fn contains_finds_all_nodes(count in 1usize..15) {
+                let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
+                // Pre-allocate all nodes
+                let mut nodes: Vec<Node> = (0..count).map(|i| Node::new(i as u32)).collect();
+
+                for node in &mut nodes {
+                    list.push_back(node);
+                }
+
+                // All nodes should be found
+                for node in &nodes {
+                    prop_assert!(list.contains(node));
+                }
+            }
+        }
     }
 }
