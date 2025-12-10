@@ -1,3 +1,24 @@
+//! Intrusive doubly-linked list.
+//!
+//! Unlike `std::collections::LinkedList`, nodes own their link storage via [`ListLink`],
+//! enabling O(1) removal without searching. Nodes can belong to multiple lists simultaneously
+//! using distinct `Tag` types.
+//!
+//! # Design
+//!
+//! Intrusive lists avoid per-node allocation and enable O(1) removal when you have a pointer
+//! to the node. The tradeoff: nodes must embed [`ListLink`] and cannot move while linked.
+//!
+//! # Example
+//!
+//! ```ignore
+//! struct Task {
+//!     data: TaskData,
+//!     ready_link: ListLink<Task, ReadyQueue>,
+//!     timer_link: ListLink<Task, TimerWheel>,
+//! }
+//! ```
+
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 
@@ -7,14 +28,16 @@ const _: () = assert!(
     "Platform must have at least 32-bit addressing"
 );
 
-/// Intrusive double-link for a doubly linked list.
+/// Embedded link storage for intrusive list membership.
+///
+/// Each `Tag` type represents a distinct list, allowing a node to be in multiple
+/// lists simultaneously by embedding multiple `ListLink` fields.
 #[derive(Debug)]
 pub struct ListLink<T, Tag> {
     prev: Option<NonNull<T>>,
     next: Option<NonNull<T>>,
-    /// Tracks whether this node is currently in a list.
-    /// Required because head/tail nodes have None prev/next respectively,
-    /// which would otherwise be indistinguishable from an unlinked node.
+    // Tracks membership because head (prev=None) and tail (next=None) are
+    // otherwise indistinguishable from unlinked nodes.
     linked: bool,
     _tag: PhantomData<Tag>,
 }
@@ -29,13 +52,11 @@ impl<T, Tag> ListLink<T, Tag> {
         }
     }
 
-    /// Returns true if this node is currently in a list.
     #[inline]
     pub fn is_linked(&self) -> bool {
         self.linked
     }
 
-    /// Reset link to unlinked state.
     pub fn reset(&mut self) {
         self.prev = None;
         self.next = None;
@@ -54,13 +75,18 @@ impl<T, Tag> Default for ListLink<T, Tag> {
     }
 }
 
-/// Trait for nodes that can be placed in an intrusive doubly linked list.
+/// Implement for types that can be stored in a [`DoublyLinkedList<Self, Tag>`].
+///
+/// Each `Tag` requires a separate implementation pointing to its corresponding
+/// [`ListLink`] field.
 pub trait ListNode<Tag>: Sized {
     fn list_link(&mut self) -> &mut ListLink<Self, Tag>;
     fn list_link_ref(&self) -> &ListLink<Self, Tag>;
 }
 
-/// Intrusive doubly linked list.
+/// Doubly-linked list where nodes own their link storage.
+///
+/// Nodes must not move while linked. Use `u32` length for cross-platform consistency.
 #[derive(Debug)]
 pub struct DoublyLinkedList<T, Tag>
 where
@@ -123,7 +149,8 @@ where
         self.tail
     }
 
-    /// Push node to back of list.
+    /// # Panics
+    /// If `node` is already linked.
     pub fn push_back(&mut self, node: &mut T) {
         let old_len = self.len;
 
@@ -184,7 +211,8 @@ where
         assert!(node.list_link_ref().next.is_none()); // It's the new tail
     }
 
-    /// Push node to front of list.
+    /// # Panics
+    /// If `node` is already linked.
     pub fn push_front(&mut self, node: &mut T) {
         let old_len = self.len;
 
@@ -245,7 +273,6 @@ where
         assert!(node.list_link_ref().prev.is_none()); // It's the new head
     }
 
-    /// Pop node from front of list.
     pub fn pop_front(&mut self) -> Option<NonNull<T>> {
         let mut head_ptr = self.head?;
 
@@ -303,7 +330,6 @@ where
         Some(head_ptr)
     }
 
-    /// Pop node from back of list.
     pub fn pop_back(&mut self) -> Option<NonNull<T>> {
         let mut tail_ptr = self.tail?;
 
@@ -364,7 +390,9 @@ where
     /// Remove `node` in O(1).
     ///
     /// # Safety
-    /// `node` must currently be in this list.
+    ///
+    /// - `node` must be in **this specific list instance**, not just any list of the same type.
+    /// - `node` must remain valid for the duration of this call.
     pub unsafe fn remove(&mut self, mut node: NonNull<T>) {
         let old_len = self.len;
 
@@ -426,8 +454,7 @@ where
         assert!((self.head.is_none()) == (self.tail.is_none()));
     }
 
-    /// Returns true if the list contains the given node.
-    /// O(n) traversal - intended for debugging/assertions only.
+    /// O(n) search for `node`. Intended for debugging/assertions only.
     pub fn contains(&self, node: &T) -> bool {
         let target = node as *const T;
         let mut current = self.head;
@@ -449,7 +476,7 @@ where
         false
     }
 
-    /// Verify list invariants. For debugging/testing.
+    /// Verify structural invariants. Only available in debug builds.
     #[cfg(debug_assertions)]
     pub fn check_invariants(&self) {
         // Empty list checks
