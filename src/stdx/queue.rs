@@ -772,6 +772,7 @@ mod tests {
         // This is intentionally creating invalid state for testing
         let a_ptr = NonNull::from(&mut a);
         b.link.next = Some(a_ptr);
+        let _ = &b; // Keep b alive; the cycle is traversed via queue's internal pointers
 
         let c = Node::new(999);
         // contains will traverse: a -> b -> a -> b -> ... and should panic
