@@ -1,20 +1,17 @@
-//! Async I/O abstraction over platform-specific completion APIs.
+//! Async I/O over platform completion APIs.
 //!
-//! Provides a unified interface for submitting I/O operations and handling completions,
-//! abstracting over Linux's `io_uring` and macOS's Grand Central Dispatch (GCD).
+//! Targets Linux `io_uring` and macOS Grand Central Dispatch (GCD).
 //!
-//! # Architecture
+//! The API is split into:
+//! - [`IoBackend`]: submit and drain completions
+//! - [`Operation`]: read/write/fsync description
+//! - [`Completion`]: per-op state and callback
 //!
-//! The design separates concerns into three layers:
-//! - [`IoBackend`]: Platform-specific submission and completion mechanics
-//! - [`Operation`]: Describes what I/O to perform (read, write, fsync)
-//! - [`Completion`]: Tracks operation lifecycle and delivers results via callback
+//! # Safety / Ownership
 //!
-//! # Ownership Model
-//!
-//! [`Completion`] instances must be pinned and outlive their in-flight operations.
-//! The caller owns the buffer memory; this layer only holds raw pointers. Backends
-//! return completions via opaque `user_data` identifiers (pointer cast to `u64`).
+//! `Completion` values must have a stable address (pinned or otherwise immovable) while an
+//! operation is in flight. Buffers are caller-owned; this layer stores raw pointers and
+//! identifies completions via `user_data` (`Completion*` cast to `u64`).
 
 pub mod iops;
 
@@ -24,7 +21,7 @@ mod backend_linux;
 mod backend_macos;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("This IO layer currently supports only Linux (io_uring) and macOS (GCD).");
+compile_error!("This I/O layer currently supports only Linux (io_uring) and macOS (GCD).");
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -49,10 +46,13 @@ pub type Io = IoCore<BackendImpl>;
 
 /// Backend abstraction for platform-specific async I/O.
 ///
-/// Implementations handle the mechanics of submitting operations to the kernel
-/// and retrieving completions. The trait enforces a push-flush-drain pattern:
-/// operations are queued, then flushed to the kernel, then completions are drained.
+/// Callers queue operations, flush them to the kernel, then drain completions.
 pub trait IoBackend {
+    /// Minimum supported entries for this backend.
+    const ENTRIES_MIN: u32;
+    /// Maximum supported entries for this backend (inclusive).
+    const ENTRIES_MAX: u32;
+
     /// Initialize the backend with a fixed queue depth.
     fn new(entries: u32) -> io::Result<Self>
     where
@@ -80,18 +80,11 @@ pub trait IoBackend {
     fn drain<F: FnMut(u64, i32)>(&mut self, f: F);
 }
 
-/// Type tag for intrusive linked list membership. Prevents a [`Completion`]
-/// from being in multiple lists simultaneously.
+/// Intrusive list tag. A [`Completion`] can only be in one list at a time.
 enum IoTag {}
 
 /// Lifecycle state of a [`Completion`].
-///
-/// State transitions are strictly enforced:
-/// ```text
-/// Idle -> Queued -> Submitted -> Completed -> Idle
-///                       ^                       |
-///                       +--- (via reset/complete)
-/// ```
+/// State machine: `Idle -> Queued -> Submitted -> Completed -> Idle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionState {
     /// Available for use. Initial and terminal state.
@@ -104,14 +97,12 @@ pub enum CompletionState {
     Completed,
 }
 
-/// Describes an I/O operation to perform.
+/// Describes an I/O operation.
 ///
 /// # Buffer Ownership
 ///
-/// `Read` and `Write` variants hold raw pointers to caller-owned buffers.
-/// The caller must ensure buffers remain valid and pinned until the operation
-/// completes. The `len` field uses `u32` for wire compatibility and to catch
-/// oversized requests at the type level.
+/// `Read` and `Write` hold raw pointers to caller-owned buffers. Buffers must remain valid and
+/// immovable until completion. `len` is `u32` to cap request sizes and match on-wire types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operation {
     /// No operation. Used as a sentinel for uninitialized [`Completion`]s.
@@ -141,7 +132,7 @@ impl Operation {
         !matches!(self, Operation::Nop)
     }
 
-    /// Performs Tiger-style runtime validation of operation parameters.
+    /// Asserts basic invariants for this operation.
     ///
     /// # Panics
     ///
@@ -164,20 +155,18 @@ impl Operation {
 ///
 /// # Safety
 ///
-/// The callback receives the original context pointer and mutable access to the
-/// [`Completion`]. The completion is in [`Idle`](CompletionState::Idle) state
-/// when the callback runs, allowing immediate reuse.
+/// Called from [`Completion::complete`]. The `context` pointer must be valid for the chosen
+/// callback, and the [`Completion`] is already in [`Idle`](CompletionState::Idle).
 pub type CompletionCallback = unsafe fn(*mut c_void, &mut Completion);
 
 /// Handler trait for receiving I/O completion notifications.
 ///
-/// Implement this trait on your context type, then use [`typed_handler_shim`]
-/// as the [`CompletionCallback`] to get type-safe callbacks without allocation.
+/// Implement on your context type, then use [`typed_handler_shim`] as the
+/// [`CompletionCallback`] to avoid allocation and dynamic dispatch.
 ///
 /// # Safety
 ///
-/// Implementations must be prepared for `completion` to be in the [`Idle`](CompletionState::Idle)
-/// state. The completion can be immediately reused or re-submitted from within the handler.
+/// `completion` is in [`Idle`](CompletionState::Idle) and may be reused or re-submitted.
 pub trait IoHandler {
     /// Called when an I/O operation completes.
     ///
@@ -188,11 +177,9 @@ pub trait IoHandler {
     unsafe fn on_complete(&mut self, completion: &mut Completion);
 }
 
-/// Type-erased callback trampoline for [`IoHandler`] implementations.
+/// Callback trampoline for [`IoHandler`] implementations.
 ///
-/// Bridges the generic `IoHandler` trait to the type-erased [`CompletionCallback`]
-/// signature. Each instantiation (via monomorphization) creates a specialized
-/// function that knows how to cast `ctx` back to the concrete handler type.
+/// Casts `ctx` back to `T` and calls [`IoHandler::on_complete`].
 ///
 /// # Usage
 ///
@@ -206,11 +193,6 @@ pub trait IoHandler {
 /// - `ctx` must point to a valid, properly aligned `T` that outlives the I/O operation
 /// - `ctx` must be the same pointer stored in [`Completion::context`] at submission time
 /// - The `T` instance must not be moved or dropped while the operation is in flight
-///
-/// # Why not `Box<dyn IoHandler>`?
-///
-/// This pattern avoids heap allocation and dynamic dispatch. The shim is a static
-/// function pointer; the only indirection is the `ctx` pointer which we need anyway.
 unsafe fn typed_handler_shim<T: IoHandler>(ctx: *mut c_void, completion: &mut Completion) {
     // SAFETY: Caller guarantees `ctx` is a valid `*mut T` from the original submission.
     unsafe {
@@ -221,17 +203,10 @@ unsafe fn typed_handler_shim<T: IoHandler>(ctx: *mut c_void, completion: &mut Co
 
 /// Tracks the lifecycle of a single I/O operation.
 ///
-/// Uses intrusive linking (via [`ListLink`]) for zero-allocation queue management.
-/// Each completion can be in at most one queue at a time, enforced by the type system.
+/// An intrusive-list node (via [`ListLink`]) used for zero-allocation queue management.
 ///
-/// # Lifecycle
-///
-/// 1. Initialize via [`new`](Self::new) (state: `Idle`)
-/// 2. Set `op`, `context`, and `callback` fields
-/// 3. Submit to [`IoBackend`] (state: `Queued` → `Submitted`)
-/// 4. Backend signals completion (state: `Completed`)
-/// 5. Call [`complete`](Self::complete) to invoke callback and transition to `Idle`
-/// 6. Optionally call [`reset`](Self::reset) to clear fields for reuse
+/// Typical flow: create in `Idle`, fill fields, submit, then call [`complete`](Self::complete)
+/// after the backend reports completion.
 pub struct Completion {
     link: ListLink<Completion, IoTag>,
     state: CompletionState,
@@ -246,8 +221,7 @@ pub struct Completion {
     /// Callback invoked when [`complete`](Self::complete) is called.
     pub callback: Option<CompletionCallback>,
 
-    /// Backend-specific scratch space.
-    /// Used by macOS backend to stash an Arc raw pointer.
+    /// Backend scratch space (macOS stores an `Arc` raw pointer).
     pub backend_context: usize,
 }
 
@@ -275,12 +249,11 @@ impl Completion {
         self.state == CompletionState::Idle
     }
 
-    /// Resets the completion for reuse.
+    /// Resets the completion for reuse (clears all fields and returns to `Idle`).
     ///
     /// # Panics
     ///
-    /// Panics if the completion is still linked in a queue or in an invalid state
-    /// for reset (`Queued` or `Submitted`).
+    /// Panics if the completion is linked in a queue or in `Queued`/`Submitted`.
     pub fn reset(&mut self) {
         assert!(!self.link.is_linked());
         assert!(self.state == CompletionState::Idle || self.state == CompletionState::Completed);
@@ -297,10 +270,7 @@ impl Completion {
         assert!(!self.link.is_linked());
     }
 
-    /// Finalizes the completion by invoking the callback and transitioning to `Idle`.
-    ///
-    /// The callback receives the stored `context` pointer and mutable access to `self`,
-    /// allowing immediate reuse or re-submission from within the callback.
+    /// Invokes the callback (if any) and transitions to `Idle`.
     ///
     /// # Panics
     ///
@@ -354,19 +324,44 @@ impl ListNode<IoTag> for Completion {
     }
 }
 
+/// Manages I/O submission and completion.
+///
+/// Wraps a platform-specific [`IoBackend`] and queues locally when the backend is full.
+///
+/// # Backpressure Strategy
+///
+/// Instead of failing when the submission queue is full, `IoCore` keeps an overflow queue.
+/// This can grow without bound if submissions outpace completions.
+///
+/// # Invariants
+///
+/// - `inflight` ≤ `capacity` (enforced by overflow queuing)
+/// - `total_completed` ≤ `total_submitted`
+/// - Must be idle (no in-flight or queued operations) before drop
 pub struct IoCore<B: IoBackend> {
     backend: B,
+    /// Operations waiting for backend capacity.
     overflow: DoublyLinkedList<Completion, IoTag>,
+    /// Count of operations submitted to the backend but not yet completed.
     inflight: u32,
+    /// Maximum concurrent operations the backend supports.
     capacity: u32,
 
+    // Metrics.
     total_submitted: u64,
     total_completed: u64,
 }
 
 impl<B: IoBackend> IoCore<B> {
+    /// Creates a new I/O core with the specified queue depth.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `entries` is outside `[ENTRIES_MIN, ENTRIES_MAX]` or not a power of two.
     pub fn new(entries: u32) -> io::Result<Self> {
-        assert!(entries >= 4 && entries.is_power_of_two());
+        assert!(entries >= B::ENTRIES_MIN);
+        assert!(entries <= B::ENTRIES_MAX);
+        assert!(entries.is_power_of_two());
 
         Ok(Self {
             backend: B::new(entries)?,
@@ -376,5 +371,99 @@ impl<B: IoBackend> IoCore<B> {
             total_submitted: 0,
             total_completed: 0,
         })
+    }
+
+    /// Returns `true` if no operations are in-flight or queued.
+    #[inline]
+    pub fn is_idle(&self) -> bool {
+        self.inflight == 0 && self.overflow.is_empty()
+    }
+
+    /// Submits an operation, queuing locally if the backend is full.
+    ///
+    /// The completion transitions to `Submitted` if accepted by the backend,
+    /// or `Queued` if placed in the overflow queue.
+    #[inline]
+    fn enqueue(&mut self, completion: &mut Completion) {
+        let old_inflight = self.inflight;
+        if self.try_submit_one(completion).is_ok() {
+            completion.set_submitted();
+            self.inflight += 1;
+            assert!(self.inflight == old_inflight + 1);
+        } else {
+            completion.set_queued();
+            self.overflow.push_back(completion);
+            assert!(self.inflight == old_inflight);
+        }
+    }
+
+    /// Attempts to push directly to the backend (no overflow queuing).
+    ///
+    /// Returns `Err(())` if the backend submission queue is full. Does not update state.
+    #[inline]
+    pub fn try_submit_one(&mut self, completion: &mut Completion) -> Result<(), ()> {
+        let user_data = completion as *mut Completion as u64;
+        // SAFETY: Caller ensures completion and its buffers outlive the operation.
+        unsafe { self.backend.try_push(&completion.op, user_data) }
+    }
+
+    /// Submits overflowed operations until the backend is full or the queue is empty.
+    fn fill_from_overflow(&mut self) {
+        loop {
+            let mut node = match self.overflow.pop_front() {
+                Some(n) => n,
+                None => break,
+            };
+
+            // SAFETY: Node came from our overflow list, which only contains valid completions.
+            let completion = unsafe { node.as_mut() };
+            let old_inflight = self.inflight;
+
+            match self.try_submit_one(completion) {
+                Ok(()) => {
+                    completion.set_submitted();
+                    self.inflight += 1;
+                    assert!(self.inflight == old_inflight + 1);
+                }
+                Err(()) => {
+                    // Backend is full; put it back and stop.
+                    completion.set_queued();
+                    self.overflow.push_back(completion);
+                    assert!(self.inflight == old_inflight);
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Reaps all available completions from the backend.
+    ///
+    /// Updates each [`Completion`], calls [`Completion::complete`], and returns the count.
+    fn drain_completions(&mut self) -> u32 {
+        let mut reaped: u32 = 0;
+
+        self.backend.drain(|user_data, result| {
+            assert!(user_data != 0);
+            // SAFETY: user_data was set to a valid Completion pointer in try_submit_one.
+            let completion = unsafe { &mut *(user_data as *mut Completion) };
+            assert!(completion.state() == CompletionState::Submitted);
+
+            completion.result = result;
+            completion.set_completed();
+            completion.complete();
+            reaped += 1;
+        });
+
+        assert!(reaped <= self.inflight);
+        self.inflight -= reaped;
+        self.total_completed += reaped as u64;
+        reaped
+    }
+}
+
+impl<B: IoBackend> Drop for IoCore<B> {
+    fn drop(&mut self) {
+        // It is a logic error to drop the I/O system with in-flight ops.
+        assert!(self.is_idle(), "IoCore dropped with in-flight operations");
     }
 }
