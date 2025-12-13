@@ -59,23 +59,21 @@ impl IoBackend for UringBackend {
             Operation::Nop => {}
             Operation::Read {
                 fd,
-                buf,
                 len,
                 offset,
+                ..
             } => {
                 assert!(fd >= 0);
-                assert!(!buf.as_ptr().is_null());
                 assert!(len > 0);
                 assert!(offset <= i64::MAX as u64);
             }
             Operation::Write {
                 fd,
-                buf,
                 len,
                 offset,
+                ..
             } => {
                 assert!(fd >= 0);
-                assert!(!buf.as_ptr().is_null());
                 assert!(len > 0);
                 assert!(offset <= i64::MAX as u64);
             }
@@ -704,12 +702,13 @@ mod integration_tests {
         let path = dir.path().join("closed_fd_test.txt");
 
         File::create(&path).unwrap();
-        let fd = {
-            let file = File::open(&path).unwrap();
-            file.as_raw_fd()
-        };
+        let file = File::open(&path).unwrap();
+        let fd = file.as_raw_fd();
 
         let mut backend = UringBackend::new(8).unwrap();
+        
+        drop(file);
+
         let mut buf = vec![0u8; 64];
         let op = Operation::Read {
             fd,
