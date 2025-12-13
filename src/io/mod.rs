@@ -831,21 +831,21 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn validate_accepts_valid_read() {
+    fn validate_accepts_read() {
         let mut buf = [0u8; 64];
         let op = test_read_op(&mut buf);
         op.validate(); // Should not panic
     }
 
     #[test]
-    fn validate_accepts_valid_write() {
+    fn validate_accepts_write() {
         let buf = [0u8; 64];
         let op = test_write_op(&buf);
         op.validate(); // Should not panic
     }
 
     #[test]
-    fn validate_accepts_valid_fsync() {
+    fn validate_accepts_fsync() {
         let op = Operation::Fsync { fd: 3 };
         op.validate(); // Should not panic
     }
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    fn is_active_correctly_identifies_operations() {
+    fn is_active_identifies_operations() {
         assert!(!Operation::Nop.is_active());
 
         let mut buf = [0u8; 1];
@@ -928,14 +928,14 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn completion_new_is_idle() {
+    fn completion_initial_state() {
         let comp = Completion::new();
         assert!(comp.is_idle());
         assert_eq!(comp.state(), CompletionState::Idle);
     }
 
     #[test]
-    fn completion_default_is_idle() {
+    fn completion_default_idle() {
         let comp = Completion::default();
         assert!(comp.is_idle());
     }
@@ -1033,7 +1033,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn io_core_new_validates_entries() {
+    fn io_core_new_checks_entries() {
         // Valid: power of two within range.
         let io: IoCore<MockBackend> = IoCore::new(16).unwrap();
         assert!(io.is_idle());
@@ -1052,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn io_core_submit_and_complete_single_operation() {
+    fn io_core_submit_complete_one() {
         let mut io: IoCore<MockBackend> = IoCore::new(16).unwrap();
         let mut buf = [0u8; 64];
         let mut comp = Completion::new();
@@ -1091,7 +1091,7 @@ mod tests {
     }
 
     #[test]
-    fn io_core_overflow_queue_handles_backpressure() {
+    fn io_core_overflow_queue_backpressure() {
         // Capacity of 2, submit 5 operations.
         let mut io: IoCore<MockBackend> = IoCore::new(2).unwrap();
         let mut bufs = [[0u8; 64]; 5];
@@ -1138,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn io_core_run_for_ns_completes_all_operations() {
+    fn io_core_run_for_ns_completes_all() {
         let mut io: IoCore<MockBackend> = IoCore::new(4).unwrap();
         let mut bufs = [[0u8; 64]; 10];
         let mut comps: Vec<Completion> = (0..10).map(|_| Completion::new()).collect();
@@ -1157,7 +1157,7 @@ mod tests {
     }
 
     #[test]
-    fn io_core_metrics_remain_consistent() {
+    fn io_core_metrics_consistent() {
         let mut io: IoCore<MockBackend> = IoCore::new(8).unwrap();
         let mut bufs = [[0u8; 64]; 20];
         let mut comps: Vec<Completion> = (0..20).map(|_| Completion::new()).collect();
@@ -1309,7 +1309,7 @@ mod property_tests {
     proptest! {
         /// Random submission/tick sequences maintain invariants.
         #[test]
-        fn random_operations_maintain_invariants(
+        fn random_operations_invariants(
             ops in prop::collection::vec(prop::bool::ANY, 0..100)
         ) {
             let mut io: IoCore<MockBackend> = IoCore::new(8).unwrap();
@@ -1380,7 +1380,7 @@ mod property_tests {
 
         /// Overflow queue correctly handles varying capacities.
         #[test]
-        fn overflow_queue_handles_various_capacities(
+        fn overflow_queue_various_capacities(
             capacity_exp in 0u32..6,  // 1, 2, 4, 8, 16, 32
             num_ops in 1usize..50
         ) {
