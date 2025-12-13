@@ -42,9 +42,14 @@ impl IoBackend for UringBackend {
         assert!(entries <= Self::ENTRIES_MAX);
 
         let mut ring = IoUring::new(entries)?;
-        assert!(ring.submission().capacity() >= entries as usize);
+        let actual_entries = ring.submission().capacity();
+        assert!(actual_entries >= entries as usize);
+        assert!(actual_entries <= u32::MAX as usize);
 
-        Ok(Self { ring, entries })
+        Ok(Self {
+            ring,
+            entries: actual_entries as u32,
+        })
     }
 
     /// # Safety
@@ -58,20 +63,14 @@ impl IoBackend for UringBackend {
         match *op {
             Operation::Nop => {}
             Operation::Read {
-                fd,
-                len,
-                offset,
-                ..
+                fd, len, offset, ..
             } => {
                 assert!(fd >= 0);
                 assert!(len > 0);
                 assert!(offset <= i64::MAX as u64);
             }
             Operation::Write {
-                fd,
-                len,
-                offset,
-                ..
+                fd, len, offset, ..
             } => {
                 assert!(fd >= 0);
                 assert!(len > 0);
@@ -90,6 +89,7 @@ impl IoBackend for UringBackend {
         }
 
         let len_before = sq.len();
+        assert!(len_before < self.entries as usize);
 
         let entry = match *op {
             Operation::Nop => opcode::Nop::new().build().user_data(user_data),
@@ -122,6 +122,7 @@ impl IoBackend for UringBackend {
 
         let len_after = sq.len();
         assert!(len_after == len_before + 1);
+        assert!(len_after <= self.entries as usize);
 
         Ok(())
     }
@@ -133,6 +134,7 @@ impl IoBackend for UringBackend {
     /// without blocking (fire-and-forget).
     fn flush(&mut self, wait_for_one: bool) -> io::Result<()> {
         let pending_before = self.ring.submission().len();
+        assert!(pending_before <= self.entries as usize);
 
         if wait_for_one {
             // Note: We rely on the caller (IoCore) to ensure there are in-flight operations
@@ -674,7 +676,6 @@ mod integration_tests {
         let fd = file.as_raw_fd();
 
         let mut backend = UringBackend::new(8).unwrap();
-        
         drop(file);
 
         let mut buf = vec![0u8; 64];
