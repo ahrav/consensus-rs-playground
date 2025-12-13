@@ -19,6 +19,7 @@
 - `cargo fmt --all` (CI: `cargo fmt --all -- --check`): format with `rustfmt`.
 - `cargo clippy --all-targets --all-features -- -D warnings`: lint; warnings fail CI.
 - `cargo audit`: dependency CVE scan (install via `cargo install cargo-audit --locked`).
+- Linux Tests (macOS): `orb cargo test --all-features --lib io::backend_linux` (requires OrbStack) or use Docker.
 - Miri (nightly): `cargo +nightly miri setup && cargo +nightly miri test --all-features`.
 
 ## Coding Style & Naming Conventions

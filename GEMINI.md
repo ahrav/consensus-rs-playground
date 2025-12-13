@@ -37,6 +37,9 @@ This project uses standard Cargo workflows, with specific emphasis on strict lin
 
 *   **Miri (Memory Safety):** `cargo miri test --all-features` (Requires Nightly Rust). Used to detect undefined behavior.
 *   **Minimal Build:** `cargo build --no-default-features`
+*   **Linux Testing on macOS:**
+    *   **OrbStack:** `orb cargo test --all-features --lib io::backend_linux`
+    *   **Docker:** `docker run --rm -it -v "$(pwd)":/app -w /app rust:latest cargo test --all-features --lib io::backend_linux`
 
 ## Development Conventions
 

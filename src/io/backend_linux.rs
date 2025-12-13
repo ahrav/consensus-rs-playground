@@ -36,9 +36,9 @@ impl IoBackend for UringBackend {
     const ENTRIES_MIN: u32 = 1;
     const ENTRIES_MAX: u32 = 1 << 15;
 
-    fn new(entries: u32) -> Result<Self> {
-        assert!(entries > 0);
-        assert!(entries.is_power_of_two());
+    fn new(entries: u32) -> io::Result<Self> {
+        assert!(entries > 0, "ring must have at least one entry");
+        assert!(entries.is_power_of_two(), "power-of-two");
         assert!(entries <= Self::ENTRIES_MAX);
 
         let mut ring = IoUring::new(entries)?;
@@ -101,7 +101,7 @@ impl IoBackend for UringBackend {
                 len,
                 offset,
             } => opcode::Read::new(types::Fd(fd), buf.as_ptr(), len)
-                .offset(offset as i64)
+                .offset(offset)
                 .build()
                 .user_data(user_data),
             Operation::Write {
@@ -110,7 +110,7 @@ impl IoBackend for UringBackend {
                 len,
                 offset,
             } => opcode::Write::new(types::Fd(fd), buf.as_ptr(), len)
-                .offset(offset as i64)
+                .offset(offset)
                 .build()
                 .user_data(user_data),
             Operation::Fsync { fd } => opcode::Fsync::new(types::Fd(fd))
@@ -168,7 +168,7 @@ impl IoBackend for UringBackend {
         assert!(drained_count <= MAX_DRAIN_PER_CALL);
 
         if drained_count < MAX_DRAIN_PER_CALL {
-            assert!(self.ring.completion().is_empty());
+            assert!(cq.is_empty());
         }
     }
 }

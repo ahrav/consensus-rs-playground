@@ -17,6 +17,7 @@ cargo test <test_name>               # Run specific test
 cargo fmt --all -- --check           # Check formatting
 cargo clippy --all-targets --all-features -- -D warnings  # Lint
 cargo miri test --all-features       # Memory safety checks (requires nightly)
+orb cargo test --all-features --lib io::backend_linux # Run Linux tests (requires OrbStack)
 ```
 
 ## Architecture
