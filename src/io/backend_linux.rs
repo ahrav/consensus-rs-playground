@@ -170,6 +170,7 @@ impl IoBackend for UringBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     #[should_panic(expected = "ring must have at least one entry")]
@@ -206,6 +207,41 @@ mod tests {
         let mut second = 0usize;
         backend.drain(|_, _| second += 1);
         assert_eq!(second, 1);
+    }
+
+    #[test]
+    fn drain_reports_all_completions_exactly_once() {
+        let mut backend = UringBackend::new(UringBackend::ENTRIES_MAX).unwrap();
+
+        let count = (MAX_DRAIN_PER_CALL + 128) as usize;
+        assert!(count <= UringBackend::ENTRIES_MAX as usize);
+
+        for i in 0..count {
+            unsafe {
+                backend.try_push(&Operation::Nop, i as u64).unwrap();
+            }
+        }
+
+        backend.flush(false).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = vec![false; count];
+        let mut remaining = count;
+
+        while remaining > 0 && Instant::now() < deadline {
+            backend.drain(|user_data, result| {
+                assert_eq!(result, 0);
+                let idx = user_data as usize;
+                assert!(idx < count);
+                assert!(!seen[idx]);
+                seen[idx] = true;
+                remaining -= 1;
+            });
+            std::thread::yield_now();
+        }
+
+        assert_eq!(remaining, 0);
+        assert!(seen.into_iter().all(|v| v));
     }
 
     #[test]
@@ -445,9 +481,11 @@ mod tests {
 mod integration_tests {
     use super::*;
     use core::ptr::NonNull;
+    use libc;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
     use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
     use tempfile::tempdir;
 
     #[test]
@@ -565,7 +603,11 @@ mod integration_tests {
             .write_all(b"0123456789ABCDEF")
             .unwrap();
 
-        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
         let fd = file.as_raw_fd();
         let mut backend = UringBackend::new(8).unwrap();
 
@@ -589,7 +631,10 @@ mod integration_tests {
 
         drop(file);
         let mut contents = Vec::new();
-        File::open(&path).unwrap().read_to_end(&mut contents).unwrap();
+        File::open(&path)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
         assert_eq!(contents, b"0123WXYZ89ABCDEF");
     }
 
@@ -706,16 +751,9 @@ mod integration_tests {
     }
 
     #[test]
-    fn read_closed_fd() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("closed_fd_test.txt");
-
-        File::create(&path).unwrap();
+    fn read_invalid_fd_returns_ebadf() {
         let mut backend = UringBackend::new(8).unwrap();
-
-        let file = File::open(&path).unwrap();
-        let fd = file.as_raw_fd();
-        drop(file);
+        let fd = i32::MAX;
 
         let mut buf = vec![0u8; 64];
         let op = Operation::Read {
@@ -731,7 +769,24 @@ mod integration_tests {
         let mut got_error = false;
         backend.drain(|user_data, result| {
             assert_eq!(user_data, 0x99);
-            assert!(result < 0);
+            assert_eq!(result, -libc::EBADF);
+            got_error = true;
+        });
+        assert!(got_error);
+    }
+
+    #[test]
+    fn fsync_invalid_fd_returns_ebadf() {
+        let mut backend = UringBackend::new(8).unwrap();
+        let fd = i32::MAX;
+
+        unsafe { backend.try_push(&Operation::Fsync { fd }, 0xF5).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut got_error = false;
+        backend.drain(|user_data, result| {
+            assert_eq!(user_data, 0xF5);
+            assert_eq!(result, -libc::EBADF);
             got_error = true;
         });
         assert!(got_error);
@@ -761,10 +816,68 @@ mod integration_tests {
         let mut got_error = false;
         backend.drain(|user_data, result| {
             assert_eq!(user_data, 0xAA);
-            assert!(result < 0);
+            assert_eq!(result, -libc::EBADF);
             got_error = true;
         });
         assert!(got_error);
+    }
+
+    #[test]
+    fn read_unix_stream() {
+        let (mut left, right) = UnixStream::pair().unwrap();
+        let fd = right.as_raw_fd();
+
+        let expected = b"hello from socket";
+        left.write_all(expected).unwrap();
+
+        let mut backend = UringBackend::new(8).unwrap();
+        let mut buf = vec![0u8; expected.len()];
+        let op = Operation::Read {
+            fd,
+            buf: NonNull::new(buf.as_mut_ptr()).unwrap(),
+            len: buf.len() as u32,
+            offset: 0,
+        };
+
+        unsafe { backend.try_push(&op, 0xC0).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut result = None;
+        backend.drain(|user_data, res| {
+            assert_eq!(user_data, 0xC0);
+            result = Some(res);
+        });
+        assert_eq!(result, Some(expected.len() as i32));
+        assert_eq!(&buf, expected);
+    }
+
+    #[test]
+    fn write_unix_stream() {
+        let (left, mut right) = UnixStream::pair().unwrap();
+        let fd = left.as_raw_fd();
+
+        let data = b"hello to socket";
+        let op = Operation::Write {
+            fd,
+            buf: NonNull::new(data.as_ptr() as *mut u8).unwrap(),
+            len: data.len() as u32,
+            offset: 0,
+        };
+
+        let mut backend = UringBackend::new(8).unwrap();
+        unsafe { backend.try_push(&op, 0xC1).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut result = None;
+        backend.drain(|user_data, res| {
+            assert_eq!(user_data, 0xC1);
+            result = Some(res);
+        });
+        assert_eq!(result, Some(data.len() as i32));
+
+        let mut buf = vec![0u8; data.len()];
+        right.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, data);
     }
 
     #[test]
