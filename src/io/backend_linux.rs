@@ -173,13 +173,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "ring must have at least one entry")]
-    fn test_new_zero_entries_panics() {
+    fn new_zero_entries_panics() {
         let _ = UringBackend::new(0);
     }
 
     #[test]
     #[should_panic(expected = "power-of-two")]
-    fn test_new_non_power_of_two_panics() {
+    fn new_non_power_of_two_panics() {
         let _ = UringBackend::new(100);
     }
 
@@ -209,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flush_wait_on_submitted() {
+    fn flush_waits() {
         let mut backend = UringBackend::new(8).unwrap();
 
         // Submit one operation (NOP).
