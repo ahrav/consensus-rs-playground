@@ -556,6 +556,44 @@ mod integration_tests {
     }
 
     #[test]
+    fn write_at_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("write_offset_test.txt");
+
+        File::create(&path)
+            .unwrap()
+            .write_all(b"0123456789ABCDEF")
+            .unwrap();
+
+        let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let fd = file.as_raw_fd();
+        let mut backend = UringBackend::new(8).unwrap();
+
+        let data = b"WXYZ";
+        let op = Operation::Write {
+            fd,
+            buf: NonNull::new(data.as_ptr() as *mut u8).unwrap(),
+            len: data.len() as u32,
+            offset: 4,
+        };
+
+        unsafe { backend.try_push(&op, 0xBEEF).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut bytes_written = None;
+        backend.drain(|user_data, result| {
+            assert_eq!(user_data, 0xBEEF);
+            bytes_written = Some(result);
+        });
+        assert_eq!(bytes_written, Some(data.len() as i32));
+
+        drop(file);
+        let mut contents = Vec::new();
+        File::open(&path).unwrap().read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, b"0123WXYZ89ABCDEF");
+    }
+
+    #[test]
     fn write_fsync() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("fsync_test.txt");
@@ -660,10 +698,11 @@ mod integration_tests {
         }
 
         assert_eq!(completions.len(), 3);
-        let user_datas: Vec<u64> = completions.iter().map(|(ud, _)| *ud).collect();
-        assert!(user_datas.contains(&1));
-        assert!(user_datas.contains(&2));
-        assert!(user_datas.contains(&3));
+        completions.sort_by_key(|(ud, _)| *ud);
+
+        assert_eq!(completions[0], (1, 7));
+        assert_eq!(completions[1], (2, write_data.len() as i32));
+        assert_eq!(completions[2], (3, 0));
     }
 
     #[test]
@@ -672,10 +711,10 @@ mod integration_tests {
         let path = dir.path().join("closed_fd_test.txt");
 
         File::create(&path).unwrap();
+        let mut backend = UringBackend::new(8).unwrap();
+
         let file = File::open(&path).unwrap();
         let fd = file.as_raw_fd();
-
-        let mut backend = UringBackend::new(8).unwrap();
         drop(file);
 
         let mut buf = vec![0u8; 64];
