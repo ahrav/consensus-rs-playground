@@ -353,3 +353,28 @@ impl ListNode<IoTag> for Completion {
         &self.link
     }
 }
+
+pub struct IoCore<B: IoBackend> {
+    backend: B,
+    overflow: DoublyLinkedList<Completion, IoTag>,
+    inflight: u32,
+    capacity: u32,
+
+    total_submitted: u64,
+    total_completed: u64,
+}
+
+impl<B: IoBackend> IoCore<B> {
+    pub fn new(entries: u32) -> io::Result<Self> {
+        assert!(entries >= 4 && entries.is_power_of_two());
+
+        Ok(Self {
+            backend: B::new(entries)?,
+            overflow: DoublyLinkedList::init(),
+            inflight: 0,
+            capacity: entries,
+            total_submitted: 0,
+            total_completed: 0,
+        })
+    }
+}
