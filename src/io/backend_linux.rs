@@ -1,11 +1,6 @@
-#![cfg(target_os = "linux")]
-
-use std::io;
-
-use io_uring::{IoUring, opcode, types};
-
-use crate::io::{IoBackend, Operation};
+use io_uring::IoUring;
 
 pub struct UringBackend {
+    #[allow(dead_code)]
     ring: IoUring,
 }
