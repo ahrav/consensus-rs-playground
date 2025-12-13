@@ -1,5 +1,5 @@
 pub mod constants;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod io;
 pub mod stdx;
 pub mod util;
