@@ -974,6 +974,55 @@ mod tests {
         comp.reset();
     }
 
+    #[test]
+    #[should_panic]
+    fn completion_reset_panics_if_linked() {
+        let mut list: DoublyLinkedList<Completion, IoTag> = DoublyLinkedList::init();
+        let mut comp = Completion::new();
+        list.push_back(&mut comp);
+        comp.reset();
+    }
+
+    #[test]
+    fn completion_complete_transitions_to_idle_and_invokes_callback() {
+        unsafe fn callback(ctx: *mut c_void, completion: &mut Completion) {
+            let called = unsafe { &mut *(ctx as *mut bool) };
+            *called = true;
+            assert!(completion.is_idle());
+        }
+
+        let mut called = false;
+        let mut comp = Completion::new();
+        comp.state = CompletionState::Completed;
+        comp.result = 123;
+        comp.context = (&mut called as *mut bool).cast::<c_void>();
+        comp.callback = Some(callback);
+
+        comp.complete();
+
+        assert!(called);
+        assert!(comp.is_idle());
+        assert!(comp.callback.is_none());
+        assert_eq!(comp.result, 123);
+    }
+
+    #[test]
+    #[should_panic]
+    fn completion_complete_panics_if_not_completed() {
+        let mut comp = Completion::new();
+        comp.complete();
+    }
+
+    #[test]
+    #[should_panic]
+    fn completion_complete_panics_if_linked() {
+        let mut list: DoublyLinkedList<Completion, IoTag> = DoublyLinkedList::init();
+        let mut comp = Completion::new();
+        comp.state = CompletionState::Completed;
+        list.push_back(&mut comp);
+        comp.complete();
+    }
+
     // =========================================================================
     // typed_handler_shim Tests
     // =========================================================================
@@ -1049,6 +1098,89 @@ mod tests {
     #[should_panic]
     fn io_core_new_rejects_zero() {
         let _: IoCore<MockBackend> = IoCore::new(0).unwrap();
+    }
+
+    // =========================================================================
+    // IoCore Preconditions Tests
+    // =========================================================================
+
+    #[test]
+    #[should_panic(expected = "buf must not be null")]
+    fn io_core_read_panics_on_null_buffer() {
+        unsafe fn callback(_ctx: *mut c_void, _completion: &mut Completion) {}
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        let mut comp = Completion::new();
+
+        io.read(
+            &mut comp,
+            3,
+            core::ptr::null_mut(),
+            1,
+            0,
+            core::ptr::null_mut(),
+            callback,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "buf must not be null")]
+    fn io_core_write_panics_on_null_buffer() {
+        unsafe fn callback(_ctx: *mut c_void, _completion: &mut Completion) {}
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        let mut comp = Completion::new();
+
+        io.write(
+            &mut comp,
+            3,
+            core::ptr::null(),
+            1,
+            0,
+            core::ptr::null_mut(),
+            callback,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn io_core_submit_panics_on_nop_operation() {
+        unsafe fn callback(_ctx: *mut c_void, _completion: &mut Completion) {}
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        let mut comp = Completion::new();
+
+        io.submit(&mut comp, Operation::Nop, core::ptr::null_mut(), callback);
+    }
+
+    #[test]
+    #[should_panic]
+    fn io_core_submit_panics_if_completion_not_idle() {
+        unsafe fn callback(_ctx: *mut c_void, _completion: &mut Completion) {}
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        let mut buf = [0u8; 1];
+        let mut comp = Completion::new();
+        comp.state = CompletionState::Completed;
+
+        let op = test_read_op(&mut buf);
+        io.submit(&mut comp, op, core::ptr::null_mut(), callback);
+    }
+
+    #[test]
+    #[should_panic]
+    fn io_core_submit_panics_if_completion_linked() {
+        unsafe fn callback(_ctx: *mut c_void, _completion: &mut Completion) {}
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        let mut buf = [0u8; 1];
+        let mut comp = Completion::new();
+
+        let mut list: DoublyLinkedList<Completion, IoTag> = DoublyLinkedList::init();
+        list.push_back(&mut comp);
+
+        let op = test_read_op(&mut buf);
+        io.submit(&mut comp, op, core::ptr::null_mut(), callback);
     }
 
     #[test]
@@ -1135,6 +1267,49 @@ mod tests {
         for comp in &comps {
             assert!(comp.is_idle());
         }
+    }
+
+    #[test]
+    fn io_core_overflow_queue_is_fifo_ordered() {
+        thread_local! {
+            static ORDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+
+        unsafe fn record_order(_ctx: *mut c_void, completion: &mut Completion) {
+            let offset = match completion.op {
+                Operation::Read { offset, .. } => offset,
+                _ => panic!("unexpected operation"),
+            };
+            ORDER.with(|o| o.borrow_mut().push(offset));
+        }
+
+        let mut io: IoCore<MockBackend> = IoCore::new(2).unwrap();
+        let mut bufs = [[0u8; 64]; 5];
+        let mut comps = [
+            Completion::new(),
+            Completion::new(),
+            Completion::new(),
+            Completion::new(),
+            Completion::new(),
+        ];
+
+        for (i, comp) in comps.iter_mut().enumerate() {
+            let op = Operation::Read {
+                fd: 3,
+                buf: NonNull::new(bufs[i].as_mut_ptr()).unwrap(),
+                len: 64,
+                offset: i as u64,
+            };
+            io.submit(comp, op, core::ptr::null_mut(), record_order);
+        }
+
+        while !io.is_idle() {
+            io.tick().unwrap();
+        }
+
+        ORDER.with(|o| {
+            assert_eq!(*o.borrow(), vec![0, 1, 2, 3, 4]);
+        });
     }
 
     #[test]
@@ -1265,6 +1440,41 @@ mod tests {
     // =========================================================================
     // Error Handling Tests
     // =========================================================================
+
+    #[test]
+    fn io_core_tick_propagates_flush_error_and_recovers() {
+        unsafe fn callback(ctx: *mut c_void, _completion: &mut Completion) {
+            let called = unsafe { &mut *(ctx as *mut bool) };
+            *called = true;
+        }
+
+        let mut io: IoCore<MockBackend> = IoCore::new(1).unwrap();
+        io.backend.flush_error = Some(io::ErrorKind::Other);
+
+        let mut called = false;
+        let mut buf = [0u8; 64];
+        let mut comp = Completion::new();
+        let op = test_read_op(&mut buf);
+        io.submit(
+            &mut comp,
+            op,
+            (&mut called as *mut bool).cast::<c_void>(),
+            callback,
+        );
+
+        assert!(io.tick().is_err());
+        assert!(!called);
+        assert_eq!(io.total_completed, 0);
+        assert_eq!(comp.state(), CompletionState::Submitted);
+
+        io.backend.flush_error = None;
+        io.tick().unwrap();
+
+        assert!(called);
+        assert!(io.is_idle());
+        assert_eq!(io.total_completed, 1);
+        assert!(comp.is_idle());
+    }
 
     #[test]
     fn io_core_handles_completion_with_error_result() {
