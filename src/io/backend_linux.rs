@@ -156,20 +156,12 @@ impl IoBackend for UringBackend {
         let mut cq = self.ring.completion();
 
         let mut drained_count: u32 = 0;
-        for cqe in &mut cq {
-            if drained_count >= MAX_DRAIN_PER_CALL {
-                break;
-            }
-
+        for cqe in (&mut cq).take(MAX_DRAIN_PER_CALL as usize) {
             f(cqe.user_data(), cqe.result());
             drained_count += 1;
         }
 
         assert!(drained_count <= MAX_DRAIN_PER_CALL);
-
-        if drained_count < MAX_DRAIN_PER_CALL {
-            assert!(cq.is_empty());
-        }
     }
 }
 
@@ -190,52 +182,28 @@ mod tests {
     }
 
     #[test]
-    fn test_drain_limit_handling() {
-        // Need a ring larger than MAX_DRAIN_PER_CALL to test limit.
-        const ENTRIES: u32 = 1 << 15; // 32768
-        let mut backend = UringBackend::new(ENTRIES).unwrap();
+    fn drain_respects_max_per_call() {
+        let mut backend = UringBackend::new(UringBackend::ENTRIES_MAX).unwrap();
 
-        // Push more than MAX_DRAIN_PER_CALL NOPs.
-        // MAX_DRAIN_PER_CALL is 16384.
-        const COUNT: usize = 20_000;
-        assert!(COUNT < ENTRIES as usize);
+        let count = MAX_DRAIN_PER_CALL as usize + 1;
+        assert!(count <= UringBackend::ENTRIES_MAX as usize);
 
-        for i in 0..COUNT {
+        for i in 0..count {
             unsafe {
                 backend.try_push(&Operation::Nop, i as u64).unwrap();
             }
         }
 
-        // Submit all.
         backend.flush(false).unwrap();
+        backend.ring.submit_and_wait(count).unwrap();
 
-        // Drain in batches.
-        // This implicitly tests that we don't panic if more than MAX_DRAIN_PER_CALL are ready.
-        let mut total_drained: usize = 0;
-        loop {
-            let mut batch: usize = 0;
-            backend.drain(|_, _| batch += 1);
-            if batch == 0 {
-                // Wait for more if we haven't got them all (NOPs should be fast though).
-                if total_drained < COUNT {
-                    // We can't easily wait for "more" without submitting,
-                    // but we can try flushing with wait=true if we suspect they are still in flight.
-                    // However, flush(true) waits for *one*.
-                    // If we are stuck, break to avoid infinite loop in test.
-                    // Realistically, NOPs complete instantly.
-                    break;
-                }
-                break;
-            }
+        let mut first = 0usize;
+        backend.drain(|_, _| first += 1);
+        assert_eq!(first, MAX_DRAIN_PER_CALL as usize);
 
-            assert!(batch <= MAX_DRAIN_PER_CALL as usize);
-            total_drained += batch;
-        }
-
-        // We can't strictly assert total_drained == COUNT because NOPs *might* not be done,
-        // but they usually are. The critical part is that we didn't panic.
-        // To be safer for CI flakiness, we just assert we processed some.
-        assert!(total_drained > 0);
+        let mut second = 0usize;
+        backend.drain(|_, _| second += 1);
+        assert_eq!(second, 1);
     }
 
     #[test]
