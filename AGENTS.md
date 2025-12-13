@@ -1,33 +1,41 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/lib.rs` wires public modules.
-- `src/constants.rs` holds VSR protocol constants and alignment helpers with compile-time assertions.
-- `src/stdx/` contains foundational utilities (`bitset`, `ring_buffer`) with property and unit tests inline.
-- `src/vsr/wire/` defines wire-level types (`header`, `command`, `checksum`) for serialization and validation.
-- `src/util/` stores small helpers (e.g., zero checks). Tests live next to code; no separate fixtures directory.
+
+- `src/lib.rs`: crate entry point; wires public modules.
+- `src/constants.rs`: protocol constants and compile-time invariants.
+- `src/vsr/wire/`: Viewstamped Replication wire primitives (`Header`, `Command`, `Message`, framing, pools).
+- `src/stdx/`: no-heap data structures (`RingBuffer`, `BitSet`, intrusive `List`/`Queue`).
+- `src/util/`: small helpers (e.g., zero-check utilities).
+- `src/io/`: async I/O backends (`io_uring` on Linux, GCD on macOS) guarded by `cfg(target_os = ...)`.
+- `.github/workflows/ci.yml`: CI definition (fmt, clippy, build/test, audit, Miri).
+- `target/`: Cargo build output; don’t commit.
 
 ## Build, Test, and Development Commands
-- `cargo build` compiles the library in debug; surfaces const assertions and type errors.
-- `cargo test` runs all unit and property tests (uses proptest); expect a few seconds per suite.
-- `cargo fmt` formats with rustfmt; run before committing.
-- `cargo clippy -- -D warnings` lints for correctness; fix or document exceptions.
-- Example: `cargo test -p consensus -- --nocapture` to debug property failures with full output.
+
+- `cargo build` / `cargo build --all-features`: compile the library.
+- `cargo build --no-default-features`: minimal build sanity check (mirrors CI).
+- `cargo test --all-features`: run unit + property + doc tests.
+- `cargo fmt --all` (CI: `cargo fmt --all -- --check`): format with `rustfmt`.
+- `cargo clippy --all-targets --all-features -- -D warnings`: lint; warnings fail CI.
+- `cargo audit`: dependency CVE scan (install via `cargo install cargo-audit --locked`).
+- Miri (nightly): `cargo +nightly miri setup && cargo +nightly miri test --all-features`.
 
 ## Coding Style & Naming Conventions
-- Rust 2024 edition; follow `clippy` guidance unless protocol requirements disagree.
-- Prefer const invariants (`const _: () = assert!(...)`) and explicit bounds/overflow checks; keep `#[inline]` on hot paths only when justified.
-- Public APIs use `///` docs focused on protocol behavior; use `//` for implementation rationale.
-- Naming: types `PascalCase`, functions `snake_case`, constants `SCREAMING_SNAKE_CASE`; mirror VSR terminology in names and comments.
-- Preserve zeroed reserved fields and alignment assertions; avoid unchecked casts unless proven safe.
+
+- Keep code `rustfmt`-clean (4-space indentation; no hand-aligned columns).
+- Follow Rust naming: `snake_case` modules/functions, `CamelCase` types, `SCREAMING_SNAKE_CASE` constants.
+- Prefer “Tiger style” invariants: `const _: () = assert!(...)` for layout/size checks and runtime `assert!` for pre/postconditions.
+- Wire protocol stability matters: don’t change existing `#[repr(u8)]` discriminants or `#[repr(C)]` layouts; add new fields/variants compatibly and extend tests.
 
 ## Testing Guidelines
-- Place tests alongside the code they cover; mirror existing structure for new modules.
-- Keep property tests bounded to maintain runtime (e.g., `Config::with_cases(256)` when adding new ones).
-- For wire changes, include serialization round-trips and checksum validations patterned after `Header` tests.
-- Cover panic/edge paths (capacity limits, size bounds, zeroed fields) to lock in invariants.
+
+- Tests are colocated with code (`#[cfg(test)] mod tests`); add coverage with the implementation.
+- Use `proptest` for round-trips and edge cases; tune locally with `PROPTEST_CASES=32 cargo test`.
+- Keep tests deterministic and fast enough for `cargo test` on a laptop.
 
 ## Commit & Pull Request Guidelines
-- Commits use short, imperative subjects (e.g., `Add VSR Wire Protocol Header Implementation`); group related edits together.
-- PRs should summarize behavior changes, note invariants touched, and list commands run (`cargo test`, `cargo clippy`, etc.).
-- Link issues when present; include repro inputs for failures. Screenshots only when behavior is user-facing.
+
+- Commit subjects are short and imperative (common prefixes: “Add”, “Fix”, “Refactor”, “Update”, “Remove”); avoid trailing periods.
+- Keep commits focused and atomic; include rationale in the PR description.
+- PRs should note protocol/safety impact (especially under `src/vsr/wire/` and `src/io/`), list how you tested (commands + platform), and ensure CI is green.

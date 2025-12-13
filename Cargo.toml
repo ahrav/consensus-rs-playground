@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-aegis = "0.9"
+aegis = { version = "0.9", features = ["pure-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+crossbeam-queue = "0.3"
 
 [dev-dependencies]
 proptest = "1"
