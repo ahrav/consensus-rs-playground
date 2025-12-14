@@ -143,6 +143,7 @@ impl Operation {
             Operation::Read { fd, len, .. } | Operation::Write { fd, len, .. } => {
                 assert!(fd >= 0, "File descriptor must be non-negative");
                 assert!(len > 0, "Length must be positive");
+                assert!(len <= i32::MAX as u32, "Length must fit in i32");
             }
             Operation::Fsync { fd } => {
                 assert!(fd >= 0, "File descriptor must be non-negative");
@@ -222,7 +223,7 @@ pub struct Completion {
     /// Callback invoked when [`complete`](Self::complete) is called.
     pub callback: Option<CompletionCallback>,
 
-    /// Backend scratch space (macOS stores an `Arc` raw pointer).
+    /// Backend scratch space (backend-specific; opaque to callers).
     pub backend_context: usize,
 }
 
@@ -905,6 +906,30 @@ mod tests {
             fd: 3,
             buf: NonNull::dangling(),
             len: 0,
+            offset: 0,
+        };
+        op.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "Length must fit in i32")]
+    fn validate_rejects_oversized_length_read() {
+        let op = Operation::Read {
+            fd: 3,
+            buf: NonNull::dangling(),
+            len: i32::MAX as u32 + 1,
+            offset: 0,
+        };
+        op.validate();
+    }
+
+    #[test]
+    #[should_panic(expected = "Length must fit in i32")]
+    fn validate_rejects_oversized_length_write() {
+        let op = Operation::Write {
+            fd: 3,
+            buf: NonNull::dangling(),
+            len: i32::MAX as u32 + 1,
             offset: 0,
         };
         op.validate();

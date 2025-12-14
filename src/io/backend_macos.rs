@@ -191,6 +191,7 @@ impl IoBackend for GcdBackend {
             } => {
                 assert!(fd >= 0, "invalid file descriptor: {fd}");
                 assert!(len > 0, "read length must be positive");
+                assert!(len <= i32::MAX as u32, "read length {len} exceeds i32::MAX");
                 assert!(
                     offset <= i64::MAX as u64,
                     "offset {offset} exceeds off_t max"
@@ -205,6 +206,10 @@ impl IoBackend for GcdBackend {
             } => {
                 assert!(fd >= 0, "invalid file descriptor: {fd}");
                 assert!(len > 0, "write length must be positive");
+                assert!(
+                    len <= i32::MAX as u32,
+                    "write length {len} exceeds i32::MAX"
+                );
                 assert!(
                     offset <= i64::MAX as u64,
                     "offset {offset} exceeds off_t max"
@@ -527,6 +532,10 @@ unsafe fn syscall_ret_isize(mut f: impl FnMut() -> isize) -> i32 {
     for _ in 0..MAX_EINTR_RETRIES {
         let rc = f();
         if rc >= 0 {
+            assert!(
+                rc <= i32::MAX as isize,
+                "syscall returned {rc} which exceeds i32::MAX"
+            );
             return rc as i32;
         }
         // SAFETY: Called immediately after failed syscall.
@@ -586,7 +595,7 @@ unsafe fn fsync_full(fd: i32) -> i32 {
     assert!(e != 0);
 
     // F_FULLFSYNC unsupported on this filesystem; fall back to best-effort fsync.
-    if e == libc::EINVAL || e == libc::ENOTTY || e == libc::ENOTSUP {
+    if e == libc::EINVAL || e == libc::ENOTTY || e == libc::ENOTSUP || e == libc::ENODEV {
         // SAFETY: fd is valid per caller contract.
         return unsafe { syscall_ret_i32(|| libc::fsync(fd)) };
     }
@@ -614,36 +623,32 @@ mod tests {
 
     #[test]
     fn drain_respects_max_per_call() {
-        let mut backend = GcdBackend::new(GcdBackend::ENTRIES_MAX).unwrap();
-
         let count = MAX_DRAIN_PER_CALL as usize + 1;
         assert!(count <= GcdBackend::ENTRIES_MAX as usize);
+
+        let mut backend = GcdBackend::new(count as u32).unwrap();
 
         let mut completions: Vec<Box<Completion>> = (0..count)
             .map(|_| completion_with_op(Operation::Nop))
             .collect();
 
+        // Manually inject completed items into the done queue to deterministically
+        // exercise the drain cap without relying on worker scheduling.
+        backend.outstanding = count as u32;
         for comp in completions.iter_mut() {
+            let ptr = &mut **comp as *mut Completion as u64;
+            backend.shared.done.push(ptr).unwrap();
             unsafe {
-                backend
-                    .try_push(&Operation::Nop, &mut **comp as *mut Completion as u64)
-                    .unwrap();
+                dispatch_semaphore_signal(backend.shared.done_sema);
             }
         }
-
-        backend.flush(false).unwrap();
-
-        // Give workers time to process all NOPs so the completion queue fills up.
-        // We can't verify they are all ready without draining, but for NOPs this is reliable.
-        std::thread::sleep(Duration::from_millis(100));
 
         let mut first = 0usize;
         backend.drain(|_, _| first += 1);
 
         // It must not exceed the limit.
         assert!(first <= MAX_DRAIN_PER_CALL as usize);
-        // It should have hit the limit (assuming 100ms was enough for 16k NOPs).
-        // If the machine is extremely slow, this might fail, but it's a standard trade-off.
+        // We injected `count` completions, so it must hit the cap.
         assert_eq!(first, MAX_DRAIN_PER_CALL as usize);
 
         let mut second = 0usize;
@@ -726,6 +731,36 @@ mod tests {
     }
 
     #[test]
+    fn flush_wait_for_one_does_not_consume_completion_token() {
+        let mut backend = GcdBackend::new(8).unwrap();
+
+        let mut comp = completion_with_op(Operation::Nop);
+        comp.result = 123;
+        let ptr = &mut *comp as *mut Completion as u64;
+
+        backend.outstanding = 1;
+        backend.shared.done.push(ptr).unwrap();
+        unsafe {
+            dispatch_semaphore_signal(backend.shared.done_sema);
+        }
+
+        backend.flush(true).unwrap();
+
+        assert_eq!(backend.shared.done.len(), 1);
+
+        // Non-blocking check: the completion token should still be available.
+        let rc = unsafe { dispatch_semaphore_wait(backend.shared.done_sema, DISPATCH_TIME_NOW) };
+        assert_eq!(rc, 0, "flush(true) consumed the completion token");
+        unsafe {
+            dispatch_semaphore_signal(backend.shared.done_sema);
+        }
+
+        let mut got = None;
+        backend.drain(|user_data, result| got = Some((user_data, result)));
+        assert_eq!(got, Some((ptr, 123)));
+    }
+
+    #[test]
     fn new_min_size() {
         let backend = GcdBackend::new(GcdBackend::ENTRIES_MIN).unwrap();
         assert_eq!(backend.capacity, GcdBackend::ENTRIES_MIN);
@@ -752,7 +787,6 @@ mod tests {
     }
 
     #[test]
-
     fn push_to_empty_ring() {
         let mut backend = GcdBackend::new(8).unwrap();
 
@@ -769,7 +803,6 @@ mod tests {
     }
 
     #[test]
-
     fn push_fills_to_capacity() {
         let mut backend = GcdBackend::new(4).unwrap();
 
@@ -790,9 +823,11 @@ mod tests {
 
         assert!(result.is_err());
 
-        backend.flush(true).unwrap();
-
-        backend.drain(|_, _| {});
+        let mut remaining = 4usize;
+        while remaining > 0 {
+            backend.flush(true).unwrap();
+            backend.drain(|_, _| remaining -= 1);
+        }
     }
 
     #[test]
@@ -814,8 +849,11 @@ mod tests {
             unsafe { backend.try_push(&Operation::Nop, &mut *comps[2] as *mut Completion as u64) };
         assert!(result.is_err());
 
-        backend.flush(true).unwrap();
-        backend.drain(|_, _| {});
+        let mut remaining = 2usize;
+        while remaining > 0 {
+            backend.flush(true).unwrap();
+            backend.drain(|_, _| remaining -= 1);
+        }
     }
 
     #[test]
@@ -1001,6 +1039,119 @@ mod tests {
         let mut comp = completion_with_op(op);
         unsafe {
             let _ = backend.try_push(&op, &mut *comp as *mut Completion as u64);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds i32::MAX")]
+    fn read_len_overflow() {
+        let mut backend = GcdBackend::new(8).unwrap();
+        let op = Operation::Read {
+            fd: 0,
+            buf: core::ptr::NonNull::dangling(),
+            len: i32::MAX as u32 + 1,
+            offset: 0,
+        };
+        let mut comp = completion_with_op(op);
+        unsafe {
+            let _ = backend.try_push(&op, &mut *comp as *mut Completion as u64);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds i32::MAX")]
+    fn write_len_overflow() {
+        let mut backend = GcdBackend::new(8).unwrap();
+        let op = Operation::Write {
+            fd: 0,
+            buf: core::ptr::NonNull::dangling(),
+            len: i32::MAX as u32 + 1,
+            offset: 0,
+        };
+        let mut comp = completion_with_op(op);
+        unsafe {
+            let _ = backend.try_push(&op, &mut *comp as *mut Completion as u64);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "null completion pointer")]
+    fn push_null_user_data_panics() {
+        let mut backend = GcdBackend::new(8).unwrap();
+        unsafe {
+            let _ = backend.try_push(&Operation::Nop, 0);
+        }
+    }
+
+    #[test]
+    fn syscall_ret_isize_retries_eintr_then_succeeds() {
+        let mut attempts: u32 = 0;
+        let rc = unsafe {
+            syscall_ret_isize(|| {
+                attempts += 1;
+                if attempts < 3 {
+                    *libc::__error() = libc::EINTR;
+                    -1
+                } else {
+                    7
+                }
+            })
+        };
+        assert_eq!(rc, 7);
+        assert_eq!(attempts, 3);
+
+        unsafe {
+            *libc::__error() = 0;
+        }
+    }
+
+    #[test]
+    fn syscall_ret_isize_returns_negative_errno() {
+        let rc = unsafe {
+            syscall_ret_isize(|| {
+                *libc::__error() = libc::EBADF;
+                -1
+            })
+        };
+        assert_eq!(rc, -libc::EBADF);
+        unsafe {
+            *libc::__error() = 0;
+        }
+    }
+
+    #[test]
+    fn syscall_ret_i32_retries_eintr_then_succeeds() {
+        let mut attempts: u32 = 0;
+        let rc = unsafe {
+            syscall_ret_i32(|| {
+                attempts += 1;
+                if attempts < 4 {
+                    *libc::__error() = libc::EINTR;
+                    -1
+                } else {
+                    0
+                }
+            })
+        };
+        assert_eq!(rc, 0);
+        assert_eq!(attempts, 4);
+
+        unsafe {
+            *libc::__error() = 0;
+        }
+    }
+
+    #[test]
+    fn syscall_ret_i32_returns_negative_errno() {
+        let rc = unsafe {
+            syscall_ret_i32(|| {
+                *libc::__error() = libc::EINVAL;
+                -1
+            })
+        };
+        assert_eq!(rc, -libc::EINVAL);
+        unsafe {
+            *libc::__error() = 0;
         }
     }
 }
@@ -1367,6 +1518,33 @@ mod integration_tests {
     }
 
     #[test]
+    fn write_invalid_fd_returns_ebadf() {
+        let mut backend = GcdBackend::new(8).unwrap();
+        let fd = i32::MAX;
+
+        let data = b"invalid fd";
+        let op = Operation::Write {
+            fd,
+            buf: NonNull::new(data.as_ptr() as *mut u8).unwrap(),
+            len: data.len() as u32,
+            offset: 0,
+        };
+        let mut comp = completion_with_op(op);
+        let ptr = &mut *comp as *mut Completion as u64;
+
+        unsafe { backend.try_push(&op, ptr).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut got_error = false;
+        backend.drain(|user_data, result| {
+            assert_eq!(user_data, ptr);
+            assert_eq!(result, -libc::EBADF);
+            got_error = true;
+        });
+        assert!(got_error);
+    }
+
+    #[test]
     fn write_readonly_fd() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("readonly_test.txt");
@@ -1397,6 +1575,28 @@ mod integration_tests {
             got_error = true;
         });
         assert!(got_error);
+    }
+
+    #[test]
+    fn fsync_falls_back_when_fullfsync_unsupported() {
+        let file = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let fd = file.as_raw_fd();
+
+        let mut backend = GcdBackend::new(8).unwrap();
+        let op = Operation::Fsync { fd };
+        let mut comp = completion_with_op(op);
+        let ptr = &mut *comp as *mut Completion as u64;
+
+        unsafe { backend.try_push(&op, ptr).unwrap() };
+        backend.flush(true).unwrap();
+
+        let mut got = None;
+        backend.drain(|user_data, result| {
+            assert_eq!(user_data, ptr);
+            got = Some(result);
+        });
+
+        assert_eq!(got, Some(0));
     }
 
     #[test]
