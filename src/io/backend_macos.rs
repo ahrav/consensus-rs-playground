@@ -1467,8 +1467,8 @@ mod integration_tests {
     #[test]
     fn read_bad_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
-        let fd = i32::MAX; 
-        
+        let fd = i32::MAX;
+
         let mut buf = vec![0u8; 64];
         let op = Operation::Read {
             fd,
