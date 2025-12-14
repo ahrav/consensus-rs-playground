@@ -67,6 +67,7 @@ impl IoBackend for UringBackend {
             } => {
                 assert!(fd >= 0);
                 assert!(len > 0);
+                assert!(len <= i32::MAX as u32);
                 assert!(offset <= i64::MAX as u64);
             }
             Operation::Write {
@@ -74,6 +75,7 @@ impl IoBackend for UringBackend {
             } => {
                 assert!(fd >= 0);
                 assert!(len > 0);
+                assert!(len <= i32::MAX as u32);
                 assert!(offset <= i64::MAX as u64);
             }
             Operation::Fsync { fd } => {
