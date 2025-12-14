@@ -15,11 +15,13 @@ env:
 jobs:
   audit:
     name: Security Audit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ubuntu-22.04
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Cargo audit
@@ -27,47 +29,63 @@ jobs:
 
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          components: rustfmt
+          key: ubuntu-22.04
+      - run: cargo fmt --all -- --check
       - run: cargo fmt --all -- --check
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
       - run: cargo clippy --all-targets --all-features -- -D warnings
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
       - run: cargo build --all-features
       - run: cargo build --no-default-features
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
       - run: cargo test --all-features
 
   miri:
     name: Miri
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # Run only on the nightly schedule or manual dispatch to avoid slowing every push/PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     env:
@@ -82,5 +100,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: miri
+          key: ubuntu-22.04
       - run: cargo miri setup
       - run: cargo miri test --all-features
