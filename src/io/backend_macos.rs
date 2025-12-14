@@ -608,7 +608,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    // Helper to create a completion with a specific operation and pin it on the heap
+    // Helper: create pinned completion.
     fn completion_with_op(op: Operation) -> Box<Completion> {
         let mut comp = Box::new(Completion::new());
         comp.op = op;
@@ -617,12 +617,12 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn new_zero_entries_panics() {
+    fn new_zero() {
         let _ = GcdBackend::new(0);
     }
 
     #[test]
-    fn drain_respects_max_per_call() {
+    fn drain_max() {
         let count = MAX_DRAIN_PER_CALL as usize + 1;
         assert!(count <= GcdBackend::ENTRIES_MAX as usize);
 
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_reports_all_completions_exactly_once() {
+    fn drain_all() {
         let mut backend = GcdBackend::new(GcdBackend::ENTRIES_MAX).unwrap();
 
         let count = (MAX_DRAIN_PER_CALL + 128) as usize;
@@ -666,8 +666,6 @@ mod tests {
         let mut completions: Vec<Box<Completion>> = (0..count)
             .map(|_| {
                 let mut c = completion_with_op(Operation::Nop);
-                // Storing index in context just for identity check if needed,
-                // but we use pointer identity.
                 c.backend_context = 0;
                 c
             })
@@ -709,20 +707,19 @@ mod tests {
     }
 
     #[test]
-    fn flush_waits() {
+    fn flush_wait() {
         let mut backend = GcdBackend::new(8).unwrap();
         let mut comp = completion_with_op(Operation::Nop);
         let ptr = &mut *comp as *mut Completion as u64;
 
-        // Submit one operation (NOP).
         unsafe {
             backend.try_push(&Operation::Nop, ptr).unwrap();
         }
 
-        // Flush without waiting (submit to kernel/workers).
+        // Flush async.
         backend.flush(false).unwrap();
 
-        // Now ask to wait for completion.
+        // Flush wait.
         backend.flush(true).unwrap();
 
         let mut count = 0;
@@ -731,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_wait_for_one_does_not_consume_completion_token() {
+    fn flush_wait_peek() {
         let mut backend = GcdBackend::new(8).unwrap();
 
         let mut comp = completion_with_op(Operation::Nop);
@@ -761,13 +758,13 @@ mod tests {
     }
 
     #[test]
-    fn new_min_size() {
+    fn new_min() {
         let backend = GcdBackend::new(GcdBackend::ENTRIES_MIN).unwrap();
         assert_eq!(backend.capacity, GcdBackend::ENTRIES_MIN);
     }
 
     #[test]
-    fn new_common_sizes() {
+    fn new_sizes() {
         for &size in &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024] {
             let backend = GcdBackend::new(size).unwrap();
             assert_eq!(backend.capacity, size);
@@ -775,19 +772,19 @@ mod tests {
     }
 
     #[test]
-    fn new_max_size() {
+    fn new_max() {
         let backend = GcdBackend::new(GcdBackend::ENTRIES_MAX).unwrap();
         assert_eq!(backend.capacity, GcdBackend::ENTRIES_MAX);
     }
 
     #[test]
     #[should_panic]
-    fn new_exceeds_max() {
+    fn new_overflow() {
         let _ = GcdBackend::new(GcdBackend::ENTRIES_MAX + 1);
     }
 
     #[test]
-    fn push_to_empty_ring() {
+    fn push_empty() {
         let mut backend = GcdBackend::new(8).unwrap();
 
         let mut comp = completion_with_op(Operation::Nop);
@@ -803,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn push_fills_to_capacity() {
+    fn push_capacity() {
         let mut backend = GcdBackend::new(4).unwrap();
 
         let mut comps: Vec<Box<Completion>> =
@@ -831,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn push_err_when_full() {
+    fn push_full() {
         let mut backend = GcdBackend::new(2).unwrap();
         let mut comps: Vec<Box<Completion>> =
             (0..3).map(|_| completion_with_op(Operation::Nop)).collect();
@@ -857,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn push_after_drain() {
+    fn push_recycle() {
         let mut backend = GcdBackend::new(2).unwrap();
         let mut comps: Vec<Box<Completion>> =
             (0..3).map(|_| completion_with_op(Operation::Nop)).collect();
@@ -904,13 +901,13 @@ mod tests {
     }
 
     #[test]
-    fn flush_empty_queue() {
+    fn flush_empty() {
         let mut backend = GcdBackend::new(8).unwrap();
         backend.flush(false).unwrap();
     }
 
     #[test]
-    fn drain_empty_queue() {
+    fn drain_empty() {
         let mut backend = GcdBackend::new(8).unwrap();
         let mut count = 0;
         backend.drain(|_, _| count += 1);
@@ -918,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn nop_completes() {
+    fn nop() {
         let mut backend = GcdBackend::new(8).unwrap();
         let mut comp = completion_with_op(Operation::Nop);
         let ptr = &mut *comp as *mut Completion as u64;
@@ -937,7 +934,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "invalid file descriptor")]
-    fn read_negative_fd() {
+    fn read_neg_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
         let op = Operation::Read {
             fd: -1,
@@ -953,7 +950,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "invalid file descriptor")]
-    fn write_negative_fd() {
+    fn write_neg_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
         let op = Operation::Write {
             fd: -1,
@@ -969,7 +966,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "invalid file descriptor")]
-    fn fsync_negative_fd() {
+    fn fsync_neg_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
         let op = Operation::Fsync { fd: -1 };
         let mut comp = completion_with_op(op);
@@ -1044,7 +1041,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceeds i32::MAX")]
-    fn read_len_overflow() {
+    fn read_len_max() {
         let mut backend = GcdBackend::new(8).unwrap();
         let op = Operation::Read {
             fd: 0,
@@ -1060,7 +1057,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "exceeds i32::MAX")]
-    fn write_len_overflow() {
+    fn write_len_max() {
         let mut backend = GcdBackend::new(8).unwrap();
         let op = Operation::Write {
             fd: 0,
@@ -1076,7 +1073,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "null completion pointer")]
-    fn push_null_user_data_panics() {
+    fn push_null() {
         let mut backend = GcdBackend::new(8).unwrap();
         unsafe {
             let _ = backend.try_push(&Operation::Nop, 0);
@@ -1084,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_ret_isize_retries_eintr_then_succeeds() {
+    fn syscall_retry() {
         let mut attempts: u32 = 0;
         let rc = unsafe {
             syscall_ret_isize(|| {
@@ -1106,7 +1103,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_ret_isize_returns_negative_errno() {
+    fn syscall_errno() {
         let rc = unsafe {
             syscall_ret_isize(|| {
                 *libc::__error() = libc::EBADF;
@@ -1120,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_ret_i32_retries_eintr_then_succeeds() {
+    fn syscall_i32_retry() {
         let mut attempts: u32 = 0;
         let rc = unsafe {
             syscall_ret_i32(|| {
@@ -1142,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn syscall_ret_i32_returns_negative_errno() {
+    fn syscall_i32_errno() {
         let rc = unsafe {
             syscall_ret_i32(|| {
                 *libc::__error() = libc::EINVAL;
@@ -1399,7 +1396,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn batch_operations() {
+    fn batch_ops() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("batch_test.txt");
 
@@ -1468,12 +1465,10 @@ mod integration_tests {
     }
 
     #[test]
-    fn read_invalid_fd_returns_ebadf() {
+    fn read_bad_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
-        let fd = i32::MAX; // Likely invalid, but wait, Backend asserts fd >= 0.
-        // libc::pread with random large FD should return -EBADF.
-        // The assertion in `try_push` is just fd >= 0.
-
+        let fd = i32::MAX; 
+        
         let mut buf = vec![0u8; 64];
         let op = Operation::Read {
             fd,
@@ -1497,7 +1492,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn fsync_invalid_fd_returns_ebadf() {
+    fn fsync_bad_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
         let fd = i32::MAX;
 
@@ -1518,7 +1513,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn write_invalid_fd_returns_ebadf() {
+    fn write_bad_fd() {
         let mut backend = GcdBackend::new(8).unwrap();
         let fd = i32::MAX;
 
@@ -1578,7 +1573,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn fsync_falls_back_when_fullfsync_unsupported() {
+    fn fsync_fallback() {
         let file = OpenOptions::new().write(true).open("/dev/null").unwrap();
         let fd = file.as_raw_fd();
 
