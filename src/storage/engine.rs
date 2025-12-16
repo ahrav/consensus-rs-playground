@@ -14,6 +14,8 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
+use libc;
+
 use crate::io::{Completion as IoCompletion, Io, Operation};
 use crate::stdx::queue::{Queue, QueueLink, QueueNode};
 
@@ -28,6 +30,10 @@ pub const SECTOR_SIZE_MIN: usize = 512;
 /// Maximum supported sector size (64 KiB for large-block devices).
 pub const SECTOR_SIZE_MAX: usize = 65536;
 
+/// Default number of concurrent I/O operations for the storage engine.
+/// Must be a power of two. Provides good concurrency for async I/O without excessive memory overhead.
+const IO_ENTRIES_DEFAULT: u32 = 256;
+
 /// Bounds next-tick callback processing to prevent runaway loops.
 const MAX_NEXT_TICK_ITERATIONS: usize = 10_000;
 
@@ -39,6 +45,9 @@ const _: () = {
     assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX);
 
     assert!(std::mem::size_of::<usize>() >= 8);
+
+    assert!(IO_ENTRIES_DEFAULT > 0);
+    assert!(IO_ENTRIES_DEFAULT.is_power_of_two());
 
     assert!(MAX_NEXT_TICK_ITERATIONS > 0);
     assert!(MAX_NEXT_TICK_ITERATIONS <= 100_000);
@@ -354,6 +363,311 @@ impl Write {
 impl Default for Write {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Phantom type tag for [`NextTick`] intrusive lists.
+enum NextTickTag {}
+
+/// Intrusive linked list node for deferred callbacks ("next tick" semantics).
+///
+/// Uses an intrusive design to avoid heap allocation during scheduling—nodes
+/// live in caller-owned memory. The `callback` is `None` when idle, `Some`
+/// when queued. This approach guarantees deterministic memory usage and
+/// eliminates allocation failure paths during I/O completion.
+#[repr(C)]
+pub struct NextTick {
+    link: QueueLink<NextTick, NextTickTag>,
+    callback: Option<fn(&mut NextTick)>,
+}
+
+impl NextTick {
+    pub const fn new() -> Self {
+        Self {
+            link: QueueLink::new(),
+            callback: None,
+        }
+    }
+
+    /// Returns `true` if this callback is queued and awaiting execution.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.callback.is_some()
+    }
+}
+
+impl Default for NextTick {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueueNode<NextTickTag> for NextTick {
+    fn queue_link(&mut self) -> &mut QueueLink<Self, NextTickTag> {
+        &mut self.link
+    }
+
+    fn queue_link_ref(&self) -> &QueueLink<Self, NextTickTag> {
+        &self.link
+    }
+}
+
+/// Direct I/O storage engine with async operation queues and deferred callbacks.
+///
+/// Manages a single preallocated file divided into zones (see [`Layout`]).
+/// Provides two priority-separated "next tick" queues: VSR protocol work
+/// executes before LSM background maintenance, ensuring consensus operations
+/// aren't starved by compaction.
+///
+/// # Invariants
+///
+/// - `fd > 0` (valid file descriptor)
+/// - `sector_size` is a power of two in `[SECTOR_SIZE_MIN, SECTOR_SIZE_MAX]`
+/// - File size matches `layout.total_size()` and is sector-aligned
+pub struct Storage {
+    io: Io,
+    file: File,
+    fd: RawFd,
+
+    layout: Layout,
+    sector_size: usize,
+
+    /// High-priority callbacks (VSR protocol operations).
+    next_tick_vsr: Queue<NextTick, NextTickTag>,
+    /// Low-priority callbacks (LSM tree maintenance).
+    next_tick_lsm: Queue<NextTick, NextTickTag>,
+}
+
+/// Configuration for opening a storage file.
+pub struct Options<'a> {
+    pub path: &'a Path,
+    pub layout: Layout,
+    pub direct_io: bool,
+    /// Sector size in bytes. If 0, defaults to [`SECTOR_SIZE_DEFAULT`].
+    pub sector_size: usize,
+}
+
+impl Storage {
+    pub const SYNCHRONICITY: Synchronicity = Synchronicity::AlwaysAsynchronous;
+
+    /// Opens or creates a storage file with the specified layout.
+    ///
+    /// Preallocates the file to `layout.total_size()` and enables direct I/O
+    /// if requested (O_DIRECT on Linux, F_NOCACHE on macOS). Direct I/O
+    /// bypasses the kernel page cache for predictable latency and durability.
+    ///
+    /// # Panics
+    ///
+    /// - `path` is empty
+    /// - `sector_size` is invalid (not power-of-two or out of range)
+    /// - `layout.sector_size` doesn't match resolved `sector_size`
+    /// - `layout.total_size()` isn't sector-aligned
+    ///
+    /// # Errors
+    ///
+    /// Returns I/O errors from file creation, preallocation, or I/O queue setup.
+    pub fn open(opts: Options<'_>) -> std::io::Result<Self> {
+        assert!(!opts.path.as_os_str().is_empty());
+
+        let sector_size = if opts.sector_size == 0 {
+            SECTOR_SIZE_DEFAULT
+        } else {
+            opts.sector_size
+        };
+
+        assert!(sector_size >= SECTOR_SIZE_MIN);
+        assert!(sector_size <= SECTOR_SIZE_MAX);
+        assert!(sector_size.is_power_of_two());
+        assert_eq!(opts.layout.sector_size as usize, sector_size);
+
+        let total_size = opts.layout.total_size();
+        assert!(total_size > 0);
+        assert!(total_size % sector_size as u64 == 0);
+
+        let mut oo = OpenOptions::new();
+        oo.read(true).write(true).create(true);
+
+        #[cfg(target_os = "linux")]
+        if opts.direct_io {
+            oo.custom_flags(libc::O_DIRECT);
+        }
+
+        let file = oo.open(opts.path)?;
+        file.set_len(total_size)?;
+
+        // macOS doesn't support O_DIRECT; use F_NOCACHE for similar semantics.
+        #[cfg(target_os = "macos")]
+        if opts.direct_io {
+            let fd = file.as_raw_fd();
+            // SAFETY: `fd` is a valid file descriptor owned by `file`.
+            // F_NOCACHE disables kernel page cache without data corruption risk.
+            let result = unsafe { libc::fcntl(fd, libc::F_NOCACHE, 1) };
+            if result == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        let fd = file.as_raw_fd();
+        assert!(fd >= 0);
+
+        let storage = Self {
+            io: Io::new(IO_ENTRIES_DEFAULT)?,
+            file,
+            fd,
+            layout: opts.layout,
+            sector_size,
+            next_tick_vsr: Queue::init(),
+            next_tick_lsm: Queue::init(),
+        };
+        storage.assert_invariants();
+
+        Ok(storage)
+    }
+
+    /// Validates structural invariants. Called in public methods for defense-in-depth.
+    #[inline]
+    fn assert_invariants(&self) {
+        assert!(self.fd > 0);
+        assert!(self.sector_size >= SECTOR_SIZE_MIN);
+        assert!(self.sector_size <= SECTOR_SIZE_MAX);
+        assert!(self.sector_size.is_power_of_two());
+        assert!(self.layout.total_size() > 0);
+    }
+
+    /// Processes I/O completions and drains deferred callbacks.
+    ///
+    /// Execution order:
+    /// 1. Drain VSR and LSM next-tick queues (queued before this call)
+    /// 2. Process I/O completions via `io.tick()` (may schedule new next-ticks)
+    /// 3. Execute drained callbacks (VSR first for priority)
+    ///
+    /// This ordering prevents recursion: callbacks scheduled during I/O completions
+    /// execute on the *next* `run()` call, preserving "next tick" semantics.
+    /// VSR callbacks run before LSM to prioritize consensus over compaction.
+    ///
+    /// # Panics
+    ///
+    /// - I/O queue tick fails
+    /// - Either queue exceeds [`MAX_NEXT_TICK_ITERATIONS`] (indicates runaway loop)
+    pub fn run(&mut self) {
+        self.assert_invariants();
+
+        // Snapshot queues before I/O processing to avoid recursion.
+        let mut vsr_ticks = self.next_tick_vsr.take_all();
+        let mut lsm_ticks = self.next_tick_lsm.take_all();
+
+        self.io.tick().expect("storage engine I/O tick failed");
+
+        // Process VSR callbacks first (higher priority).
+        let mut vsr_processed: usize = 0;
+        for _ in 0..MAX_NEXT_TICK_ITERATIONS {
+            let Some(mut nt_ptr) = vsr_ticks.pop() else {
+                break;
+            };
+            // SAFETY: Pointer obtained from intrusive queue; node lifetime
+            // guaranteed by caller (nodes are typically stack-allocated or
+            // embedded in long-lived structures).
+            let nt = unsafe { nt_ptr.as_mut() };
+            if let Some(cb) = nt.callback.take() {
+                cb(nt);
+            }
+            vsr_processed += 1;
+        }
+        assert!(
+            vsr_ticks.is_empty(),
+            "VSR next-tick queue not drained: processed {vsr_processed}, limit {MAX_NEXT_TICK_ITERATIONS}"
+        );
+
+        // Process LSM callbacks second (background priority).
+        let mut lsm_processed: usize = 0;
+        for _ in 0..MAX_NEXT_TICK_ITERATIONS {
+            let Some(mut nt_ptr) = lsm_ticks.pop() else {
+                break;
+            };
+            // SAFETY: Same as VSR loop above.
+            let nt = unsafe { nt_ptr.as_mut() };
+            if let Some(cb) = nt.callback.take() {
+                cb(nt);
+            }
+            lsm_processed += 1;
+        }
+        assert!(
+            lsm_ticks.is_empty(),
+            "LSM next-tick queue not drained: processed {lsm_processed}, limit {MAX_NEXT_TICK_ITERATIONS}"
+        );
+    }
+
+    /// Alias for [`Self::run`]. Advances the event loop by one tick.
+    #[inline]
+    pub fn tick(&mut self) {
+        self.run();
+    }
+
+    #[inline]
+    pub fn sector_size(&self) -> usize {
+        self.sector_size
+    }
+
+    #[inline]
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    #[inline]
+    pub fn size(&self) -> u64 {
+        self.layout.total_size()
+    }
+
+    /// Schedules a callback to execute on the next [`Self::run`] call.
+    ///
+    /// The callback runs after I/O completions but before returning from `run()`.
+    /// Choose `queue` based on priority: [`NextTickQueue::Vsr`] for protocol work,
+    /// [`NextTickQueue::Lsm`] for background maintenance.
+    ///
+    /// # Panics
+    ///
+    /// - `next_tick.is_pending()` is already true (double-scheduling)
+    pub fn on_next_tick(
+        &mut self,
+        queue: NextTickQueue,
+        callback: fn(&mut NextTick),
+        next_tick: &mut NextTick,
+    ) {
+        assert!(!next_tick.is_pending());
+
+        next_tick.callback = Some(callback);
+        match queue {
+            NextTickQueue::Vsr => self.next_tick_vsr.push(next_tick),
+            NextTickQueue::Lsm => self.next_tick_lsm.push(next_tick),
+        }
+
+        assert!(next_tick.is_pending());
+    }
+
+    /// Cancels all pending LSM callbacks without executing them.
+    ///
+    /// Used during LSM tree resets (e.g., compaction abort) to discard stale
+    /// maintenance work. VSR callbacks are never cancelled—consensus operations
+    /// must complete.
+    ///
+    /// # Panics
+    ///
+    /// - Queue exceeds [`MAX_NEXT_TICK_ITERATIONS`] (indicates memory corruption)
+    pub fn reset_next_tick_lsm(&mut self) {
+        let mut ticks = self.next_tick_lsm.take_all();
+        let mut cleared: usize = 0;
+        for _ in 0..MAX_NEXT_TICK_ITERATIONS {
+            let Some(mut nt_ptr) = ticks.pop() else { break };
+            // SAFETY: Pointer from intrusive queue; lifetime managed by caller.
+            let nt = unsafe { nt_ptr.as_mut() };
+            nt.callback = None;
+            cleared += 1;
+        }
+
+        assert!(
+            ticks.is_empty(),
+            "LSM reset incomplete: cleared {cleared}, limit {MAX_NEXT_TICK_ITERATIONS}"
+        );
     }
 }
 
