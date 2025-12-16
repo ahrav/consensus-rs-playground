@@ -482,7 +482,7 @@ impl Storage {
 
         let total_size = opts.layout.total_size();
         assert!(total_size > 0);
-        assert!(total_size % sector_size as u64 == 0);
+        assert!(total_size.is_multiple_of(sector_size as u64));
 
         let mut oo = OpenOptions::new();
         oo.read(true).write(true).create(true);
@@ -668,6 +668,19 @@ impl Storage {
             ticks.is_empty(),
             "LSM reset incomplete: cleared {cleared}, limit {MAX_NEXT_TICK_ITERATIONS}"
         );
+    }
+
+    /// Returns a mutable reference to the underlying I/O subsystem.
+    ///
+    /// Used to submit I/O operations ([`Read`], [`Write`]) which are then
+    /// driven to completion by [`Storage::tick`].
+    pub fn io(&mut self) -> &mut Io {
+        &mut self.io
+    }
+
+    /// Returns a reference to the underlying file.
+    pub fn file(&self) -> &File {
+        &self.file
     }
 }
 
@@ -1344,5 +1357,202 @@ mod security_tests {
 
         assert_eq!(std::mem::align_of::<Read>(), 8);
         assert_eq!(std::mem::align_of::<Write>(), 8);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::io::{Completion, Operation};
+    use std::cell::RefCell;
+    use std::fs::File;
+    use std::io::{Seek, Write};
+    use tempfile::tempdir;
+
+    fn default_layout() -> Layout {
+        Layout::new(512, 4096, 4096, 4096, 4096, 4096, 4096)
+    }
+
+    #[test]
+    fn test_storage_open_basic() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_basic");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+
+        let storage = Storage::open(opts).unwrap();
+        assert_eq!(storage.sector_size(), 512);
+        assert_eq!(storage.size(), layout.total_size());
+        assert_eq!(
+            storage.file().metadata().unwrap().len(),
+            layout.total_size()
+        );
+    }
+
+    #[test]
+    fn test_next_tick_vsr_before_lsm() {
+        thread_local! {
+            static EXECUTION_ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn cb_vsr(_: &mut NextTick) {
+            EXECUTION_ORDER.with(|o| o.borrow_mut().push("VSR"));
+        }
+
+        fn cb_lsm(_: &mut NextTick) {
+            EXECUTION_ORDER.with(|o| o.borrow_mut().push("LSM"));
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_tick_order");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut nt_vsr = NextTick::new();
+        let mut nt_lsm = NextTick::new();
+
+        // Queue LSM first, then VSR.
+        storage.on_next_tick(NextTickQueue::Lsm, cb_lsm, &mut nt_lsm);
+        storage.on_next_tick(NextTickQueue::Vsr, cb_vsr, &mut nt_vsr);
+
+        storage.run();
+
+        EXECUTION_ORDER.with(|o| {
+            assert_eq!(*o.borrow(), vec!["VSR", "LSM"]);
+            o.borrow_mut().clear();
+        });
+    }
+
+    #[test]
+    fn test_next_tick_requeue_delayed() {
+        thread_local! {
+             static EXECUTION_COUNT: RefCell<u32> = const { RefCell::new(0) };
+             static STORAGE_PTR: RefCell<Option<*mut Storage>> = const { RefCell::new(None) };
+        }
+
+        fn cb_requeue(nt: &mut NextTick) {
+            EXECUTION_COUNT.with(|c| *c.borrow_mut() += 1);
+
+            STORAGE_PTR.with(|s| {
+                if let Some(storage_ptr) = *s.borrow() {
+                    let storage = unsafe { &mut *storage_ptr };
+                    // Safe because nt is detached from queue during callback
+                    storage.on_next_tick(NextTickQueue::Vsr, cb_requeue, nt);
+                }
+            });
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_requeue");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut nt = NextTick::new();
+
+        STORAGE_PTR.with(|s| *s.borrow_mut() = Some(&mut storage as *mut Storage));
+
+        storage.on_next_tick(NextTickQueue::Vsr, cb_requeue, &mut nt);
+
+        // First run: executes once, re-queues.
+        storage.run();
+        EXECUTION_COUNT.with(|c| assert_eq!(*c.borrow(), 1));
+
+        // Second run: executes again.
+        storage.run();
+        EXECUTION_COUNT.with(|c| assert_eq!(*c.borrow(), 2));
+
+        STORAGE_PTR.with(|s| *s.borrow_mut() = None);
+        EXECUTION_COUNT.with(|c| *c.borrow_mut() = 0);
+    }
+
+    #[test]
+    fn test_storage_io_read() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_io_read");
+        let layout = default_layout();
+
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            // Write something at WalPrepares (zone 2).
+            // Zone 0: 4096, 1: 4096. Zone 2 starts at 8192.
+            f.seek(std::io::SeekFrom::Start(8192)).unwrap();
+            f.write_all(&[0x42; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut read = Read::new();
+        read.zone = Zone::WalPrepares;
+        read.zone_spec = layout.zone(Zone::WalPrepares);
+        read.offset = 0;
+        read.expected_len = 512;
+
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static READ_DONE: RefCell<bool> = const { RefCell::new(false) };
+        }
+
+        fn cb(_: &mut Read) {
+            READ_DONE.with(|b| *b.borrow_mut() = true);
+        }
+        read.callback = Some(cb);
+
+        let abs_offset = read.absolute_offset();
+
+        // Manual shim to bridge IoCompletion -> Read callback
+        unsafe fn read_shim(ctx: *mut core::ffi::c_void, _comp: &mut Completion) {
+            // SAFETY: ctx is *mut Read
+            unsafe {
+                let read = &mut *(ctx as *mut Read);
+                if let Some(cb) = read.callback {
+                    cb(read);
+                }
+            }
+        }
+
+        let ctx = &mut read as *mut Read as *mut core::ffi::c_void;
+        let fd = storage.fd;
+
+        storage.io().read(
+            &mut read.io,
+            fd,
+            buf.as_mut_ptr(),
+            512,
+            abs_offset,
+            ctx,
+            read_shim,
+        );
+
+        // Run tick to drive IO
+        // Note: Io::tick waits for at least one completion if inflight > 0.
+        storage.tick();
+
+        READ_DONE.with(|b| assert!(*b.borrow()));
+        assert_eq!(buf.as_slice()[0], 0x42);
+        
+        READ_DONE.with(|b| *b.borrow_mut() = false);
     }
 }
