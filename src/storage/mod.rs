@@ -1,5 +1,12 @@
+pub mod engine;
 pub mod layout;
-pub mod storage;
+
+// Re-exports for convenient access
+pub use engine::{
+    AlignedBuf, NextTickQueue, Read, SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN,
+    Synchronicity, Write,
+};
+pub use layout::{Layout, Zone, ZoneSpec};
 
 #[macro_export]
 macro_rules! container_of {
