@@ -4,6 +4,8 @@
 //! alignment requirements, enabling O_DIRECT reads/writes without kernel
 //! buffering.
 
+#![allow(dead_code, unused_imports)]
+
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::alloc;
@@ -356,5 +358,673 @@ impl Write {
 impl Default for Write {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== Constants Tests ====================
+
+    #[test]
+    fn sector_size_constants_are_power_of_two() {
+        assert!(SECTOR_SIZE_MIN.is_power_of_two());
+        assert!(SECTOR_SIZE_DEFAULT.is_power_of_two());
+        assert!(SECTOR_SIZE_MAX.is_power_of_two());
+    }
+
+    #[test]
+    fn sector_size_ordering() {
+        // Redundant with compile-time assertions, but kept for test coverage visibility
+        const _: () = assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT);
+        const _: () = assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX);
+    }
+
+    #[test]
+    fn sector_size_values() {
+        assert_eq!(SECTOR_SIZE_MIN, 512);
+        assert_eq!(SECTOR_SIZE_DEFAULT, 4096);
+        assert_eq!(SECTOR_SIZE_MAX, 65536);
+    }
+
+    // ==================== AlignedBuf Construction Tests ====================
+
+    #[test]
+    fn aligned_buf_with_default_sector() {
+        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        assert_eq!(buf.len(), 4096);
+        assert_eq!(buf.align(), SECTOR_SIZE_DEFAULT);
+        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_DEFAULT, 0);
+    }
+
+    #[test]
+    fn aligned_buf_with_min_sector() {
+        let buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
+        assert_eq!(buf.len(), 512);
+        assert_eq!(buf.align(), SECTOR_SIZE_MIN);
+        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
+    }
+
+    #[test]
+    fn aligned_buf_with_max_sector() {
+        let buf = AlignedBuf::new_zeroed(65536, SECTOR_SIZE_MAX);
+        assert_eq!(buf.len(), 65536);
+        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
+        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
+    }
+
+    #[test]
+    fn aligned_buf_small_len_large_align() {
+        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MAX);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
+        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
+    }
+
+    #[test]
+    fn aligned_buf_large_len_small_align() {
+        let buf = AlignedBuf::new_zeroed(1024 * 1024, SECTOR_SIZE_MIN);
+        assert_eq!(buf.len(), 1024 * 1024);
+        assert_eq!(buf.align(), SECTOR_SIZE_MIN);
+        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
+    }
+
+    #[test]
+    fn aligned_buf_various_alignments() {
+        for align in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let buf = AlignedBuf::new_zeroed(align, align);
+            assert_eq!(buf.as_ptr() as usize % align, 0);
+        }
+    }
+
+    // ==================== AlignedBuf Panic Tests ====================
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn aligned_buf_zero_len_panics() {
+        let _ = AlignedBuf::new_zeroed(0, SECTOR_SIZE_DEFAULT);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn aligned_buf_zero_align_panics() {
+        let _ = AlignedBuf::new_zeroed(4096, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn aligned_buf_non_power_of_two_align_panics() {
+        let _ = AlignedBuf::new_zeroed(4096, 100);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn aligned_buf_align_exceeds_max_panics() {
+        let _ = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_MAX * 2);
+    }
+
+    // ==================== AlignedBuf Method Tests ====================
+
+    #[test]
+    fn aligned_buf_zero_initialized() {
+        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        assert!(buf.as_slice().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn aligned_buf_as_slice_len() {
+        let buf = AlignedBuf::new_zeroed(1234, SECTOR_SIZE_MIN);
+        assert_eq!(buf.as_slice().len(), 1234);
+    }
+
+    #[test]
+    fn aligned_buf_as_mut_slice_write() {
+        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        let slice = buf.as_mut_slice();
+        slice[0] = 0xAB;
+        slice[1] = 0xCD;
+        slice[4095] = 0xEF;
+
+        assert_eq!(buf.as_slice()[0], 0xAB);
+        assert_eq!(buf.as_slice()[1], 0xCD);
+        assert_eq!(buf.as_slice()[4095], 0xEF);
+    }
+
+    #[test]
+    fn aligned_buf_as_mut_slice_fill() {
+        let buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
+        buf.as_mut_slice().fill(0xFF);
+        assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn aligned_buf_ptr_consistency() {
+        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        assert_eq!(buf.as_ptr(), buf.as_mut_ptr() as *const u8);
+        assert_eq!(buf.as_ptr(), buf.as_slice().as_ptr());
+    }
+
+    #[test]
+    fn aligned_buf_is_empty_always_false() {
+        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MIN);
+        assert!(!buf.is_empty());
+
+        let buf2 = AlignedBuf::new_zeroed(1024 * 1024, SECTOR_SIZE_DEFAULT);
+        assert!(!buf2.is_empty());
+    }
+
+    #[test]
+    fn aligned_buf_len_matches_requested() {
+        for len in [1, 100, 512, 4096, 65536, 1024 * 1024] {
+            let buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
+            assert_eq!(buf.len(), len);
+        }
+    }
+
+    #[test]
+    fn aligned_buf_align_matches_requested() {
+        for align in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let buf = AlignedBuf::new_zeroed(4096, align);
+            assert_eq!(buf.align(), align);
+        }
+    }
+
+    // ==================== AlignedBuf Drop & Send Tests ====================
+
+    #[test]
+    fn aligned_buf_drop_multiple() {
+        for _ in 0..100 {
+            let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+            buf.as_mut_slice().fill(0xAB);
+            // buf dropped here
+        }
+    }
+
+    #[test]
+    fn aligned_buf_send() {
+        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        buf.as_mut_slice()[0] = 42;
+
+        let handle = std::thread::spawn(move || {
+            assert_eq!(buf.as_slice()[0], 42);
+            buf.len()
+        });
+
+        assert_eq!(handle.join().unwrap(), 4096);
+    }
+
+    // ==================== Synchronicity & NextTickQueue Tests ====================
+
+    #[test]
+    fn synchronicity_variants() {
+        let sync = Synchronicity::AlwaysSynchronous;
+        let async_var = Synchronicity::AlwaysAsynchronous;
+
+        assert_eq!(sync, Synchronicity::AlwaysSynchronous);
+        assert_eq!(async_var, Synchronicity::AlwaysAsynchronous);
+        assert_ne!(sync, async_var);
+    }
+
+    #[test]
+    fn synchronicity_clone_eq() {
+        let sync = Synchronicity::AlwaysSynchronous;
+        let cloned = sync;
+        assert_eq!(sync, cloned);
+    }
+
+    #[test]
+    fn next_tick_queue_variants() {
+        let vsr = NextTickQueue::Vsr;
+        let lsm = NextTickQueue::Lsm;
+
+        assert_eq!(vsr, NextTickQueue::Vsr);
+        assert_eq!(lsm, NextTickQueue::Lsm);
+        assert_ne!(vsr, lsm);
+    }
+
+    // ==================== Read Tests ====================
+
+    #[test]
+    fn read_new_defaults() {
+        let read = Read::new();
+        assert!(!read.is_pending());
+        assert_eq!(read.expected_len(), 0);
+        assert_eq!(read.zone, Zone::SuperBlock);
+        assert_eq!(read.zone_spec.base, 0);
+        assert_eq!(read.zone_spec.size, 0);
+        assert_eq!(read.offset, 0);
+    }
+
+    #[test]
+    fn read_default_eq_new() {
+        let read_new = Read::new();
+        let read_default = Read::default();
+
+        assert_eq!(read_new.zone, read_default.zone);
+        assert_eq!(read_new.offset, read_default.offset);
+        assert_eq!(read_new.expected_len(), read_default.expected_len());
+    }
+
+    #[test]
+    fn read_is_pending_without_callback() {
+        let read = Read::new();
+        assert!(!read.is_pending());
+    }
+
+    #[test]
+    fn read_absolute_offset_zero() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec {
+            base: 1000,
+            size: 500,
+        };
+        read.offset = 0;
+
+        assert_eq!(read.absolute_offset(), 1000);
+    }
+
+    #[test]
+    fn read_absolute_offset_middle() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec {
+            base: 1000,
+            size: 500,
+        };
+        read.offset = 250;
+
+        assert_eq!(read.absolute_offset(), 1250);
+    }
+
+    #[test]
+    fn read_absolute_offset_at_boundary() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec {
+            base: 1000,
+            size: 500,
+        };
+        read.offset = 500; // At boundary (valid)
+
+        assert_eq!(read.absolute_offset(), 1500);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_absolute_offset_beyond_zone_panics() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec {
+            base: 1000,
+            size: 500,
+        };
+        read.offset = 501; // Beyond zone
+
+        let _ = read.absolute_offset();
+    }
+
+    #[test]
+    fn read_with_layout_integration() {
+        let layout = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
+
+        let mut read = Read::new();
+        read.zone = Zone::WalPrepares;
+        read.zone_spec = layout.zone(Zone::WalPrepares);
+        read.offset = 100;
+
+        let abs = read.absolute_offset();
+        assert_eq!(abs, layout.start(Zone::WalPrepares) + 100);
+    }
+
+    // ==================== Write Tests ====================
+
+    #[test]
+    fn write_new_defaults() {
+        let write = Write::new();
+        assert!(!write.is_pending());
+        assert_eq!(write.expected_len(), 0);
+        assert_eq!(write.zone, Zone::SuperBlock);
+        assert_eq!(write.zone_spec.base, 0);
+        assert_eq!(write.zone_spec.size, 0);
+        assert_eq!(write.offset, 0);
+    }
+
+    #[test]
+    fn write_default_eq_new() {
+        let write_new = Write::new();
+        let write_default = Write::default();
+
+        assert_eq!(write_new.zone, write_default.zone);
+        assert_eq!(write_new.offset, write_default.offset);
+        assert_eq!(write_new.expected_len(), write_default.expected_len());
+    }
+
+    #[test]
+    fn write_is_pending_without_callback() {
+        let write = Write::new();
+        assert!(!write.is_pending());
+    }
+
+    #[test]
+    fn write_absolute_offset_zero() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec {
+            base: 2000,
+            size: 1000,
+        };
+        write.offset = 0;
+
+        assert_eq!(write.absolute_offset(), 2000);
+    }
+
+    #[test]
+    fn write_absolute_offset_middle() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec {
+            base: 2000,
+            size: 1000,
+        };
+        write.offset = 500;
+
+        assert_eq!(write.absolute_offset(), 2500);
+    }
+
+    #[test]
+    fn write_absolute_offset_at_boundary() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec {
+            base: 2000,
+            size: 1000,
+        };
+        write.offset = 1000;
+
+        assert_eq!(write.absolute_offset(), 3000);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_absolute_offset_beyond_zone_panics() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec {
+            base: 2000,
+            size: 1000,
+        };
+        write.offset = 1001;
+
+        let _ = write.absolute_offset();
+    }
+
+    #[test]
+    fn write_with_layout_integration() {
+        let layout = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
+
+        let mut write = Write::new();
+        write.zone = Zone::ClientReplies;
+        write.zone_spec = layout.zone(Zone::ClientReplies);
+        write.offset = 200;
+
+        let abs = write.absolute_offset();
+        assert_eq!(abs, layout.start(Zone::ClientReplies) + 200);
+    }
+
+    // ==================== Read/Write Consistency Tests ====================
+
+    #[test]
+    fn read_write_same_offset_same_result() {
+        let zone_spec = ZoneSpec {
+            base: 8192,
+            size: 4096,
+        };
+
+        let mut read = Read::new();
+        read.zone_spec = zone_spec;
+        read.offset = 100;
+
+        let mut write = Write::new();
+        write.zone_spec = zone_spec;
+        write.offset = 100;
+
+        assert_eq!(read.absolute_offset(), write.absolute_offset());
+    }
+
+    #[test]
+    fn read_write_all_zones() {
+        let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
+
+        for zone in Zone::ALL {
+            let zone_spec = layout.zone(zone);
+            if zone_spec.size > 0 {
+                let offset = zone_spec.size / 2;
+
+                let mut read = Read::new();
+                read.zone = zone;
+                read.zone_spec = zone_spec;
+                read.offset = offset;
+
+                let mut write = Write::new();
+                write.zone = zone;
+                write.zone_spec = zone_spec;
+                write.offset = offset;
+
+                assert_eq!(read.absolute_offset(), write.absolute_offset());
+                assert_eq!(read.absolute_offset(), zone_spec.base + offset);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn align_strategy() -> impl Strategy<Value = usize> {
+        prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192, 16384, 32768, 65536])
+    }
+
+    fn len_strategy() -> impl Strategy<Value = usize> {
+        1usize..=(1024 * 1024)
+    }
+
+    proptest! {
+        #[test]
+        fn prop_aligned_buf_alignment(
+            len in len_strategy(),
+            align in align_strategy(),
+        ) {
+            let buf = AlignedBuf::new_zeroed(len, align);
+            prop_assert_eq!(buf.as_ptr() as usize % align, 0);
+            prop_assert_eq!(buf.len(), len);
+            prop_assert_eq!(buf.align(), align);
+        }
+
+        #[test]
+        fn prop_aligned_buf_zero_init(len in 1usize..10000) {
+            let buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
+            prop_assert!(buf.as_slice().iter().all(|&b| b == 0));
+        }
+
+        #[test]
+        fn prop_aligned_buf_is_empty_always_false(
+            len in len_strategy(),
+            align in align_strategy(),
+        ) {
+            let buf = AlignedBuf::new_zeroed(len, align);
+            prop_assert!(!buf.is_empty());
+        }
+
+        #[test]
+        fn prop_aligned_buf_ptr_consistency(
+            len in len_strategy(),
+            align in align_strategy(),
+        ) {
+            let buf = AlignedBuf::new_zeroed(len, align);
+            prop_assert_eq!(buf.as_ptr(), buf.as_mut_ptr() as *const u8);
+            prop_assert_eq!(buf.as_ptr(), buf.as_slice().as_ptr());
+        }
+
+        #[test]
+        fn prop_aligned_buf_mutability(
+            len in 1usize..10000,
+            pattern in any::<u8>(),
+        ) {
+            let buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
+            buf.as_mut_slice().fill(pattern);
+            prop_assert!(buf.as_slice().iter().all(|&b| b == pattern));
+        }
+
+        #[test]
+        fn prop_read_absolute_offset(
+            base in 0u64..1_000_000,
+            size in 1u64..100_000,
+            offset_factor in 0.0f64..1.0,
+        ) {
+            let mut read = Read::new();
+            read.zone_spec = ZoneSpec { base, size };
+            read.offset = (size as f64 * offset_factor) as u64;
+
+            let abs = read.absolute_offset();
+            prop_assert_eq!(abs, base + read.offset);
+            prop_assert!(abs >= base);
+        }
+
+        #[test]
+        fn prop_write_absolute_offset(
+            base in 0u64..1_000_000,
+            size in 1u64..100_000,
+            offset_factor in 0.0f64..1.0,
+        ) {
+            let mut write = Write::new();
+            write.zone_spec = ZoneSpec { base, size };
+            write.offset = (size as f64 * offset_factor) as u64;
+
+            let abs = write.absolute_offset();
+            prop_assert_eq!(abs, base + write.offset);
+            prop_assert!(abs >= base);
+        }
+
+        #[test]
+        fn prop_read_write_consistency(
+            base in 0u64..1_000_000,
+            size in 1u64..100_000,
+            offset_factor in 0.0f64..1.0,
+        ) {
+            let zone_spec = ZoneSpec { base, size };
+            let offset = (size as f64 * offset_factor) as u64;
+
+            let mut read = Read::new();
+            read.zone_spec = zone_spec;
+            read.offset = offset;
+
+            let mut write = Write::new();
+            write.zone_spec = zone_spec;
+            write.offset = offset;
+
+            prop_assert_eq!(read.absolute_offset(), write.absolute_offset());
+        }
+
+        #[test]
+        fn prop_read_offset_within_zone(
+            base in 0u64..1_000_000,
+            size in 1u64..100_000,
+            offset_factor in 0.0f64..1.0,
+        ) {
+            let zone_spec = ZoneSpec { base, size };
+            let offset = (size as f64 * offset_factor) as u64;
+
+            let mut read = Read::new();
+            read.zone_spec = zone_spec;
+            read.offset = offset;
+
+            let abs = read.absolute_offset();
+            prop_assert!(abs >= zone_spec.base);
+            prop_assert!(abs <= zone_spec.end());
+        }
+
+        #[test]
+        fn prop_layout_integration(
+            sector_exp in 9u32..13u32,
+            block_exp in 0u32..4u32,
+            zone_idx in 0usize..Zone::COUNT,
+        ) {
+            let sector_size = 1u64 << sector_exp;
+            let block_size = sector_size << block_exp;
+
+            let layout = Layout::new(
+                sector_size,
+                block_size,
+                sector_size * 2,
+                sector_size * 4,
+                sector_size * 8,
+                sector_size * 2,
+                block_size * 16,
+            );
+
+            let zone = Zone::ALL[zone_idx];
+            let zone_spec = layout.zone(zone);
+
+            if zone_spec.size > 0 {
+                let offset = zone_spec.size / 2;
+
+                let mut read = Read::new();
+                read.zone = zone;
+                read.zone_spec = zone_spec;
+                read.offset = offset;
+
+                let abs = read.absolute_offset();
+                prop_assert_eq!(abs, layout.offset(zone, offset));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "ZoneSpec::offset overflow")]
+    fn test_read_absolute_offset_overflow() {
+        // Scenario: ZoneSpec is corrupted or maliciously crafted such that
+        // base + size overflows u64, but we try to read within "size".
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec {
+            base: u64::MAX - 10,
+            size: 20, // base + size overflows
+        };
+        // offset is within "size" (15 <= 20), so the first check passes.
+        // But base + offset (MAX - 10 + 15) = MAX + 5 -> Overflows.
+        read.offset = 15;
+
+        let _ = read.absolute_offset();
+    }
+
+    #[test]
+    #[should_panic(expected = "ZoneSpec::offset overflow")]
+    fn test_write_absolute_offset_overflow() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec {
+            base: u64::MAX - 100,
+            size: 200,
+        };
+        write.offset = 150;
+        let _ = write.absolute_offset();
+    }
+
+    #[test]
+    fn test_struct_sizes() {
+        // Ensure structs don't accidentally grow or shrink in ways that might affect FFI or cache lines.
+        // These assertions are platform-dependent (likely 64-bit), but valuable for tracking changes.
+        // Read/Write:
+        // IoCompletion (approx 88 bytes, includes Operation(32), ListLink(16), etc.)
+        // + Option<fn> (8)
+        // + usize (8)
+        // + Zone (1+7pad = 8)
+        // + ZoneSpec (16)
+        // + u64 (8)
+        // = 88 + 8 + 8 + 8 + 16 + 8 = 136 bytes.
+        assert_eq!(std::mem::size_of::<Read>(), 136);
+        assert_eq!(std::mem::size_of::<Write>(), 136);
+
+        assert_eq!(std::mem::align_of::<Read>(), 8);
+        assert_eq!(std::mem::align_of::<Write>(), 8);
     }
 }
