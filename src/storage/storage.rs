@@ -194,33 +194,38 @@ pub enum NextTickQueue {
     Lsm,
 }
 
-/// A pending read operation with embedded zone context.
-///
-/// `Read` acts as a self-contained cursor for asynchronous I/O. It embeds
-/// a [`ZoneSpec`] snapshot from the [`Layout`], enabling absolute offset
-/// calculation without holding a reference to the global layout.
-///
-/// # Address Translation
-///
-/// The storage file is divided into [`Zone`]s with fixed positions. This struct
-/// translates logical (zone-relative) offsets to physical (absolute) file offsets:
-///
-/// ```text
-/// Logical:   Read { zone: WalPrepares, offset: 100 }
-///                                        │
-///            ┌───────────────────────────┘
-///            ▼
-/// Physical:  zone_spec.base + offset = 8192 + 100 = 8292
-/// ```
-///
-/// The embedded `zone_spec` is copied from [`Layout`] at creation time,
-/// making the `Read` stateless relative to global layout—it can be passed
-/// to isolated I/O threads with all math self-contained.
-///
-/// # Layout
-///
-/// `#[repr(C)]` ensures predictable field ordering for cache efficiency and
-/// potential FFI with the kernel I/O subsystem.
+// ─────────────────────────────────────────────────────────────────────────────
+// I/O Operation Structs
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `Read` and `Write` are self-contained cursors for asynchronous I/O. They
+// embed a [`ZoneSpec`] snapshot from the [`Layout`], enabling absolute offset
+// calculation without holding a reference to the global layout.
+//
+// # Address Translation
+//
+// The storage file is divided into [`Zone`]s with fixed positions. These structs
+// translate logical (zone-relative) offsets to physical (absolute) file offsets:
+//
+// ```text
+// Logical:   Read/Write { zone: WalPrepares, offset: 100 }
+//                                              │
+//            ┌─────────────────────────────────┘
+//            ▼
+// Physical:  zone_spec.base + offset = 8192 + 100 = 8292
+// ```
+//
+// The embedded `zone_spec` is copied from [`Layout`] at creation time,
+// making operations stateless relative to global layout—they can be passed
+// to isolated I/O threads with all math self-contained.
+//
+// # Layout
+//
+// `#[repr(C)]` ensures predictable field ordering for cache efficiency and
+// potential FFI with the kernel I/O subsystem.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pending read operation. See module comment above for address translation.
 #[repr(C)]
 pub struct Read {
     /// I/O completion state (result, status flags).
@@ -278,5 +283,78 @@ impl Read {
         assert!(abs >= self.zone_spec.base);
 
         abs
+    }
+}
+
+impl Default for Read {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A pending write operation. See module comment above for address translation.
+#[repr(C)]
+pub struct Write {
+    /// I/O completion state (result, status flags).
+    pub io: IoCompletion,
+    /// Invoked when I/O completes; `None` if not pending.
+    callback: Option<fn(&mut Write)>,
+    /// Expected bytes for validation (short writes are errors in direct I/O).
+    expected_len: usize,
+
+    /// Which zone this write targets.
+    pub zone: Zone,
+    /// Snapshot of zone position/size from [`Layout`] at submission time.
+    pub zone_spec: ZoneSpec,
+    /// Logical offset within the zone (0 = zone start).
+    pub offset: u64,
+}
+
+impl Write {
+    /// Creates a zeroed `Write` targeting the SuperBlock at offset 0.
+    ///
+    /// Call site must populate `zone`, `zone_spec`, and `offset` before use.
+    pub const fn new() -> Self {
+        Self {
+            io: IoCompletion::new(),
+            callback: None,
+            expected_len: 0,
+            zone: Zone::SuperBlock,
+            zone_spec: ZoneSpec { base: 0, size: 0 },
+            offset: 0,
+        }
+    }
+
+    /// Returns `true` if this write is awaiting I/O completion.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Expected write length; short writes indicate I/O errors with O_DIRECT.
+    #[inline]
+    pub fn expected_len(&self) -> usize {
+        self.expected_len
+    }
+
+    /// Computes the absolute file offset from zone-relative addressing.
+    ///
+    /// # Panics
+    ///
+    /// - `offset > zone_spec.size` (would write past zone boundary)
+    #[inline]
+    pub fn absolute_offset(&self) -> u64 {
+        assert!(self.offset <= self.zone_spec.size);
+
+        let abs = self.zone_spec.offset(self.offset);
+        assert!(abs >= self.zone_spec.base);
+
+        abs
+    }
+}
+
+impl Default for Write {
+    fn default() -> Self {
+        Self::new()
     }
 }
