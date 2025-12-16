@@ -299,7 +299,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_zone_constants() {
+    fn test_zone_invariants() {
         assert_eq!(Zone::COUNT, Zone::ALL.len());
         for (i, z) in Zone::ALL.iter().enumerate() {
             assert_eq!(z.index(), i);
@@ -307,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up() {
+    fn test_align_up_basic() {
         assert_eq!(align_up(0, 4), 0);
         assert_eq!(align_up(1, 4), 4);
         assert_eq!(align_up(3, 4), 4);
@@ -317,14 +317,14 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up_align_one() {
+    fn test_align_up_identity() {
         assert_eq!(align_up(0, 1), 0);
         assert_eq!(align_up(1, 1), 1);
         assert_eq!(align_up(12345, 1), 12345);
     }
 
     #[test]
-    fn test_layout_creation_and_alignment() {
+    fn test_layout_new() {
         let sector = 512;
         let block = 4096;
         let l = Layout::new(
@@ -361,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_no_padding_needed() {
+    fn test_layout_exact() {
         let sector = 512;
         let block = 4096;
         // 8 sectors = 4096 bytes
@@ -380,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_offset_and_spec() {
+    fn test_offset() {
         let l = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
 
         let z = Zone::WalHeaders; // Starts at 512, size 512.
@@ -396,13 +396,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "offset out of bounds")]
-    fn test_offset_out_of_bounds() {
+    fn test_offset_oob() {
         let l = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
         l.offset(Zone::WalHeaders, 513);
     }
 
     #[test]
-    fn test_zone_for_absolute() {
+    fn test_lookup() {
         let l = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
         // SB: 0..512
         // WH: 512..1024
@@ -423,13 +423,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "sector_size must be power of two")]
-    fn test_invalid_sector_size() {
+    fn test_new_invalid_sector() {
         Layout::new(100, 4096, 4096, 4096, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "not sector-aligned")]
-    fn test_unaligned_zone_size() {
+    fn test_new_unaligned() {
         Layout::new(4096, 4096, 1000, 4096, 4096, 4096, 4096);
     }
 
@@ -446,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zonespec_contains_boundaries() {
+    fn test_zonespec_contains() {
         let spec = ZoneSpec {
             base: 1000,
             size: 500,
@@ -467,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zonespec_contains_zero_size_zone() {
+    fn test_zonespec_contains_empty() {
         let spec = ZoneSpec {
             base: 1000,
             size: 0,
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_zonespec_offset_out_of_bounds() {
+    fn test_zonespec_offset_oob() {
         let spec = ZoneSpec {
             base: 1000,
             size: 10,
@@ -501,7 +501,7 @@ mod tests {
     // ==================== align_up Edge Case Tests ====================
 
     #[test]
-    fn test_align_up_already_aligned() {
+    fn test_align_up_aligned() {
         assert_eq!(align_up(0, 4096), 0);
         assert_eq!(align_up(4096, 4096), 4096);
         assert_eq!(align_up(8192, 4096), 8192);
@@ -509,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up_various_alignments() {
+    fn test_align_up_variable() {
         assert_eq!(align_up(100, 512), 512);
         assert_eq!(align_up(512, 512), 512);
         assert_eq!(align_up(513, 512), 1024);
@@ -518,13 +518,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_align_up_rejects_zero_align() {
+    fn test_align_up_zero() {
         let _ = align_up(100, 0);
     }
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_align_up_rejects_non_power_of_two() {
+    fn test_align_up_non_pot() {
         let _ = align_up(100, 100);
     }
 
@@ -538,49 +538,49 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_layout_rejects_zero_sector_size() {
+    fn test_new_zero_sector() {
         Layout::new(0, 4096, 4096, 4096, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_layout_rejects_zero_block_size() {
+    fn test_new_zero_block() {
         Layout::new(4096, 0, 4096, 4096, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "block_size must be power of two")]
-    fn test_layout_rejects_non_power_of_two_block_size() {
+    fn test_new_block_non_pot() {
         Layout::new(4096, 5000, 4096, 4096, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_layout_rejects_block_smaller_than_sector() {
+    fn test_new_block_lt_sector() {
         Layout::new(4096, 2048, 4096, 4096, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "not sector-aligned")]
-    fn test_layout_rejects_unaligned_wal_headers() {
+    fn test_new_unaligned_wal_header() {
         Layout::new(4096, 4096, 4096, 4097, 4096, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "not sector-aligned")]
-    fn test_layout_rejects_unaligned_wal_prepares() {
+    fn test_new_unaligned_wal_prepare() {
         Layout::new(4096, 4096, 4096, 4096, 4097, 4096, 4096);
     }
 
     #[test]
     #[should_panic(expected = "not sector-aligned")]
-    fn test_layout_rejects_unaligned_client_replies() {
+    fn test_new_unaligned_client_reply() {
         Layout::new(4096, 4096, 4096, 4096, 4096, 4097, 4096);
     }
 
     #[test]
     #[should_panic(expected = "not block-aligned")]
-    fn test_layout_rejects_unaligned_grid() {
+    fn test_new_unaligned_grid() {
         Layout::new(512, 4096, 4096, 4096, 4096, 4096, 4097);
     }
 
@@ -588,20 +588,20 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "ZoneSpec::end overflow")]
-    fn test_layout_new_panics_on_zone_end_overflow() {
+    fn test_new_overflow_zone_end() {
         let _ = Layout::new(1, 1, u64::MAX, 1, 0, 0, 0);
     }
 
     #[test]
     #[should_panic(expected = "align_up overflow")]
-    fn test_layout_new_panics_on_align_up_overflow() {
+    fn test_new_overflow_align() {
         let _ = Layout::new(1, 2, u64::MAX, 0, 0, 0, 0);
     }
 
     // ==================== Layout Invariant Tests ====================
 
     #[test]
-    fn test_layout_zones_are_contiguous() {
+    fn test_zones_contiguous() {
         let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
 
         for i in 1..Zone::COUNT {
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_all_zones_sector_aligned() {
+    fn test_zones_aligned() {
         let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
 
         for zone in Zone::ALL {
@@ -632,13 +632,13 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_superblock_starts_at_zero() {
+    fn test_sb_zero() {
         let layout = Layout::new(4096, 4096, 4096, 4096, 4096, 4096, 4096);
         assert_eq!(layout.start(Zone::SuperBlock), 0);
     }
 
     #[test]
-    fn test_layout_zones_do_not_overlap() {
+    fn test_zones_overlap() {
         let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
 
         for i in 0..Zone::COUNT {
@@ -661,27 +661,27 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_grid_is_block_aligned() {
+    fn test_grid_aligned() {
         // Use sizes that don't naturally align to block size
         let layout = Layout::new(512, 4096, 5120, 3072, 7168, 2048, 8192);
         assert_eq!(layout.start(Zone::Grid) % layout.block_size, 0);
     }
 
     #[test]
-    fn test_layout_total_size_equals_last_zone_end() {
+    fn test_total_size_end() {
         let layout = Layout::new(4096, 4096, 4096, 4096, 4096, 4096, 4096);
         assert_eq!(layout.total_size(), layout.end(Zone::Grid));
     }
 
     #[test]
-    fn test_layout_total_size_is_sum_of_zones() {
+    fn test_total_size_sum() {
         let layout = Layout::new(4096, 4096, 4096, 8192, 16384, 8192, 65536);
         let sum: u64 = Zone::ALL.iter().map(|&z| layout.size(z)).sum();
         assert_eq!(layout.total_size(), sum);
     }
 
     #[test]
-    fn test_layout_with_zero_sized_zones() {
+    fn test_empty_zones() {
         let layout = Layout::new(4096, 4096, 4096, 0, 0, 0, 4096);
 
         assert_eq!(layout.size(Zone::WalHeaders), 0);
@@ -696,14 +696,14 @@ mod tests {
     }
 
     #[test]
-    fn test_layout_large_zones_no_overflow() {
+    fn test_large_zones() {
         let gb = 1024 * 1024 * 1024;
         let layout = Layout::new(4096, 1024 * 1024, 4096, gb, 10 * gb, gb, 100 * gb);
         assert!(layout.total_size() > 100 * gb);
     }
 
     #[test]
-    fn test_zone_discriminants_are_stable() {
+    fn test_discriminants() {
         // Wire protocol stability - discriminants must never change
         assert_eq!(Zone::SuperBlock as u8, 0);
         assert_eq!(Zone::WalHeaders as u8, 1);
@@ -714,7 +714,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zone_for_absolute_zero_sized_zones() {
+    fn test_lookup_empty_zones() {
         let layout = Layout::new(4096, 4096, 4096, 0, 4096, 0, 4096);
 
         // Zero-sized zones should not contain any offset
@@ -737,7 +737,7 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn prop_layout_zones_are_contiguous(
+        fn prop_zones_contiguous(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
         ) {
@@ -760,7 +760,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_all_zones_sector_aligned(
+        fn prop_zones_aligned(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
         ) {
@@ -781,7 +781,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_grid_is_block_aligned(
+        fn prop_grid_aligned(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
         ) {
@@ -800,7 +800,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_total_size_equals_sum(
+        fn prop_total_size(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
         ) {
@@ -820,7 +820,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_zone_for_absolute_roundtrip(
+        fn prop_lookup_roundtrip(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
         ) {
@@ -846,7 +846,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_offset_stays_within_zone(
+        fn prop_offset_bounds(
             sector_size in sector_size_strategy(),
             block_exp in 0u32..5u32,
             zone_idx in 0usize..Zone::COUNT,
@@ -875,7 +875,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_align_up_is_aligned(
+        fn prop_align_up(
             value in 0u64..1_000_000,
             align_exp in 9u32..20u32,
         ) {
@@ -890,7 +890,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_zonespec_contains_boundaries(
+        fn prop_zonespec_contains(
             base in 0u64..1_000_000,
             size in 1u64..1_000_000,
         ) {
@@ -905,7 +905,7 @@ mod proptests {
         }
 
         #[test]
-        fn prop_zonespec_offset_within_bounds(
+        fn prop_zonespec_offset(
             base in 0u64..1_000_000,
             size in 1u64..1_000_000,
             relative_factor in 0.0f64..1.0,
