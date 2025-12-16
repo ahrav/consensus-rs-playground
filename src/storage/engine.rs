@@ -212,8 +212,8 @@ pub enum NextTickQueue {
 // ```
 //
 // The embedded `zone_spec` is copied from [`Layout`] at creation time,
-// making operations stateless relative to global layout—they can be passed
-// to isolated I/O threads with all math self-contained.
+// making operations stateless relative to global layout—submission/execution
+// doesn't require holding a reference to the global layout.
 //
 // # Layout
 //
@@ -451,6 +451,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn buf_panic_len_over_isize_max() {
+        let _ = AlignedBuf::new_zeroed((isize::MAX as usize) + 1, SECTOR_SIZE_DEFAULT);
+    }
+
+    #[test]
     fn buf_is_zeroed() {
         let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
         assert!(buf.as_slice().iter().all(|&b| b == 0));
@@ -482,6 +488,13 @@ mod tests {
         let ptr = buf.as_ptr();
         assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
         assert_eq!(ptr, buf.as_slice().as_ptr());
+    }
+
+    #[test]
+    fn buf_slice_lengths() {
+        let mut buf = AlignedBuf::new_zeroed(1234, SECTOR_SIZE_DEFAULT);
+        assert_eq!(buf.as_slice().len(), 1234);
+        assert_eq!(buf.as_mut_slice().len(), 1234);
     }
 
     #[test]
@@ -536,6 +549,31 @@ mod tests {
     }
 
     #[test]
+    fn read_pending_true_when_callback_set() {
+        fn cb(_: &mut Read) {}
+        let mut read = Read::new();
+        assert!(!read.is_pending());
+        read.callback = Some(cb);
+        assert!(read.is_pending());
+        read.callback = None;
+        assert!(!read.is_pending());
+    }
+
+    #[test]
+    fn read_expected_len_accessors() {
+        let mut read = Read::new();
+        assert_eq!(read.expected_len(), 0);
+        read.expected_len = 123;
+        assert_eq!(read.expected_len(), 123);
+    }
+
+    #[test]
+    fn read_io_starts_idle() {
+        let read = Read::new();
+        assert!(read.io.is_idle());
+    }
+
+    #[test]
     fn read_offset_logic() {
         let mut read = Read::new();
         read.zone_spec = ZoneSpec {
@@ -565,6 +603,23 @@ mod tests {
             size: 500,
         };
         read.offset = 501;
+        let _ = read.absolute_offset();
+    }
+
+    #[test]
+    fn read_zero_size_zone_allows_only_zero_offset() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec { base: 42, size: 0 };
+        read.offset = 0;
+        assert_eq!(read.absolute_offset(), 42);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_zero_size_zone_panics_on_nonzero_offset() {
+        let mut read = Read::new();
+        read.zone_spec = ZoneSpec { base: 42, size: 0 };
+        read.offset = 1;
         let _ = read.absolute_offset();
     }
 
@@ -608,6 +663,31 @@ mod tests {
     }
 
     #[test]
+    fn write_pending_true_when_callback_set() {
+        fn cb(_: &mut Write) {}
+        let mut write = Write::new();
+        assert!(!write.is_pending());
+        write.callback = Some(cb);
+        assert!(write.is_pending());
+        write.callback = None;
+        assert!(!write.is_pending());
+    }
+
+    #[test]
+    fn write_expected_len_accessors() {
+        let mut write = Write::new();
+        assert_eq!(write.expected_len(), 0);
+        write.expected_len = 456;
+        assert_eq!(write.expected_len(), 456);
+    }
+
+    #[test]
+    fn write_io_starts_idle() {
+        let write = Write::new();
+        assert!(write.io.is_idle());
+    }
+
+    #[test]
     fn write_offset_logic() {
         let mut write = Write::new();
         write.zone_spec = ZoneSpec {
@@ -634,6 +714,23 @@ mod tests {
             size: 1000,
         };
         write.offset = 1001;
+        let _ = write.absolute_offset();
+    }
+
+    #[test]
+    fn write_zero_size_zone_allows_only_zero_offset() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec { base: 99, size: 0 };
+        write.offset = 0;
+        assert_eq!(write.absolute_offset(), 99);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_zero_size_zone_panics_on_nonzero_offset() {
+        let mut write = Write::new();
+        write.zone_spec = ZoneSpec { base: 99, size: 0 };
+        write.offset = 1;
         let _ = write.absolute_offset();
     }
 
@@ -690,6 +787,28 @@ mod tests {
                 assert_eq!(read.absolute_offset(), zone_spec.base + offset);
             }
         }
+    }
+
+    #[test]
+    fn read_io_field_is_first() {
+        let offset = unsafe {
+            let uninit = core::mem::MaybeUninit::<Read>::uninit();
+            let base = uninit.as_ptr();
+            let io_ptr = core::ptr::addr_of!((*base).io);
+            (io_ptr as usize) - (base as usize)
+        };
+        assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn write_io_field_is_first() {
+        let offset = unsafe {
+            let uninit = core::mem::MaybeUninit::<Write>::uninit();
+            let base = uninit.as_ptr();
+            let io_ptr = core::ptr::addr_of!((*base).io);
+            (io_ptr as usize) - (base as usize)
+        };
+        assert_eq!(offset, 0);
     }
 }
 
