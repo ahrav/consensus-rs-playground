@@ -1386,7 +1386,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_storage_open_basic() {
+    fn open() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_basic");
         let layout = default_layout();
@@ -1408,7 +1408,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_storage_invariants_allow_fd_zero() {
+    fn open_fd_zero() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_fd_zero");
 
@@ -1425,7 +1425,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_storage_open_sector_size_defaults() {
+    fn open_defaults() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_default_sector_size");
         let layout = default_layout_4k();
@@ -1442,7 +1442,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_next_tick_vsr_before_lsm() {
+    fn priority_vsr_over_lsm() {
         thread_local! {
             static EXECUTION_ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         }
@@ -1482,7 +1482,7 @@ mod integration_tests {
 
     #[test]
     #[should_panic(expected = "assertion failed")]
-    fn test_on_next_tick_double_schedule_panics() {
+    fn double_schedule_panic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_double_schedule");
         let opts = Options {
@@ -1501,7 +1501,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_reset_next_tick_lsm_cancels_callbacks() {
+    fn reset_lsm() {
         thread_local! {
             static EXECUTION_ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         }
@@ -1544,7 +1544,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_next_tick_requeue_delayed() {
+    fn requeue_next_tick() {
         thread_local! {
              static EXECUTION_COUNT: RefCell<u32> = const { RefCell::new(0) };
              static STORAGE_PTR: RefCell<Option<*mut Storage>> = const { RefCell::new(None) };
@@ -1590,7 +1590,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_storage_io_read() {
+    fn io_read() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_io_read");
         let layout = default_layout();
@@ -1670,7 +1670,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_storage_io_write() {
+    fn io_write() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("storage_io_write");
         let layout = default_layout();
@@ -1743,7 +1743,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_io_completion_schedules_next_tick_is_deferred() {
+    fn io_defers_next_tick() {
         thread_local! {
             static IO_DONE: Cell<bool> = const { Cell::new(false) };
             static NEXT_TICK_DONE: Cell<bool> = const { Cell::new(false) };
