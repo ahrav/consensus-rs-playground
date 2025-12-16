@@ -103,19 +103,13 @@ impl AlignedBuf {
         assert!(self.len > 0);
         assert!(self.align > 0);
         assert!(self.align.is_power_of_two());
-        assert!(self.ptr.as_ptr() as usize % self.align == 0);
+        assert!((self.ptr.as_ptr() as usize).is_multiple_of(self.align));
     }
 
     /// Returns the buffer as a mutable byte slice.
-    ///
-    /// # Safety
-    ///
-    /// Interior mutability through `&self` is sound because `AlignedBuf` owns
-    /// its allocation exclusively and is `!Sync`.
-    pub fn as_mut_slice(&self) -> &mut [u8] {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.assert_invariants();
-        // SAFETY: We own the allocation, it's valid for `len` bytes,
-        // and `AlignedBuf` is `!Sync` so no data races.
+        // SAFETY: We own the allocation exclusively, it's valid for `len` bytes.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
     }
 
@@ -133,7 +127,7 @@ impl AlignedBuf {
     }
 
     /// Returns a mutable raw pointer to the buffer start.
-    pub fn as_mut_ptr(&self) -> *mut u8 {
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.assert_invariants();
         self.ptr.as_ptr()
     }
@@ -464,7 +458,7 @@ mod tests {
 
     #[test]
     fn buf_mut_write() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
         let slice = buf.as_mut_slice();
         slice[0] = 0xAB;
         slice[1] = 0xCD;
@@ -477,16 +471,17 @@ mod tests {
 
     #[test]
     fn buf_mut_fill() {
-        let buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
+        let mut buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
         buf.as_mut_slice().fill(0xFF);
         assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
     }
 
     #[test]
     fn buf_ptrs() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.as_ptr(), buf.as_mut_ptr() as *const u8);
-        assert_eq!(buf.as_ptr(), buf.as_slice().as_ptr());
+        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        let ptr = buf.as_ptr();
+        assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
+        assert_eq!(ptr, buf.as_slice().as_ptr());
     }
 
     #[test]
@@ -498,14 +493,14 @@ mod tests {
     #[test]
     fn buf_drop() {
         for _ in 0..100 {
-            let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+            let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
             buf.as_mut_slice().fill(0xAB);
         }
     }
 
     #[test]
     fn buf_send() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
+        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
         buf.as_mut_slice()[0] = 42;
         let handle = std::thread::spawn(move || {
             assert_eq!(buf.as_slice()[0], 42);
@@ -580,7 +575,10 @@ mod tests {
         read.zone = Zone::WalPrepares;
         read.zone_spec = layout.zone(Zone::WalPrepares);
         read.offset = 100;
-        assert_eq!(read.absolute_offset(), layout.start(Zone::WalPrepares) + 100);
+        assert_eq!(
+            read.absolute_offset(),
+            layout.start(Zone::WalPrepares) + 100
+        );
     }
 
     // ==================== Write ====================
@@ -646,7 +644,10 @@ mod tests {
         write.zone = Zone::ClientReplies;
         write.zone_spec = layout.zone(Zone::ClientReplies);
         write.offset = 200;
-        assert_eq!(write.absolute_offset(), layout.start(Zone::ClientReplies) + 200);
+        assert_eq!(
+            write.absolute_offset(),
+            layout.start(Zone::ClientReplies) + 200
+        );
     }
 
     // ==================== Consistency ====================
@@ -737,9 +738,10 @@ mod proptests {
             len in len_strategy(),
             align in align_strategy(),
         ) {
-            let buf = AlignedBuf::new_zeroed(len, align);
-            prop_assert_eq!(buf.as_ptr(), buf.as_mut_ptr() as *const u8);
-            prop_assert_eq!(buf.as_ptr(), buf.as_slice().as_ptr());
+            let mut buf = AlignedBuf::new_zeroed(len, align);
+            let ptr = buf.as_ptr();
+            prop_assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
+            prop_assert_eq!(ptr, buf.as_slice().as_ptr());
         }
 
         #[test]
@@ -747,7 +749,7 @@ mod proptests {
             len in 1usize..10000,
             pattern in any::<u8>(),
         ) {
-            let buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
+            let mut buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
             buf.as_mut_slice().fill(pattern);
             prop_assert!(buf.as_slice().iter().all(|&b| b == pattern));
         }
