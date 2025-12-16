@@ -169,3 +169,114 @@ impl Drop for AlignedBuf {
 
 // SAFETY: The buffer owns its allocation exclusively. No shared mutable state.
 unsafe impl Send for AlignedBuf {}
+
+/// Controls whether I/O operations complete synchronously or asynchronously.
+///
+/// Used to configure storage behavior for testing (synchronous) vs production
+/// (asynchronous with io_uring/epoll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synchronicity {
+    /// Operations block until completion. Useful for deterministic testing.
+    AlwaysSynchronous,
+    /// Operations return immediately; completion notified via callback.
+    AlwaysAsynchronous,
+}
+
+/// Identifies which subsystem a deferred callback belongs to.
+///
+/// Callbacks are partitioned to allow priority-based processing: VSR protocol
+/// operations typically take precedence over LSM tree maintenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextTickQueue {
+    /// Viewstamped Replication protocol callbacks (high priority).
+    Vsr,
+    /// Log-Structured Merge tree callbacks (background maintenance).
+    Lsm,
+}
+
+/// A pending read operation with embedded zone context.
+///
+/// `Read` acts as a self-contained cursor for asynchronous I/O. It embeds
+/// a [`ZoneSpec`] snapshot from the [`Layout`], enabling absolute offset
+/// calculation without holding a reference to the global layout.
+///
+/// # Address Translation
+///
+/// The storage file is divided into [`Zone`]s with fixed positions. This struct
+/// translates logical (zone-relative) offsets to physical (absolute) file offsets:
+///
+/// ```text
+/// Logical:   Read { zone: WalPrepares, offset: 100 }
+///                                        │
+///            ┌───────────────────────────┘
+///            ▼
+/// Physical:  zone_spec.base + offset = 8192 + 100 = 8292
+/// ```
+///
+/// The embedded `zone_spec` is copied from [`Layout`] at creation time,
+/// making the `Read` stateless relative to global layout—it can be passed
+/// to isolated I/O threads with all math self-contained.
+///
+/// # Layout
+///
+/// `#[repr(C)]` ensures predictable field ordering for cache efficiency and
+/// potential FFI with the kernel I/O subsystem.
+#[repr(C)]
+pub struct Read {
+    /// I/O completion state (result, status flags).
+    pub io: IoCompletion,
+    /// Invoked when I/O completes; `None` if not pending.
+    callback: Option<fn(&mut Read)>,
+    /// Expected bytes for validation (short reads are errors in direct I/O).
+    expected_len: usize,
+
+    /// Which zone this read targets.
+    pub zone: Zone,
+    /// Snapshot of zone position/size from [`Layout`] at submission time.
+    pub zone_spec: ZoneSpec,
+    /// Logical offset within the zone (0 = zone start).
+    pub offset: u64,
+}
+
+impl Read {
+    /// Creates a zeroed `Read` targeting the SuperBlock at offset 0.
+    ///
+    /// Call site must populate `zone`, `zone_spec`, and `offset` before use.
+    pub const fn new() -> Self {
+        Self {
+            io: IoCompletion::new(),
+            callback: None,
+            expected_len: 0,
+            zone: Zone::SuperBlock,
+            zone_spec: ZoneSpec { base: 0, size: 0 },
+            offset: 0,
+        }
+    }
+
+    /// Returns `true` if this read is awaiting I/O completion.
+    #[inline]
+    pub fn is_pending(&self) -> bool {
+        self.callback.is_some()
+    }
+
+    /// Expected read length; short reads indicate I/O errors with O_DIRECT.
+    #[inline]
+    pub fn expected_len(&self) -> usize {
+        self.expected_len
+    }
+
+    /// Computes the absolute file offset from zone-relative addressing.
+    ///
+    /// # Panics
+    ///
+    /// - `offset > zone_spec.size` (would read past zone boundary)
+    #[inline]
+    pub fn absolute_offset(&self) -> u64 {
+        assert!(self.offset <= self.zone_spec.size);
+
+        let abs = self.zone_spec.offset(self.offset);
+        assert!(abs >= self.zone_spec.base);
+
+        abs
+    }
+}

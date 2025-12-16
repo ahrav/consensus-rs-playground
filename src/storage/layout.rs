@@ -1,33 +1,80 @@
 //! Storage layout for VSR data file.
 //!
-//! Organizes storage into contiguous [`Zone`]s with alignment guarantees:
-//! - All zone bases are sector-aligned
-//! - Grid zone is additionally block-aligned (via automatic padding)
+//! This module provides a translation layer between **logical addressing**
+//! (zone + offset) and **physical addressing** (absolute file byte). This
+//! decouples application logic (which cares about "the 3rd WAL entry") from
+//! physical storage (which cares about "byte 4096 on disk").
 //!
-//! # Layout Order
+//! # Physical Layout
+//!
+//! The [`Layout`] struct describes the immutable shape of the file on disk.
+//! Zones are contiguous, with [`GridPadding`](Zone::GridPadding) inserted
+//! automatically to ensure [`Grid`](Zone::Grid) is block-aligned.
+//!
 //! ```text
-//! SuperBlock | WalHeaders | WalPrepares | ClientReplies | GridPadding | Grid
+//! File Start (0)
+//! │
+//! ▼
+//! ┌──────────────┐ ◄─ Zone 0: SuperBlock (base: 0)
+//! │              │
+//! ├──────────────┤ ◄─ Zone 1: WalHeaders
+//! │              │
+//! ├──────────────┤ ◄─ Zone 2: WalPrepares
+//! │              │
+//! ├──────────────┤ ◄─ Zone 3: ClientReplies
+//! │              │
+//! ├──────────────┤ ◄─ Zone 4: GridPadding (variable, forces alignment)
+//! │  //////////  │
+//! ├──────────────┤ ◄─ Zone 5: Grid (base % block_size == 0)
+//! │              │
+//! │              │
+//! └──────────────┘
 //! ```
+//!
+//! # Key Relationships
+//!
+//! - **[`Layout`] → [`ZoneSpec`]**: The layout acts as a factory. Compute the
+//!   layout once at startup, then extract [`ZoneSpec`]s to configure I/O
+//!   operations.
+//!
+//! - **[`ZoneSpec`] → I/O**: I/O structs (like `Read`) embed a [`ZoneSpec`]
+//!   snapshot. This makes them self-contained—they can be passed to isolated
+//!   I/O threads without referencing the global layout.
+//!
+//! # Design Rationale
+//!
+//! - **Safety**: Zone bounds are enforced; reads cannot cross zone boundaries.
+//! - **Performance**: No pointer chasing—base offset is embedded in the I/O struct.
+//! - **Alignment**: [`Layout`] guarantees sector-aligned bases, so aligned
+//!   relative offsets yield aligned physical accesses.
 
-/// Discriminant for each storage region.
+/// Identifies a storage region within the data file.
 ///
-/// Discriminants are stable (`#[repr(u8)]`) for indexing into arrays.
-/// Use [`Zone::ALL`] for iteration in layout order.
+/// Each zone has a dedicated purpose in the VSR protocol. Discriminants are
+/// stable (`#[repr(u8)]`) for array indexing. Use [`Zone::ALL`] for iteration
+/// in layout order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Zone {
+    /// Cluster metadata and replica state for crash recovery.
     SuperBlock = 0,
+    /// Fixed-size headers for WAL entries (checksums, sequence numbers).
     WalHeaders = 1,
+    /// Variable-size prepare message bodies referenced by WAL headers.
     WalPrepares = 2,
+    /// Cached responses for client request deduplication.
     ClientReplies = 3,
-    /// Padding inserted automatically to block-align the Grid.
+    /// Auto-inserted padding to block-align the Grid zone.
     GridPadding = 4,
+    /// LSM tree block storage for persistent state machine data.
     Grid = 5,
 }
 
 impl Zone {
+    /// Total number of zones in the layout.
     pub const COUNT: usize = 6;
 
+    /// All zones in physical layout order (file start → end).
     pub const ALL: [Zone; Self::COUNT] = [
         Zone::SuperBlock,
         Zone::WalHeaders,
@@ -37,6 +84,7 @@ impl Zone {
         Zone::Grid,
     ];
 
+    /// Returns the zone's index for array lookup (matches discriminant value).
     #[inline]
     pub const fn index(self) -> usize {
         self as usize
@@ -65,7 +113,26 @@ const _: () = {
     assert!(Zone::ALL[5] as usize == 5);
 };
 
-/// Position and extent of a single zone.
+/// Position and extent of a single zone, extracted from [`Layout`].
+///
+/// `ZoneSpec` is a lightweight, copyable snapshot of a zone's location. It's
+/// designed to be embedded in I/O structs, providing all context needed for
+/// address translation without referencing the global [`Layout`].
+///
+/// # Address Translation
+///
+/// ```text
+/// ZoneSpec { base: 8192, size: 4096 }
+///              │
+///              ▼
+/// ┌────────────┬────────────────────────────┐
+/// │   File     │  Zone (WalPrepares)        │
+/// │   ...      │ [8192]──────────[12288)    │
+/// └────────────┴────────────────────────────┘
+///                  ▲
+///                  │
+///              offset(100) → 8292
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct ZoneSpec {
     /// Absolute byte offset from file start.
@@ -109,9 +176,26 @@ impl ZoneSpec {
 
 /// Complete storage layout with computed zone positions.
 ///
-/// Zones are laid out contiguously. [`GridPadding`](Zone::GridPadding) is
-/// computed automatically to ensure [`Grid`](Zone::Grid) starts at a
-/// block-aligned offset.
+/// `Layout` is the **factory** for [`ZoneSpec`]s. Compute it once at startup,
+/// then extract zone specs for I/O operations. Zones are laid out contiguously
+/// with [`GridPadding`](Zone::GridPadding) auto-computed to block-align the Grid.
+///
+/// # Invariants
+///
+/// - All zone bases are sector-aligned
+/// - Zones are contiguous: `zone[i].end() == zone[i+1].base`
+/// - [`Grid`](Zone::Grid) base is block-aligned
+/// - [`SuperBlock`](Zone::SuperBlock) starts at offset 0
+///
+/// # Example
+///
+/// ```ignore
+/// let layout = Layout::new(512, 4096, sb, wh, wp, cr, grid);
+///
+/// // Extract spec for I/O
+/// let wal_spec = layout.zone(Zone::WalPrepares);
+/// let abs_offset = wal_spec.offset(relative_offset);
+/// ```
 #[derive(Debug, Clone)]
 pub struct Layout {
     /// Minimum I/O alignment (typically 512 or 4096).
