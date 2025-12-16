@@ -421,7 +421,7 @@ impl QueueNode<NextTickTag> for NextTick {
 ///
 /// # Invariants
 ///
-/// - `fd > 0` (valid file descriptor)
+/// - `fd >= 0` (valid file descriptor)
 /// - `sector_size` is a power of two in `[SECTOR_SIZE_MIN, SECTOR_SIZE_MAX]`
 /// - File size matches `layout.total_size()` and is sector-aligned
 pub struct Storage {
@@ -527,7 +527,7 @@ impl Storage {
     /// Validates structural invariants. Called in public methods for defense-in-depth.
     #[inline]
     fn assert_invariants(&self) {
-        assert!(self.fd > 0);
+        assert!(self.fd >= 0);
         assert!(self.sector_size >= SECTOR_SIZE_MIN);
         assert!(self.sector_size <= SECTOR_SIZE_MAX);
         assert!(self.sector_size.is_power_of_two());
@@ -1364,13 +1364,25 @@ mod security_tests {
 mod integration_tests {
     use super::*;
     use crate::io::{Completion, Operation};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs::File;
-    use std::io::{Seek, Write};
+    use std::io::{Read as IoRead, Seek, Write as IoWrite};
     use tempfile::tempdir;
 
     fn default_layout() -> Layout {
         Layout::new(512, 4096, 4096, 4096, 4096, 4096, 4096)
+    }
+
+    fn default_layout_4k() -> Layout {
+        Layout::new(
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+            SECTOR_SIZE_DEFAULT as u64,
+        )
     }
 
     #[test]
@@ -1393,6 +1405,40 @@ mod integration_tests {
             storage.file().metadata().unwrap().len(),
             layout.total_size()
         );
+    }
+
+    #[test]
+    fn test_storage_invariants_allow_fd_zero() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_fd_zero");
+
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+
+        let mut storage = Storage::open(opts).unwrap();
+        storage.fd = 0;
+        storage.assert_invariants();
+    }
+
+    #[test]
+    fn test_storage_open_sector_size_defaults() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_default_sector_size");
+        let layout = default_layout_4k();
+
+        let opts = Options {
+            path: &path,
+            layout,
+            direct_io: false,
+            sector_size: 0,
+        };
+
+        let storage = Storage::open(opts).unwrap();
+        assert_eq!(storage.sector_size(), SECTOR_SIZE_DEFAULT);
     }
 
     #[test]
@@ -1432,6 +1478,69 @@ mod integration_tests {
             assert_eq!(*o.borrow(), vec!["VSR", "LSM"]);
             o.borrow_mut().clear();
         });
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_on_next_tick_double_schedule_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_double_schedule");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        fn cb(_: &mut NextTick) {}
+
+        let mut next_tick = NextTick::new();
+        storage.on_next_tick(NextTickQueue::Vsr, cb, &mut next_tick);
+        storage.on_next_tick(NextTickQueue::Vsr, cb, &mut next_tick);
+    }
+
+    #[test]
+    fn test_reset_next_tick_lsm_cancels_callbacks() {
+        thread_local! {
+            static EXECUTION_ORDER: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn cb_vsr(_: &mut NextTick) {
+            EXECUTION_ORDER.with(|o| o.borrow_mut().push("VSR"));
+        }
+
+        fn cb_lsm(_: &mut NextTick) {
+            EXECUTION_ORDER.with(|o| o.borrow_mut().push("LSM"));
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_reset_lsm");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut nt_vsr = NextTick::new();
+        let mut nt_lsm = NextTick::new();
+        storage.on_next_tick(NextTickQueue::Vsr, cb_vsr, &mut nt_vsr);
+        storage.on_next_tick(NextTickQueue::Lsm, cb_lsm, &mut nt_lsm);
+
+        storage.reset_next_tick_lsm();
+        assert!(!nt_lsm.is_pending());
+
+        storage.run();
+
+        EXECUTION_ORDER.with(|o| {
+            assert_eq!(*o.borrow(), vec!["VSR"]);
+            o.borrow_mut().clear();
+        });
+
+        assert!(!nt_vsr.is_pending());
+        assert!(!nt_lsm.is_pending());
     }
 
     #[test]
@@ -1527,7 +1636,7 @@ mod integration_tests {
             // SAFETY: ctx is *mut Read
             unsafe {
                 let read = &mut *(ctx as *mut Read);
-                if let Some(cb) = read.callback {
+                if let Some(cb) = read.callback.take() {
                     cb(read);
                 }
             }
@@ -1552,7 +1661,177 @@ mod integration_tests {
 
         READ_DONE.with(|b| assert!(*b.borrow()));
         assert_eq!(buf.as_slice()[0], 0x42);
-        
+
+        assert_eq!(read.io.result, 512);
+        assert!(read.io.is_idle());
+        assert!(!read.is_pending());
+
         READ_DONE.with(|b| *b.borrow_mut() = false);
+    }
+
+    #[test]
+    fn test_storage_io_write() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_io_write");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut write = Write::new();
+        write.zone = Zone::WalPrepares;
+        write.zone_spec = layout.zone(Zone::WalPrepares);
+        write.offset = 0;
+        write.expected_len = 512;
+
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xA5);
+
+        thread_local! {
+            static WRITE_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn cb(_: &mut Write) {
+            WRITE_DONE.with(|b| b.set(true));
+        }
+        write.callback = Some(cb);
+
+        let abs_offset = write.absolute_offset();
+
+        unsafe fn write_shim(ctx: *mut core::ffi::c_void, _comp: &mut Completion) {
+            // SAFETY: ctx is *mut Write
+            unsafe {
+                let write = &mut *(ctx as *mut Write);
+                if let Some(cb) = write.callback.take() {
+                    cb(write);
+                }
+            }
+        }
+
+        let ctx = &mut write as *mut Write as *mut core::ffi::c_void;
+        let fd = storage.fd;
+
+        storage.io().write(
+            &mut write.io,
+            fd,
+            buf.as_ptr(),
+            512,
+            abs_offset,
+            ctx,
+            write_shim,
+        );
+        storage.tick();
+
+        WRITE_DONE.with(|b| assert!(b.get()));
+
+        assert_eq!(write.io.result, 512);
+        assert!(write.io.is_idle());
+        assert!(!write.is_pending());
+
+        let mut f = File::open(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(abs_offset)).unwrap();
+        let mut read_back = vec![0u8; 512];
+        f.read_exact(&mut read_back).unwrap();
+        assert!(read_back.iter().all(|&b| b == 0xA5));
+
+        WRITE_DONE.with(|b| b.set(false));
+    }
+
+    #[test]
+    fn test_io_completion_schedules_next_tick_is_deferred() {
+        thread_local! {
+            static IO_DONE: Cell<bool> = const { Cell::new(false) };
+            static NEXT_TICK_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+
+        fn next_tick_cb(_: &mut NextTick) {
+            NEXT_TICK_DONE.with(|b| b.set(true));
+        }
+
+        struct IoCtx {
+            queue: *mut Queue<NextTick, NextTickTag>,
+            next_tick: *mut NextTick,
+        }
+
+        unsafe fn io_cb(ctx: *mut core::ffi::c_void, _comp: &mut Completion) {
+            IO_DONE.with(|b| b.set(true));
+
+            // SAFETY: ctx is a valid `IoCtx*` for the duration of the I/O op.
+            unsafe {
+                let ctx = &mut *(ctx as *mut IoCtx);
+                let next_tick = &mut *ctx.next_tick;
+                assert!(!next_tick.is_pending());
+
+                next_tick.callback = Some(next_tick_cb);
+                let queue = &mut *ctx.queue;
+                queue.push(next_tick);
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_io_schedules_next_tick");
+        let layout = default_layout();
+
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+                .unwrap();
+            f.write_all(&[0x11; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut nt = NextTick::new();
+        let queue_ptr: *mut Queue<NextTick, NextTickTag> = &mut storage.next_tick_vsr;
+        let mut ctx = IoCtx {
+            queue: queue_ptr,
+            next_tick: &mut nt,
+        };
+
+        let mut read = Read::new();
+        read.zone = Zone::WalPrepares;
+        read.zone_spec = layout.zone(Zone::WalPrepares);
+        read.offset = 0;
+        read.expected_len = 512;
+
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        let abs_offset = read.absolute_offset();
+
+        let fd = storage.fd;
+        storage.io().read(
+            &mut read.io,
+            fd,
+            buf.as_mut_ptr(),
+            512,
+            abs_offset,
+            &mut ctx as *mut IoCtx as *mut core::ffi::c_void,
+            io_cb,
+        );
+
+        // First run: completes the I/O and queues the next-tick, but must not run it.
+        storage.run();
+        IO_DONE.with(|b| assert!(b.get()));
+        NEXT_TICK_DONE.with(|b| assert!(!b.get()));
+        assert!(nt.is_pending());
+
+        // Second run: drains the queued next-tick.
+        storage.run();
+        NEXT_TICK_DONE.with(|b| assert!(b.get()));
+        assert!(!nt.is_pending());
+
+        IO_DONE.with(|b| b.set(false));
+        NEXT_TICK_DONE.with(|b| b.set(false));
     }
 }

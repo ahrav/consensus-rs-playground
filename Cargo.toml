@@ -8,6 +8,7 @@ aegis = { version = "0.9", features = ["pure-rust"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 crossbeam-queue = "0.3"
