@@ -373,8 +373,8 @@ mod tests {
         assert_eq!(SECTOR_SIZE_MIN, 512);
         assert_eq!(SECTOR_SIZE_DEFAULT, 4096);
         assert_eq!(SECTOR_SIZE_MAX, 65536);
-        assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT);
-        assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX);
+        const { assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT) };
+        const { assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX) };
     }
 
     // ==================== AlignedBuf ====================
