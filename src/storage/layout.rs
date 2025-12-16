@@ -1,3 +1,18 @@
+//! Storage layout for VSR data file.
+//!
+//! Organizes storage into contiguous [`Zone`]s with alignment guarantees:
+//! - All zone bases are sector-aligned
+//! - Grid zone is additionally block-aligned (via automatic padding)
+//!
+//! # Layout Order
+//! ```text
+//! SuperBlock | WalHeaders | WalPrepares | ClientReplies | GridPadding | Grid
+//! ```
+
+/// Discriminant for each storage region.
+///
+/// Discriminants are stable (`#[repr(u8)]`) for indexing into arrays.
+/// Use [`Zone::ALL`] for iteration in layout order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Zone {
@@ -5,6 +20,7 @@ pub enum Zone {
     WalHeaders = 1,
     WalPrepares = 2,
     ClientReplies = 3,
+    /// Padding inserted automatically to block-align the Grid.
     GridPadding = 4,
     Grid = 5,
 }
@@ -49,13 +65,20 @@ const _: () = {
     assert!(Zone::ALL[5] as usize == 5);
 };
 
+/// Position and extent of a single zone.
 #[derive(Debug, Clone, Copy)]
 pub struct ZoneSpec {
+    /// Absolute byte offset from file start.
     pub base: u64,
+    /// Size in bytes (may be zero for empty zones).
     pub size: u64,
 }
 
 impl ZoneSpec {
+    /// Exclusive end offset (`base + size`).
+    ///
+    /// # Panics
+    /// On arithmetic overflow.
     #[inline]
     pub const fn end(self) -> u64 {
         match self.base.checked_add(self.size) {
@@ -64,11 +87,16 @@ impl ZoneSpec {
         }
     }
 
+    /// Returns `true` if `abs_offset` falls within `[base, end)`.
     #[inline]
     pub const fn contains(self, abs_offset: u64) -> bool {
         self.base <= abs_offset && abs_offset < self.end()
     }
 
+    /// Converts a zone-relative offset to an absolute file offset.
+    ///
+    /// # Panics
+    /// If `relative > size` or on arithmetic overflow.
     #[inline]
     pub const fn offset(self, relative: u64) -> u64 {
         assert!(relative <= self.size);
@@ -79,14 +107,29 @@ impl ZoneSpec {
     }
 }
 
+/// Complete storage layout with computed zone positions.
+///
+/// Zones are laid out contiguously. [`GridPadding`](Zone::GridPadding) is
+/// computed automatically to ensure [`Grid`](Zone::Grid) starts at a
+/// block-aligned offset.
 #[derive(Debug, Clone)]
 pub struct Layout {
+    /// Minimum I/O alignment (typically 512 or 4096).
     pub sector_size: u64,
+    /// Grid block size; must be a multiple of `sector_size`.
     pub block_size: u64,
     zones: [ZoneSpec; Zone::COUNT],
 }
 
 impl Layout {
+    /// Constructs a layout from zone sizes.
+    ///
+    /// [`GridPadding`](Zone::GridPadding) size is computed automatically.
+    ///
+    /// # Panics
+    /// - `sector_size` or `block_size` is zero or not a power of two
+    /// - `block_size < sector_size`
+    /// - Zone sizes are not sector-aligned (or block-aligned for grid)
     pub fn new(
         sector_size: u64,
         block_size: u64,
@@ -181,6 +224,7 @@ impl Layout {
         layout
     }
 
+    /// Total file size (sum of all zone sizes).
     #[inline]
     pub fn total_size(&self) -> u64 {
         self.zones
@@ -189,26 +233,34 @@ impl Layout {
             .expect("total size overflow")
     }
 
+    /// Returns the [`ZoneSpec`] for a zone.
     #[inline]
     pub fn zone(&self, z: Zone) -> ZoneSpec {
         self.zones[z.index()]
     }
 
+    /// Absolute start offset of a zone.
     #[inline]
     pub fn start(&self, z: Zone) -> u64 {
         self.zone(z).base
     }
 
+    /// Size of a zone in bytes.
     #[inline]
     pub fn size(&self, z: Zone) -> u64 {
         self.zone(z).size
     }
 
+    /// Exclusive end offset of a zone.
     #[inline]
     pub fn end(&self, z: Zone) -> u64 {
         self.zone(z).end()
     }
 
+    /// Converts a zone-relative offset to absolute.
+    ///
+    /// # Panics
+    /// If `relative > zone.size`.
     #[inline]
     pub fn offset(&self, z: Zone, relative: u64) -> u64 {
         let spec = self.zone(z);
@@ -219,6 +271,7 @@ impl Layout {
             .expect("Layout::offset overflow")
     }
 
+    /// Finds which zone contains `abs_offset`, or `None` if out of bounds.
     pub fn zone_for_absolute(&self, abs_offset: u64) -> Option<Zone> {
         Zone::ALL
             .into_iter()
@@ -226,6 +279,11 @@ impl Layout {
     }
 }
 
+/// Rounds `value` up to the next multiple of `align`.
+///
+/// # Panics
+/// - `align` is zero or not a power of two
+/// - Result would overflow `u64`
 #[inline]
 pub const fn align_up(value: u64, align: u64) -> u64 {
     assert!(align > 0);
@@ -256,6 +314,13 @@ mod tests {
         assert_eq!(align_up(4, 4), 4);
         assert_eq!(align_up(5, 4), 8);
         assert_eq!(align_up(100, 64), 128);
+    }
+
+    #[test]
+    fn test_align_up_align_one() {
+        assert_eq!(align_up(0, 1), 0);
+        assert_eq!(align_up(1, 1), 1);
+        assert_eq!(align_up(12345, 1), 12345);
     }
 
     #[test]
@@ -423,6 +488,16 @@ mod tests {
         let _ = spec.offset(200);
     }
 
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_zonespec_offset_out_of_bounds() {
+        let spec = ZoneSpec {
+            base: 1000,
+            size: 10,
+        };
+        let _ = spec.offset(11);
+    }
+
     // ==================== align_up Edge Case Tests ====================
 
     #[test]
@@ -468,6 +543,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_layout_rejects_zero_block_size() {
+        Layout::new(4096, 0, 4096, 4096, 4096, 4096, 4096);
+    }
+
+    #[test]
     #[should_panic(expected = "block_size must be power of two")]
     fn test_layout_rejects_non_power_of_two_block_size() {
         Layout::new(4096, 5000, 4096, 4096, 4096, 4096, 4096);
@@ -501,6 +582,20 @@ mod tests {
     #[should_panic(expected = "not block-aligned")]
     fn test_layout_rejects_unaligned_grid() {
         Layout::new(512, 4096, 4096, 4096, 4096, 4096, 4097);
+    }
+
+    // ==================== Layout Overflow Tests ====================
+
+    #[test]
+    #[should_panic(expected = "ZoneSpec::end overflow")]
+    fn test_layout_new_panics_on_zone_end_overflow() {
+        let _ = Layout::new(1, 1, u64::MAX, 1, 0, 0, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "align_up overflow")]
+    fn test_layout_new_panics_on_align_up_overflow() {
+        let _ = Layout::new(1, 2, u64::MAX, 0, 0, 0, 0);
     }
 
     // ==================== Layout Invariant Tests ====================
@@ -642,14 +737,17 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn prop_layout_zones_are_contiguous(sector_size in sector_size_strategy()) {
-            let block_size = sector_size;
+        fn prop_layout_zones_are_contiguous(
+            sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
+        ) {
+            let block_size = sector_size << block_exp;
             let layout = Layout::new(
                 sector_size,
                 block_size,
-                sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
                 block_size * 16,
             );
@@ -662,14 +760,17 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_all_zones_sector_aligned(sector_size in sector_size_strategy()) {
-            let block_size = sector_size;
+        fn prop_layout_all_zones_sector_aligned(
+            sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
+        ) {
+            let block_size = sector_size << block_exp;
             let layout = Layout::new(
                 sector_size,
                 block_size,
-                sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
                 block_size * 16,
             );
@@ -680,31 +781,36 @@ mod proptests {
         }
 
         #[test]
-        fn prop_layout_grid_is_block_aligned(sector_size in sector_size_strategy()) {
-            let block_size = sector_size * 4;
-            if block_size <= 1024 * 1024 {
-                let layout = Layout::new(
-                    sector_size,
-                    block_size,
-                    sector_size * 3,
-                    sector_size * 5,
-                    sector_size * 7,
-                    sector_size * 2,
-                    block_size * 8,
-                );
-                prop_assert_eq!(layout.start(Zone::Grid) % layout.block_size, 0);
-            }
-        }
-
-        #[test]
-        fn prop_layout_total_size_equals_sum(sector_size in sector_size_strategy()) {
-            let block_size = sector_size;
+        fn prop_layout_grid_is_block_aligned(
+            sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
+        ) {
+            let block_size = sector_size << block_exp;
             let layout = Layout::new(
                 sector_size,
                 block_size,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
+                block_size * 8,
+            );
+            prop_assert_eq!(layout.start(Zone::Grid) % layout.block_size, 0);
+            prop_assert!(layout.size(Zone::GridPadding) < layout.block_size);
+        }
+
+        #[test]
+        fn prop_layout_total_size_equals_sum(
+            sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
+        ) {
+            let block_size = sector_size << block_exp;
+            let layout = Layout::new(
+                sector_size,
+                block_size,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
                 block_size * 16,
             );
@@ -714,14 +820,17 @@ mod proptests {
         }
 
         #[test]
-        fn prop_zone_for_absolute_roundtrip(sector_size in sector_size_strategy()) {
-            let block_size = sector_size;
+        fn prop_zone_for_absolute_roundtrip(
+            sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
+        ) {
+            let block_size = sector_size << block_exp;
             let layout = Layout::new(
                 sector_size,
                 block_size,
-                sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
                 block_size * 16,
             );
@@ -739,15 +848,16 @@ mod proptests {
         #[test]
         fn prop_layout_offset_stays_within_zone(
             sector_size in sector_size_strategy(),
+            block_exp in 0u32..5u32,
             zone_idx in 0usize..Zone::COUNT,
         ) {
-            let block_size = sector_size;
+            let block_size = sector_size << block_exp;
             let layout = Layout::new(
                 sector_size,
                 block_size,
-                sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
+                sector_size * 3,
+                sector_size * 5,
+                sector_size * 7,
                 sector_size * 2,
                 block_size * 16,
             );
@@ -758,6 +868,7 @@ mod proptests {
                 let relative = zone_spec.size / 2;
                 let abs_offset = layout.offset(zone, relative);
 
+                prop_assert_eq!(layout.zone_for_absolute(abs_offset), Some(zone));
                 prop_assert!(abs_offset >= zone_spec.base);
                 prop_assert!(abs_offset < zone_spec.end());
             }
