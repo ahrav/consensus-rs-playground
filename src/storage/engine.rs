@@ -191,37 +191,39 @@ pub enum NextTickQueue {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// I/O Operation Structs
+// I/O Control Blocks
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// `Read` and `Write` are self-contained cursors for asynchronous I/O. They
-// embed a [`ZoneSpec`] snapshot from the [`Layout`], enabling absolute offset
-// calculation without holding a reference to the global layout.
+// `Read` and `Write` are **I/O Control Blocks (IOCBs)**—each represents a slot
+// for an in-flight async operation. The embedded [`IoCompletion`] is bound to
+// a fixed memory address where the kernel/io_uring writes results.
 //
 // # Address Translation
 //
-// The storage file is divided into [`Zone`]s with fixed positions. These structs
-// translate logical (zone-relative) offsets to physical (absolute) file offsets:
+// IOCBs translate logical (zone-relative) offsets to physical (absolute) offsets:
 //
 // ```text
-// Logical:   Read/Write { zone: WalPrepares, offset: 100 }
-//                                              │
-//            ┌─────────────────────────────────┘
+// Logical:   Read { zone: WalPrepares, offset: 100 }
+//                                        │
+//            ┌───────────────────────────┘
 //            ▼
 // Physical:  zone_spec.base + offset = 8192 + 100 = 8292
 // ```
 //
-// The embedded `zone_spec` is copied from [`Layout`] at creation time,
-// making operations stateless relative to global layout—submission/execution
-// doesn't require holding a reference to the global layout.
+// The embedded `zone_spec` is copied from [`Layout`], making IOCBs self-contained.
+// Once prepared, an IOCB doesn't need to access the global Layout.
 //
-// # Layout
+// The storage engine only sees `absolute_offset()`—no knowledge of Zones. The
+// `zone` field exists for **completion context**: callbacks inspect it to
+// determine how to process results.
 //
-// `#[repr(C)]` ensures predictable field ordering for cache efficiency and
-// potential FFI with the kernel I/O subsystem.
+// # Memory Layout
+//
+// `#[repr(C)]` ensures predictable field ordering. The `io` field is first so
+// the IOCB address equals the completion address.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A pending read operation. See module comment above for address translation.
+/// I/O Control Block for a pending read. See module comment for lifecycle.
 #[repr(C)]
 pub struct Read {
     /// I/O completion state (result, status flags).
@@ -288,7 +290,7 @@ impl Default for Read {
     }
 }
 
-/// A pending write operation. See module comment above for address translation.
+/// I/O Control Block for a pending write. See module comment for lifecycle.
 #[repr(C)]
 pub struct Write {
     /// I/O completion state (result, status flags).
