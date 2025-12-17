@@ -7,6 +7,8 @@
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use std::fs::{File, OpenOptions};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
