@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
+use std::thread::panicking;
 
 use libc;
 
@@ -681,6 +682,216 @@ impl Storage {
     /// Returns a reference to the underlying file.
     pub fn file(&self) -> &File {
         &self.file
+    }
+
+    /// Submits async read from `zone` at zone-relative `offset`.
+    ///
+    /// Translates to absolute file offset and validates sector alignment for O_DIRECT.
+    /// `read` must outlive the operation; `callback` invoked on completion.
+    ///
+    /// # Panics
+    ///
+    /// - `buffer.is_empty()` or `read.is_pending()`
+    /// - Buffer pointer, length, or offset not sector-aligned
+    /// - Read exceeds zone boundary
+    pub fn read_sectors(
+        &mut self,
+        callback: fn(&mut Read),
+        read: &mut Read,
+        buffer: &mut [u8],
+        zone: Zone,
+        offset: u64,
+    ) {
+        self.assert_invariants();
+        assert!(!buffer.is_empty());
+        assert!(!read.is_pending());
+
+        self.assert_buffer_aligned(buffer.as_ptr() as usize, buffer.len(), offset);
+
+        let zone_spec = self.layout.zone(zone);
+        assert!(zone_spec.size > 0);
+        assert!(offset < zone_spec.size);
+        assert!(buffer.len() as u64 <= zone_spec.size - offset);
+
+        let abs = zone_spec.base.checked_add(offset).expect("offset overflow");
+        assert!(abs >= zone_spec.base);
+        assert!(abs < zone_spec.base + zone_spec.size);
+
+        read.callback = Some(callback);
+        read.expected_len = buffer.len();
+        read.zone = zone;
+        read.zone_spec = zone_spec;
+        read.offset = abs;
+
+        assert!(read.is_pending());
+        assert_eq!(read.expected_len, buffer.len());
+        assert_eq!(read.absolute_offset(), abs);
+
+        let ctx = (read as *mut Read).cast::<c_void>();
+        let buf = NonNull::new(buffer.as_mut_ptr()).expect("buffer pointer is null");
+        self.io.submit(
+            &mut read.io,
+            Operation::Read {
+                fd: self.fd,
+                buf,
+                len: buffer.len() as u32,
+                offset: abs,
+            },
+            ctx,
+            read_complete_trampoline,
+        );
+    }
+
+    /// Submits async write to `zone` at zone-relative `offset`.
+    ///
+    /// Translates to absolute file offset and validates sector alignment for O_DIRECT.
+    /// `write` must outlive the operation; `callback` invoked on completion.
+    /// `buffer` is const but cast to `*mut u8` for io_uring API (kernel doesn't modify).
+    ///
+    /// # Panics
+    ///
+    /// - `buffer.is_empty()` or `write.is_pending()`
+    /// - Buffer pointer, length, or offset not sector-aligned
+    /// - Write exceeds zone boundary
+    pub fn write_sectors(
+        &mut self,
+        callback: fn(&mut Write),
+        write: &mut Write,
+        buffer: &[u8],
+        zone: Zone,
+        offset: u64,
+    ) {
+        self.assert_invariants();
+        assert!(!buffer.is_empty());
+        assert!(!write.is_pending());
+
+        self.assert_buffer_aligned(buffer.as_ptr() as usize, buffer.len(), offset);
+
+        let zone_spec = self.layout.zone(zone);
+        assert!(zone_spec.size > 0);
+        assert!(offset < zone_spec.size);
+        assert!(buffer.len() as u64 <= zone_spec.size - offset);
+
+        let abs = zone_spec.base.checked_add(offset).expect("offset overflow");
+        assert!(abs >= zone_spec.base);
+        assert!(abs < zone_spec.base + zone_spec.size);
+
+        write.callback = Some(callback);
+        write.expected_len = buffer.len();
+        write.zone = zone;
+        write.zone_spec = zone_spec;
+        write.offset = abs;
+
+        assert!(write.is_pending());
+        assert_eq!(write.expected_len, buffer.len());
+        assert_eq!(write.absolute_offset(), abs);
+
+        let ctx = (write as *mut Write).cast::<c_void>();
+        let buf = NonNull::new(buffer.as_ptr() as *mut u8).expect("buffer pointer is null");
+        self.io.submit(
+            &mut write.io,
+            Operation::Write {
+                fd: self.fd,
+                buf,
+                len: buffer.len() as u32,
+                offset: abs,
+            },
+            ctx,
+            write_complete_trampoline,
+        );
+    }
+
+    /// Flushes all writes to stable storage (durability barrier).
+    ///
+    /// Generic `ctx`/`cb` pattern allows caller-defined completion context.
+    pub fn fsync(
+        &mut self,
+        completion: &mut IoCompletion,
+        ctx: *mut c_void,
+        cb: unsafe fn(*mut c_void, &mut IoCompletion),
+    ) {
+        self.assert_invariants();
+        assert!(self.fd >= 0);
+
+        self.io
+            .submit(completion, Operation::Fsync { fd: self.fd }, ctx, cb);
+    }
+
+    /// Validates alignment for O_DIRECT: buffer pointer, length, and offset must
+    /// be sector-aligned. `isize::MAX` check prevents kernel pointer arithmetic overflow.
+    fn assert_buffer_aligned(&self, buf_ptr: usize, len: usize, offset: u64) {
+        assert!(len % self.sector_size() == 0);
+        assert!(offset % (self.sector_size() as u64) == 0);
+        assert!(buf_ptr % self.sector_size() == 0);
+
+        assert!(len > 0);
+        assert!(len <= isize::MAX as usize);
+    }
+}
+
+/// C callback trampoline: casts `ctx` to [`Read`], validates result, invokes typed callback.
+///
+/// Panics on I/O errors or short reads (fail-stop: storage corruption is unrecoverable).
+///
+/// # Safety
+///
+/// `ctx` must point to valid [`Read`] that outlives the operation.
+unsafe fn read_complete_trampoline(ctx: *mut c_void, completion: &mut IoCompletion) {
+    assert!(!ctx.is_null());
+
+    let read = unsafe { &mut *(ctx as *mut Read) };
+    if completion.result < 0 {
+        let errno = -completion.result;
+        panic!(
+            "storage read failed: errno={errno} (zone={:?}, offset={}, expected_len={})",
+            read.zone, read.offset, read.expected_len
+        );
+    }
+
+    let n = completion.result as usize;
+    if n != read.expected_len {
+        panic!(
+            "storage read failed: short read {n} != {} (zone={:?}, offset={}, expected_len={})",
+            read.expected_len, read.zone, read.offset, read.expected_len
+        );
+    }
+
+    if let Some(cb) = read.callback.take() {
+        assert!(!read.is_pending());
+        cb(read);
+    }
+}
+
+/// C callback trampoline: casts `ctx` to [`Write`], validates result, invokes typed callback.
+///
+/// Panics on I/O errors or short writes (fail-stop: storage corruption is unrecoverable).
+///
+/// # Safety
+///
+/// `ctx` must point to valid [`Write`] that outlives the operation.
+unsafe fn write_complete_trampoline(ctx: *mut c_void, completion: &mut IoCompletion) {
+    assert!(!ctx.is_null());
+
+    let write = unsafe { &mut *(ctx as *mut Write) };
+    if completion.result < 0 {
+        let errno = -completion.result;
+        panic!(
+            "storage write failed: errno={errno} (zone={:?}, offset={}, expected_len={})",
+            write.zone, write.offset, write.expected_len
+        );
+    }
+
+    let n = completion.result as usize;
+    if n != write.expected_len {
+        panic!(
+            "storage write failed: short write {n} != {} (zone={:?}, offset={}, expected_len={})",
+            write.expected_len, write.zone, write.offset, write.expected_len
+        );
+    }
+
+    if let Some(cb) = write.callback.take() {
+        assert!(!write.is_pending());
+        cb(write);
     }
 }
 
