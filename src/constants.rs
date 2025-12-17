@@ -1,15 +1,6 @@
-//! System constants (currently unused, retained for future use).
+//! Crate-wide protocol and storage constants.
 //!
-//! # Design Decisions
-//!
-//! Size constants use `u32` instead of `usize` for portability and to prevent
-//! truncation on 32-bit systems. Use [`as_usize`] or `_USIZE` variants for arrays.
-//!
-//! All invariants verified at compile time via `const` assertions.
-//!
-//! # Note
-//!
-//! VSR wire-format constants have been moved to [`crate::vsr::wire::constants`].
+//! Changing constants that affect wire framing or on-disk layout is a breaking change.
 
 // =============================================================================
 // Platform verification
@@ -22,22 +13,144 @@ const _: () = assert!(
 );
 
 // =============================================================================
-// Disk I/O constants
+// Disk / storage constants
 // =============================================================================
 
-/// Sector size for disk I/O alignment. Must be power of two for bitwise alignment.
-pub const SECTOR_SIZE: u32 = 4096;
+/// Sector size in bytes used for disk I/O alignment.
+pub const SECTOR_SIZE: usize = 4096;
+
+/// Default sector size for the storage engine when not explicitly configured.
+pub const SECTOR_SIZE_DEFAULT: usize = SECTOR_SIZE;
+
+/// Minimum supported sector size (legacy 512-byte sectors).
+pub const SECTOR_SIZE_MIN: usize = 512;
+
+/// Maximum supported sector size (64 KiB for large-block devices).
+pub const SECTOR_SIZE_MAX: usize = 65_536;
+
+/// Default number of concurrent I/O operations for the storage engine.
+pub const IO_ENTRIES_DEFAULT: u32 = 256;
+
+/// Bounds next-tick callback processing to prevent runaway loops.
+pub const MAX_NEXT_TICK_ITERATIONS: usize = 10_000;
+
+// =============================================================================
+// VSR wire constants
+// =============================================================================
+
+/// Fixed wire header size in bytes.
+pub const HEADER_SIZE: u32 = 256;
+
+/// Maximum wire message size in bytes (header + body).
+pub const MESSAGE_SIZE_MAX: u32 = 1 << 20; // 1 MiB
+
+/// Maximum message body size in bytes (`MESSAGE_SIZE_MAX - HEADER_SIZE`).
+pub const MESSAGE_BODY_SIZE_MAX: u32 = MESSAGE_SIZE_MAX - HEADER_SIZE;
+
+/// VSR protocol version. Increment for wire-incompatible changes.
+pub const VSR_VERSION: u16 = 1;
+
+/// Cluster identifier type used on the wire.
+pub type ClusterId = u128;
+
+// =============================================================================
+// VSR / superblock constants
+// =============================================================================
+
+/// Maximum number of replicas in a cluster.
+pub const REPLICAS_MAX: usize = 6;
+
+/// Maximum number of standbys in a cluster.
+pub const STANDBYS_MAX: usize = 6;
+
+/// Maximum total members in a cluster (`replicas + standbys`).
+pub const MEMBERS_MAX: usize = REPLICAS_MAX + STANDBYS_MAX;
+
+/// Number of superblock copies stored on disk.
+pub const SUPERBLOCK_COPIES: usize = 8;
+
+/// Maximum number of client ids tracked for reply deduplication.
+pub const CLIENTS_MAX: usize = 65_536;
+
+/// Max in-flight prepares in the pipeline.
+pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 32;
+
+/// View-change suffix capacity used to derive view header limits.
+pub const VIEW_CHANGE_HEADERS_SUFFIX_MAX: usize = PIPELINE_PREPARE_QUEUE_MAX + 1;
+
+/// Maximum number of view headers retained during view changes.
+pub const VIEW_HEADERS_MAX: usize = VIEW_CHANGE_HEADERS_SUFFIX_MAX + 2;
+
+/// Number of slots in the journal ring.
+pub const JOURNAL_SLOT_COUNT: usize = 8;
+
+/// Total journal size in bytes.
+pub const JOURNAL_SIZE: usize = JOURNAL_SLOT_COUNT * MESSAGE_SIZE_MAX_USIZE;
+
+/// On-disk size of a single client reply entry in bytes.
+pub const CLIENT_REPLY_SIZE: usize = 32;
+
+/// Total bytes reserved in the superblock for client replies.
+pub const CLIENT_REPLIES_SIZE: usize = CLIENTS_MAX * CLIENT_REPLY_SIZE;
+
+/// Upper bound for a configured storage size limit.
+pub const STORAGE_SIZE_LIMIT_MAX: u64 = 1 << 40; // 1 TiB
 
 // =============================================================================
 // Compile-time design integrity assertions
 // =============================================================================
 
-// Sector constraints
-const _: () = assert!(SECTOR_SIZE > 0);
-const _: () = assert!(
-    SECTOR_SIZE.is_power_of_two(),
-    "Sector size must be power of two for alignment arithmetic"
-);
+const _: () = {
+    // Storage sector constraints.
+    assert!(SECTOR_SIZE > 0);
+    assert!(SECTOR_SIZE.is_power_of_two());
+    assert!(SECTOR_SIZE_MIN.is_power_of_two());
+    assert!(SECTOR_SIZE_MAX.is_power_of_two());
+    assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT);
+    assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX);
+
+    // This crate currently assumes 64-bit addressing for storage sizing.
+    assert!(size_of::<usize>() >= 8);
+
+    assert!(IO_ENTRIES_DEFAULT > 0);
+    assert!(IO_ENTRIES_DEFAULT.is_power_of_two());
+
+    assert!(MAX_NEXT_TICK_ITERATIONS > 0);
+    assert!(MAX_NEXT_TICK_ITERATIONS <= 100_000);
+
+    // Wire header constraints.
+    assert!(HEADER_SIZE > 0);
+    assert!(HEADER_SIZE == 256);
+    assert!(HEADER_SIZE.is_multiple_of(16));
+
+    // Wire message size constraints.
+    assert!(MESSAGE_SIZE_MAX > 0);
+    assert!(MESSAGE_SIZE_MAX > HEADER_SIZE);
+    assert!(MESSAGE_SIZE_MAX.is_power_of_two());
+    assert!(MESSAGE_BODY_SIZE_MAX == MESSAGE_SIZE_MAX - HEADER_SIZE);
+    assert!(MESSAGE_BODY_SIZE_MAX > 0);
+
+    // Protocol version.
+    assert!(VSR_VERSION > 0);
+
+    // Superblock / cluster constraints.
+    assert!(REPLICAS_MAX > 0);
+    assert!(STANDBYS_MAX > 0);
+    assert!(MEMBERS_MAX == REPLICAS_MAX + STANDBYS_MAX);
+
+    assert!(SUPERBLOCK_COPIES >= 4);
+    assert!(SUPERBLOCK_COPIES <= 8);
+    assert!(SUPERBLOCK_COPIES.is_multiple_of(2));
+
+    assert!(CLIENTS_MAX > 0);
+    assert!(PIPELINE_PREPARE_QUEUE_MAX > 0);
+    assert!(VIEW_CHANGE_HEADERS_SUFFIX_MAX == PIPELINE_PREPARE_QUEUE_MAX + 1);
+    assert!(VIEW_HEADERS_MAX == VIEW_CHANGE_HEADERS_SUFFIX_MAX + 2);
+
+    assert!(JOURNAL_SLOT_COUNT > 0);
+    assert!(CLIENT_REPLY_SIZE > 0);
+    assert!(STORAGE_SIZE_LIMIT_MAX > 0);
+};
 
 // =============================================================================
 // Helper functions
@@ -57,12 +170,12 @@ const _: () = assert!(
 /// assert_eq!(sector_ceil(SECTOR_SIZE + 1), SECTOR_SIZE * 2);
 /// ```
 #[inline]
-pub const fn sector_ceil(n: u32) -> u32 {
+pub const fn sector_ceil(n: usize) -> usize {
     const _: () = assert!(SECTOR_SIZE.is_power_of_two());
 
     let mask = SECTOR_SIZE - 1;
 
-    assert!(n <= u32::MAX - mask, "sector_ceil overflow");
+    assert!(n <= usize::MAX - mask, "sector_ceil overflow");
 
     let result = (n + mask) & !mask;
     assert!(
@@ -73,12 +186,12 @@ pub const fn sector_ceil(n: u32) -> u32 {
     result
 }
 
-/// Convert protocol constant from `u32` to `usize` for array sizing.
+/// Convert a `u32` protocol length to `usize` for array sizing.
 ///
 /// # Examples
 /// ```
 /// # use consensus::constants::*;
-/// let buffer = [0u8; as_usize(SECTOR_SIZE)];
+/// let buffer = [0u8; as_usize(HEADER_SIZE)];
 /// ```
 #[inline(always)]
 pub const fn as_usize(n: u32) -> usize {
@@ -89,11 +202,19 @@ pub const fn as_usize(n: u32) -> usize {
 // Pre-converted usize constants
 // =============================================================================
 
-/// [`SECTOR_SIZE`] as `usize`.
-pub const SECTOR_SIZE_USIZE: usize = SECTOR_SIZE as usize;
+/// [`HEADER_SIZE`] as `usize`.
+pub const HEADER_SIZE_USIZE: usize = HEADER_SIZE as usize;
+
+/// [`MESSAGE_SIZE_MAX`] as `usize`.
+pub const MESSAGE_SIZE_MAX_USIZE: usize = MESSAGE_SIZE_MAX as usize;
+
+/// [`MESSAGE_BODY_SIZE_MAX`] as `usize`.
+pub const MESSAGE_BODY_SIZE_MAX_USIZE: usize = MESSAGE_BODY_SIZE_MAX as usize;
 
 // Verify usize conversions match source constants.
-const _: () = assert!(SECTOR_SIZE_USIZE == SECTOR_SIZE as usize);
+const _: () = assert!(HEADER_SIZE_USIZE == HEADER_SIZE as usize);
+const _: () = assert!(MESSAGE_SIZE_MAX_USIZE == MESSAGE_SIZE_MAX as usize);
+const _: () = assert!(MESSAGE_BODY_SIZE_MAX_USIZE == MESSAGE_BODY_SIZE_MAX as usize);
 
 // =============================================================================
 // Tests
@@ -123,12 +244,32 @@ mod tests {
     }
 
     #[test]
-    fn constants_are_powers_of_two() {
+    fn storage_constants_are_powers_of_two() {
         assert!(SECTOR_SIZE.is_power_of_two());
+        assert!(SECTOR_SIZE_MIN.is_power_of_two());
+        assert!(SECTOR_SIZE_MAX.is_power_of_two());
+        assert!(IO_ENTRIES_DEFAULT.is_power_of_two());
     }
 
     #[test]
-    fn usize_constants_match_originals() {
-        assert_eq!(SECTOR_SIZE_USIZE, SECTOR_SIZE as usize);
+    fn storage_constant_values() {
+        assert_eq!(SECTOR_SIZE, 4096);
+        assert_eq!(SECTOR_SIZE_MIN, 512);
+        assert_eq!(SECTOR_SIZE_DEFAULT, 4096);
+        assert_eq!(SECTOR_SIZE_MAX, 65_536);
+    }
+
+    #[test]
+    fn wire_constant_relationships_hold() {
+        assert_eq!(HEADER_SIZE + MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX);
+        assert!(HEADER_SIZE.is_multiple_of(16));
+        assert!(MESSAGE_SIZE_MAX.is_power_of_two());
+    }
+
+    #[test]
+    fn wire_usize_constants_match_originals() {
+        assert_eq!(HEADER_SIZE_USIZE, HEADER_SIZE as usize);
+        assert_eq!(MESSAGE_SIZE_MAX_USIZE, MESSAGE_SIZE_MAX as usize);
+        assert_eq!(MESSAGE_BODY_SIZE_MAX_USIZE, MESSAGE_BODY_SIZE_MAX as usize);
     }
 }
