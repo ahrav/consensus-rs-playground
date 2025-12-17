@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn decode_message_with_max_body_size() {
-        use super::constants::MESSAGE_BODY_SIZE_MAX;
+        use crate::vsr::wire::constants::MESSAGE_BODY_SIZE_MAX;
 
         let mut buf = MessageBuffer::new();
         let mut pool: MessagePool<4> = MessagePool::new();
