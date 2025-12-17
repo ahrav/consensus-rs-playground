@@ -1,4 +1,4 @@
-//! Deterministic AEGIS-128L MAC used as the wire-format checksum.
+//! Deterministic AEGIS-128L tag used as the wire-format checksum.
 //!
 //! Mirrors the Zig reference implementation: both key and nonce are zeroed so tags
 //! are reproducible across implementations. This detects corruption but is not a
@@ -19,7 +19,6 @@ pub type Checksum128 = u128;
 /// let tag = checksum::checksum(b"message");
 /// assert_eq!(tag, checksum::checksum(b"message"));
 /// ```
-#[cfg(target_os = "linux")]
 pub fn checksum(data: &[u8]) -> u128 {
     use aegis::aegis128l::Aegis128L;
 
@@ -31,15 +30,22 @@ pub fn checksum(data: &[u8]) -> u128 {
     u128::from_le_bytes(tag)
 }
 
-#[cfg(target_os = "macos")]
-pub fn checksum(data: &[u8]) -> u128 {
-    use aegis::aegis128l::Aegis128L;
+/// Computes the AEGISMAC-128L tag for `data`.
+///
+/// This uses the AEGIS-MAC construction from the `aegis` crate and produces
+/// different tags than [`checksum`]. It is only available on Linux because it
+/// requires the non-`pure-rust` `aegis` backend.
+#[cfg(target_os = "linux")]
+pub fn checksum_aegis_mac(data: &[u8]) -> u128 {
+    use aegis::aegis128l::Aegis128LMac;
 
-    let key = [0u8; 16];
-    let nonce = [0u8; 16];
-    let aegis = Aegis128L::new(&key, &nonce);
+    // Being explicit about the aliases avoids any type mismatch surprises.
+    let key: aegis::aegis128l::Key = [0u8; 16];
+    let nonce: aegis::aegis128l::Nonce = [0u8; 16];
 
-    let (_ciphertext, tag) = aegis.encrypt(&[], data);
+    let mut mac = Aegis128LMac::<16>::new_with_nonce(&key, &nonce);
+    mac.update(data);
+    let tag = mac.finalize();
     u128::from_le_bytes(tag)
 }
 
@@ -155,10 +161,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn test_linux_checksum_values() {
+    fn checksum_known_values() {
         assert_eq!(checksum(&[]), 0x49f174618255402de6e7e3c40d60cc83);
         assert_eq!(checksum(&[0u8; 16]), 0x263abed41c10336165d15dd08dd42af7);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn checksum_aegis_mac_known_values() {
+        assert_eq!(
+            super::checksum_aegis_mac(&[]),
+            0x635037dbb2b81e9bf114d2092a5aa1ad
+        );
+        assert_eq!(
+            super::checksum_aegis_mac(&[0u8; 16]),
+            0x9cb583709438f5be0c1866de93ad9818
+        );
     }
 
     // =========================================================================

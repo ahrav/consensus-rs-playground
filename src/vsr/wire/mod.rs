@@ -12,6 +12,8 @@ pub mod constants {
     };
 }
 
+#[cfg(target_os = "linux")]
+pub use checksum::checksum_aegis_mac;
 pub use checksum::{Checksum128, checksum};
 pub use command::{Command, InvalidCommand};
 pub use constants::{
