@@ -3,7 +3,6 @@
 //! Mirrors the Zig reference implementation: both key and nonce are zeroed so tags
 //! are reproducible across implementations. This detects corruption but is not a
 //! secret-key authenticator.
-use aegis::aegis128l::Aegis128L;
 
 pub type Checksum128 = u128;
 
@@ -20,8 +19,22 @@ pub type Checksum128 = u128;
 /// let tag = checksum::checksum(b"message");
 /// assert_eq!(tag, checksum::checksum(b"message"));
 /// ```
-#[inline]
+#[cfg(target_os = "linux")]
 pub fn checksum(data: &[u8]) -> u128 {
+    use aegis::aegis128l::Aegis128L;
+
+    let key = [0u8; 16];
+    let nonce = [0u8; 16];
+    let aegis = Aegis128L::new(&key, &nonce);
+
+    let (_ciphertext, tag) = aegis.encrypt(&[], data);
+    u128::from_le_bytes(tag)
+}
+
+#[cfg(target_os = "macos")]
+pub fn checksum(data: &[u8]) -> u128 {
+    use aegis::aegis128l::Aegis128L;
+
     let key = [0u8; 16];
     let nonce = [0u8; 16];
     let aegis = Aegis128L::new(&key, &nonce);
@@ -139,6 +152,13 @@ mod tests {
         // VSR messages might be several KB
         let data = vec![0x5A; 64 * 1024]; // 64KB
         let _ = checksum(&data); // Should not panic
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_linux_checksum_values() {
+        assert_eq!(checksum(&[]), 0x49f174618255402de6e7e3c40d60cc83);
+        assert_eq!(checksum(&[0u8; 16]), 0x263abed41c10336165d15dd08dd42af7);
     }
 
     // =========================================================================

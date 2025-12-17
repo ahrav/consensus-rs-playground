@@ -1,8 +1,14 @@
 pub mod buffer;
-pub mod constants;
 pub mod engine;
 pub mod iocb;
 pub mod layout;
+
+pub mod constants {
+    pub use crate::constants::{
+        IO_ENTRIES_DEFAULT, MAX_NEXT_TICK_ITERATIONS, SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX,
+        SECTOR_SIZE_MIN,
+    };
+}
 
 // Re-exports for convenient access
 pub use buffer::AlignedBuf;
