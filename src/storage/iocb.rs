@@ -1,8 +1,8 @@
 //! I/O Control Blocks (IOCBs) and deferred callback structures.
 
+use super::layout::{Zone, ZoneSpec};
 use crate::io::Completion as IoCompletion;
 use crate::stdx::queue::{QueueLink, QueueNode};
-use super::layout::{Zone, ZoneSpec};
 
 /// Controls whether I/O operations complete synchronously or asynchronously.
 ///

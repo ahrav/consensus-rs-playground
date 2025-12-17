@@ -279,8 +279,8 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
-    use proptest::prelude::*;
     use crate::storage::constants::SECTOR_SIZE_MIN;
+    use proptest::prelude::*;
 
     fn align_strategy() -> impl Strategy<Value = usize> {
         prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192, 16384, 32768, 65536])

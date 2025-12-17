@@ -510,10 +510,10 @@ unsafe fn write_complete_trampoline(ctx: *mut c_void, completion: &mut IoComplet
 mod integration_tests {
     use super::*;
     use crate::io::Completion;
-    use std::cell::{Cell, RefCell};
     use crate::storage::buffer::AlignedBuf;
-    use tempfile::tempdir;
+    use std::cell::{Cell, RefCell};
     use std::io::{Read as IoRead, Seek, Write as IoWrite};
+    use tempfile::tempdir;
 
     fn default_layout() -> Layout {
         Layout::new(512, 4096, 4096, 4096, 4096, 4096, 4096)

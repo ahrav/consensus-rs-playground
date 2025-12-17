@@ -7,7 +7,7 @@ pub mod layout;
 // Re-exports for convenient access
 pub use buffer::AlignedBuf;
 pub use constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN};
-pub use engine::{Storage, Options};
+pub use engine::{Options, Storage};
 pub use iocb::{NextTickQueue, Read, Synchronicity, Write};
 pub use layout::{Layout, Zone, ZoneSpec};
 
