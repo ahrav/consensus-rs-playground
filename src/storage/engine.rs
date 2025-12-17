@@ -721,7 +721,7 @@ impl Storage {
         read.expected_len = buffer.len();
         read.zone = zone;
         read.zone_spec = zone_spec;
-        read.offset = abs;
+        read.offset = offset;
 
         assert!(read.is_pending());
         assert_eq!(read.expected_len, buffer.len());
@@ -780,7 +780,7 @@ impl Storage {
         write.expected_len = buffer.len();
         write.zone = zone;
         write.zone_spec = zone_spec;
-        write.offset = abs;
+        write.offset = offset;
 
         assert!(write.is_pending());
         assert_eq!(write.expected_len, buffer.len());
@@ -820,9 +820,9 @@ impl Storage {
     /// Validates alignment for O_DIRECT: buffer pointer, length, and offset must
     /// be sector-aligned. `isize::MAX` check prevents kernel pointer arithmetic overflow.
     fn assert_buffer_aligned(&self, buf_ptr: usize, len: usize, offset: u64) {
-        assert!(len % self.sector_size() == 0);
-        assert!(offset % (self.sector_size() as u64) == 0);
-        assert!(buf_ptr % self.sector_size() == 0);
+        assert!(len.is_multiple_of(self.sector_size()));
+        assert!(offset.is_multiple_of(self.sector_size() as u64));
+        assert!(buf_ptr.is_multiple_of(self.sector_size()));
 
         assert!(len > 0);
         assert!(len <= isize::MAX as usize);
@@ -2044,5 +2044,722 @@ mod integration_tests {
 
         IO_DONE.with(|b| b.set(false));
         NEXT_TICK_DONE.with(|b| b.set(false));
+    }
+
+    #[test]
+    fn read_sectors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_sectors");
+        let layout = default_layout();
+
+        // Setup file content
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+                .unwrap();
+            f.write_all(&[0xBB; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.read_sectors(cb, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert_eq!(buf.as_slice()[0], 0xBB);
+        assert!(!read.is_pending());
+    }
+
+    #[test]
+    fn write_sectors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_sectors");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xCC);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(cb, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(!write.is_pending());
+
+        // Verify content
+        let mut f = File::open(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+            .unwrap();
+        let mut check = [0u8; 512];
+        f.read_exact(&mut check).unwrap();
+        assert!(check.iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_buffer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_unaligned");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+
+        // Unaligned slice (offset by 1)
+        let mut raw = vec![0u8; 512 + 1];
+        let slice = &mut raw[1..];
+
+        storage.read_sectors(|_| {}, &mut read, slice, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_buffer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_unaligned");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+
+        let raw = vec![0u8; 512 + 1];
+        let slice = &raw[1..];
+
+        storage.write_sectors(|_| {}, &mut write, slice, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_len() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_len");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(1024, 512); // aligned
+
+        // Valid ptr, invalid len
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            &mut buf.as_mut_slice()[..511],
+            Zone::WalPrepares,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_offset");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Invalid offset
+        storage.read_sectors(|_| {}, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_out_of_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_oob");
+        let layout = default_layout(); // WalPrepares is 4096 bytes
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Offset 4096 is exactly at end, but len 512 pushes it over
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            4096,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_len_overflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_len_overflow");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        // 1024 bytes buffer
+        let mut buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Offset 3584 (4096 - 512). Reading 1024 bytes goes past end (4096 + 512).
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            3584,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_out_of_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_oob");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(512, 512);
+
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_empty_buffer_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_empty");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let empty: &mut [u8] = &mut [];
+
+        storage.read_sectors(|_| {}, &mut read, empty, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_empty_buffer_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_empty");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let empty: &[u8] = &[];
+
+        storage.write_sectors(|_| {}, &mut write, empty, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_pending_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_pending");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        // Force pending state
+        read.callback = Some(|_: &mut Read| {});
+        assert!(read.is_pending());
+
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        storage.read_sectors(|_| {}, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_pending_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_pending");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        // Force pending state
+        write.callback = Some(|_: &mut Write| {});
+        assert!(write.is_pending());
+
+        let buf = AlignedBuf::new_zeroed(512, 512);
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_len() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_len");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Valid ptr, invalid len (511 not multiple of 512)
+        storage.write_sectors(
+            |_| {},
+            &mut write,
+            &buf.as_slice()[..511],
+            Zone::WalPrepares,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_offset");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Invalid offset (1 not multiple of 512)
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_len_overflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_len_overflow");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        // 1024 bytes buffer
+        let buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Offset 3584 (4096 - 512). Writing 1024 bytes goes past end.
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 3584);
+    }
+
+    #[test]
+    fn read_write_roundtrip_data_integrity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_roundtrip");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Write known pattern
+        let mut write = Write::new();
+        let mut write_buf = AlignedBuf::new_zeroed(512, 512);
+        for (i, b) in write_buf.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        thread_local! {
+            static WRITE_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn write_cb(_: &mut Write) {
+            WRITE_DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(
+            write_cb,
+            &mut write,
+            write_buf.as_slice(),
+            Zone::WalPrepares,
+            512,
+        );
+        storage.tick();
+        WRITE_DONE.with(|b| assert!(b.get()));
+
+        // Read it back
+        let mut read = Read::new();
+        let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static READ_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn read_cb(_: &mut Read) {
+            READ_DONE.with(|b| b.set(true));
+        }
+
+        storage.read_sectors(
+            read_cb,
+            &mut read,
+            read_buf.as_mut_slice(),
+            Zone::WalPrepares,
+            512,
+        );
+        storage.tick();
+        READ_DONE.with(|b| assert!(b.get()));
+
+        // Verify data integrity
+        for (i, &b) in read_buf.as_slice().iter().enumerate() {
+            assert_eq!(b, (i % 256) as u8, "data mismatch at byte {i}");
+        }
+    }
+
+    #[test]
+    fn read_sectors_exact_zone_fill() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_exact_fill");
+        let layout = default_layout();
+
+        // Pre-fill the zone
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+                .unwrap();
+            let zone_size = layout.zone(Zone::WalPrepares).size as usize;
+            f.write_all(&vec![0xEE; zone_size]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let zone_size = layout.zone(Zone::WalPrepares).size as usize;
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(zone_size, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Read exactly zone.size bytes starting at offset 0
+        storage.read_sectors(cb, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(buf.as_slice().iter().all(|&b| b == 0xEE));
+    }
+
+    #[test]
+    fn read_sectors_last_sector() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_last_sector");
+        let layout = default_layout();
+        let zone_size = layout.zone(Zone::WalPrepares).size;
+        let last_sector_offset = zone_size - 512;
+
+        // Pre-fill last sector
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            let abs_offset = layout.start(Zone::WalPrepares) + last_sector_offset;
+            f.seek(std::io::SeekFrom::Start(abs_offset)).unwrap();
+            f.write_all(&[0xFF; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Read last sector of zone
+        storage.read_sectors(
+            cb,
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            last_sector_offset,
+        );
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn write_sectors_last_sector() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_last");
+        let layout = default_layout();
+        let zone_size = layout.zone(Zone::WalPrepares).size;
+        let last_sector_offset = zone_size - 512;
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xAA);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Write last sector of zone
+        storage.write_sectors(
+            cb,
+            &mut write,
+            buf.as_slice(),
+            Zone::WalPrepares,
+            last_sector_offset,
+        );
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+
+        // Verify
+        let mut f = File::open(&path).unwrap();
+        let abs_offset = layout.start(Zone::WalPrepares) + last_sector_offset;
+        f.seek(std::io::SeekFrom::Start(abs_offset)).unwrap();
+        let mut check = [0u8; 512];
+        f.read_exact(&mut check).unwrap();
+        assert!(check.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn read_write_multiple_zones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_multi_zone");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Test zones with non-zero size
+        let test_zones = [
+            Zone::SuperBlock,
+            Zone::WalHeaders,
+            Zone::WalPrepares,
+            Zone::ClientReplies,
+            Zone::Grid,
+        ];
+
+        for (idx, &zone) in test_zones.iter().enumerate() {
+            let zone_spec = layout.zone(zone);
+            if zone_spec.size == 0 {
+                continue;
+            }
+
+            // Write unique pattern per zone
+            let pattern = ((idx + 1) * 0x11) as u8;
+            let mut write = Write::new();
+            let mut buf = AlignedBuf::new_zeroed(512, 512);
+            buf.as_mut_slice().fill(pattern);
+
+            thread_local! {
+                static DONE: Cell<bool> = const { Cell::new(false) };
+            }
+            fn cb_w(_: &mut Write) {
+                DONE.with(|b| b.set(true));
+            }
+
+            DONE.with(|b| b.set(false));
+            storage.write_sectors(cb_w, &mut write, buf.as_slice(), zone, 0);
+            storage.tick();
+            DONE.with(|b| assert!(b.get(), "write failed for zone {:?}", zone));
+
+            // Read back and verify
+            let mut read = Read::new();
+            let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+            fn cb_r(_: &mut Read) {
+                DONE.with(|b| b.set(true));
+            }
+
+            DONE.with(|b| b.set(false));
+            storage.read_sectors(cb_r, &mut read, read_buf.as_mut_slice(), zone, 0);
+            storage.tick();
+            DONE.with(|b| assert!(b.get(), "read failed for zone {:?}", zone));
+
+            assert!(
+                read_buf.as_slice().iter().all(|&b| b == pattern),
+                "data mismatch for zone {:?}",
+                zone
+            );
+        }
+    }
+
+    #[test]
+    fn zone_isolation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_isolation");
+        let layout = default_layout();
+
+        // Pre-fill WalHeaders with 0xAA
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalHeaders)))
+                .unwrap();
+            f.write_all(&[0xAA; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Write 0xBB to WalPrepares
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xBB);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb_w(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(cb_w, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+        DONE.with(|b| assert!(b.get()));
+
+        // Verify WalHeaders is still 0xAA (not corrupted by WalPrepares write)
+        let mut read = Read::new();
+        let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+        fn cb_r(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        DONE.with(|b| b.set(false));
+        storage.read_sectors(
+            cb_r,
+            &mut read,
+            read_buf.as_mut_slice(),
+            Zone::WalHeaders,
+            0,
+        );
+        storage.tick();
+        DONE.with(|b| assert!(b.get()));
+
+        assert!(
+            read_buf.as_slice().iter().all(|&b| b == 0xAA),
+            "WalHeaders was corrupted by WalPrepares write"
+        );
     }
 }
