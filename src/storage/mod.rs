@@ -1,11 +1,14 @@
+pub mod buffer;
+pub mod constants;
 pub mod engine;
+pub mod iocb;
 pub mod layout;
 
 // Re-exports for convenient access
-pub use engine::{
-    AlignedBuf, NextTickQueue, Read, SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN,
-    Synchronicity, Write,
-};
+pub use buffer::AlignedBuf;
+pub use constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN};
+pub use engine::{Options, Storage};
+pub use iocb::{NextTickQueue, Read, Synchronicity, Write};
 pub use layout::{Layout, Zone, ZoneSpec};
 
 #[macro_export]

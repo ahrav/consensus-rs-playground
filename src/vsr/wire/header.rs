@@ -24,8 +24,8 @@
 //! Bytes 128-255: reserved_command
 //! ```
 
+use super::constants::{ClusterId, HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, VSR_VERSION};
 use super::{Checksum128, Command, checksum};
-use crate::constants::{ClusterId, HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, VSR_VERSION};
 use crate::util::zero::is_all_zeros;
 
 /// Byte offset where checksummed content begins (after the checksum field itself).
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn checksum_body_with_various_sizes() {
-        use crate::constants::MESSAGE_BODY_SIZE_MAX;
+        use crate::vsr::wire::constants::MESSAGE_BODY_SIZE_MAX;
 
         let body_sizes = [1, 100, 1024, 4096, MESSAGE_BODY_SIZE_MAX as usize];
 

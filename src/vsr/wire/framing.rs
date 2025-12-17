@@ -26,8 +26,8 @@
 //! *   **Pool Integrity:** The `MessagePool` contains only valid messages. Reading directly into the pool (Zero-Copy) would leave "dirty" objects on validation failure, complicating cleanup.
 //! *   **Resource Safety:** Invalid packets are rejected without allocating pool resources.
 
+use super::constants::{HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE};
 use super::{Header, MessageHandle, MessagePool};
-use crate::constants::{HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE};
 
 // Compile-time design integrity
 const _: () = assert!(HEADER_SIZE > 0);
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn decode_message_with_max_body_size() {
-        use crate::constants::MESSAGE_BODY_SIZE_MAX;
+        use crate::vsr::wire::constants::MESSAGE_BODY_SIZE_MAX;
 
         let mut buf = MessageBuffer::new();
         let mut pool: MessagePool<4> = MessagePool::new();

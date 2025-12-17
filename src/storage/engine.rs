@@ -4,12 +4,10 @@
 //! alignment requirements, enabling O_DIRECT reads/writes without kernel
 //! buffering.
 
-#![allow(dead_code, unused_imports)]
-
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use std::alloc;
 use std::fs::{File, OpenOptions};
+#[cfg(target_os = "linux")]
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
@@ -17,400 +15,14 @@ use std::path::Path;
 use libc;
 
 use crate::io::{Completion as IoCompletion, Io, Operation};
-use crate::stdx::queue::{Queue, QueueLink, QueueNode};
+use crate::stdx::queue::Queue;
 
-pub use super::layout::{Layout, Zone, ZoneSpec};
-
-/// Default sector size for most modern storage devices.
-pub const SECTOR_SIZE_DEFAULT: usize = 4096;
-
-/// Minimum sector size (legacy 512-byte sectors).
-pub const SECTOR_SIZE_MIN: usize = 512;
-
-/// Maximum supported sector size (64 KiB for large-block devices).
-pub const SECTOR_SIZE_MAX: usize = 65536;
-
-/// Default number of concurrent I/O operations for the storage engine.
-/// Must be a power of two. Provides good concurrency for async I/O without excessive memory overhead.
-const IO_ENTRIES_DEFAULT: u32 = 256;
-
-/// Bounds next-tick callback processing to prevent runaway loops.
-const MAX_NEXT_TICK_ITERATIONS: usize = 10_000;
-
-const _: () = {
-    assert!(SECTOR_SIZE_DEFAULT.is_power_of_two());
-    assert!(SECTOR_SIZE_MIN.is_power_of_two());
-    assert!(SECTOR_SIZE_MAX.is_power_of_two());
-    assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT);
-    assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX);
-
-    assert!(std::mem::size_of::<usize>() >= 8);
-
-    assert!(IO_ENTRIES_DEFAULT > 0);
-    assert!(IO_ENTRIES_DEFAULT.is_power_of_two());
-
-    assert!(MAX_NEXT_TICK_ITERATIONS > 0);
-    assert!(MAX_NEXT_TICK_ITERATIONS <= 100_000);
+use super::constants::{
+    IO_ENTRIES_DEFAULT, MAX_NEXT_TICK_ITERATIONS, SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX,
+    SECTOR_SIZE_MIN,
 };
-
-/// Heap-allocated buffer with guaranteed alignment for direct I/O.
-///
-/// Direct I/O (O_DIRECT) requires buffers aligned to the storage device's
-/// sector size. Standard allocators don't guarantee this, so `AlignedBuf`
-/// uses [`std::alloc`] directly to enforce alignment.
-///
-/// # Invariants
-///
-/// - `len > 0` (empty buffers disallowed)
-/// - `align` is a power of two and ≤ [`SECTOR_SIZE_MAX`]
-/// - `ptr` is aligned to `align`
-///
-/// # Example
-///
-/// ```ignore
-/// let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-/// assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_DEFAULT, 0);
-/// ```
-pub struct AlignedBuf {
-    ptr: NonNull<u8>,
-    len: usize,
-    align: usize,
-}
-
-impl AlignedBuf {
-    /// Allocates a zero-initialized buffer with the specified alignment.
-    ///
-    /// # Panics
-    ///
-    /// - `len == 0`
-    /// - `align == 0` or not a power of two
-    /// - `align > SECTOR_SIZE_MAX`
-    /// - `len > isize::MAX` (Rust allocation limit)
-    /// - Allocation failure
-    pub fn new_zeroed(len: usize, align: usize) -> Self {
-        assert!(len > 0);
-        assert!(align > 0);
-        assert!(align.is_power_of_two());
-        assert!(align <= SECTOR_SIZE_MAX);
-        assert!(len <= isize::MAX as usize);
-
-        let layout = alloc::Layout::from_size_align(len, align).expect("bad layout");
-
-        // SAFETY: Layout is valid (non-zero size, power-of-two alignment).
-        let raw = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(raw).expect("alloc failed");
-
-        let result = Self { ptr, len, align };
-        result.assert_invariants();
-
-        result
-    }
-
-    /// Validates structural invariants. Called on all public operations.
-    #[inline]
-    fn assert_invariants(&self) {
-        assert!(self.len > 0);
-        assert!(self.align > 0);
-        assert!(self.align.is_power_of_two());
-        assert!((self.ptr.as_ptr() as usize).is_multiple_of(self.align));
-    }
-
-    /// Returns the buffer as a mutable byte slice.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.assert_invariants();
-        // SAFETY: We own the allocation exclusively, it's valid for `len` bytes.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-    }
-
-    /// Returns the buffer as an immutable byte slice.
-    pub fn as_slice(&self) -> &[u8] {
-        self.assert_invariants();
-        // SAFETY: Valid allocation of `len` bytes.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
-    }
-
-    /// Returns a raw pointer to the buffer start.
-    pub fn as_ptr(&self) -> *const u8 {
-        self.assert_invariants();
-        self.ptr.as_ptr()
-    }
-
-    /// Returns a mutable raw pointer to the buffer start.
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.assert_invariants();
-        self.ptr.as_ptr()
-    }
-
-    /// Returns the buffer length in bytes.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Always returns `false` (empty buffers are disallowed by construction).
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Returns the alignment in bytes.
-    pub fn align(&self) -> usize {
-        self.align
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        self.assert_invariants();
-
-        let layout =
-            alloc::Layout::from_size_align(self.len, self.align).expect("bad layout in drop");
-        assert!(layout.size() == self.len);
-        assert!(layout.align() == self.align);
-
-        // SAFETY: `ptr` was allocated with this exact layout in `new_zeroed`.
-        unsafe { alloc::dealloc(self.ptr.as_ptr(), layout) }
-    }
-}
-
-// SAFETY: The buffer owns its allocation exclusively. No shared mutable state.
-unsafe impl Send for AlignedBuf {}
-
-/// Controls whether I/O operations complete synchronously or asynchronously.
-///
-/// Used to configure storage behavior for testing (synchronous) vs production
-/// (asynchronous with io_uring/epoll).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Synchronicity {
-    /// Operations block until completion. Useful for deterministic testing.
-    AlwaysSynchronous,
-    /// Operations return immediately; completion notified via callback.
-    AlwaysAsynchronous,
-}
-
-/// Identifies which subsystem a deferred callback belongs to.
-///
-/// Callbacks are partitioned to allow priority-based processing: VSR protocol
-/// operations typically take precedence over LSM tree maintenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NextTickQueue {
-    /// Viewstamped Replication protocol callbacks (high priority).
-    Vsr,
-    /// Log-Structured Merge tree callbacks (background maintenance).
-    Lsm,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// I/O Control Blocks
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// `Read` and `Write` are **I/O Control Blocks (IOCBs)**—each represents a slot
-// for an in-flight async operation. The embedded [`IoCompletion`] is bound to
-// a fixed memory address where the kernel/io_uring writes results.
-//
-// # Address Translation
-//
-// IOCBs translate logical (zone-relative) offsets to physical (absolute) offsets:
-//
-// ```text
-// Logical:   Read { zone: WalPrepares, offset: 100 }
-//                                        │
-//            ┌───────────────────────────┘
-//            ▼
-// Physical:  zone_spec.base + offset = 8192 + 100 = 8292
-// ```
-//
-// The embedded `zone_spec` is copied from [`Layout`], making IOCBs self-contained.
-// Once prepared, an IOCB doesn't need to access the global Layout.
-//
-// The storage engine only sees `absolute_offset()`—no knowledge of Zones. The
-// `zone` field exists for **completion context**: callbacks inspect it to
-// determine how to process results.
-//
-// # Memory Layout
-//
-// `#[repr(C)]` ensures predictable field ordering. The `io` field is first so
-// the IOCB address equals the completion address.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// I/O Control Block for a pending read. See module comment for lifecycle.
-#[repr(C)]
-pub struct Read {
-    /// I/O completion state (result, status flags).
-    pub io: IoCompletion,
-    /// Invoked when I/O completes; `None` if not pending.
-    callback: Option<fn(&mut Read)>,
-    /// Expected bytes for validation (short reads are errors in direct I/O).
-    expected_len: usize,
-
-    /// Which zone this read targets.
-    pub zone: Zone,
-    /// Snapshot of zone position/size from [`Layout`] at submission time.
-    pub zone_spec: ZoneSpec,
-    /// Logical offset within the zone (0 = zone start).
-    pub offset: u64,
-}
-
-impl Read {
-    /// Creates a zeroed `Read` targeting the SuperBlock at offset 0.
-    ///
-    /// Call site must populate `zone`, `zone_spec`, and `offset` before use.
-    pub const fn new() -> Self {
-        Self {
-            io: IoCompletion::new(),
-            callback: None,
-            expected_len: 0,
-            zone: Zone::SuperBlock,
-            zone_spec: ZoneSpec { base: 0, size: 0 },
-            offset: 0,
-        }
-    }
-
-    /// Returns `true` if this read is awaiting I/O completion.
-    #[inline]
-    pub fn is_pending(&self) -> bool {
-        self.callback.is_some()
-    }
-
-    /// Expected read length; short reads indicate I/O errors with O_DIRECT.
-    #[inline]
-    pub fn expected_len(&self) -> usize {
-        self.expected_len
-    }
-
-    /// Computes the absolute file offset from zone-relative addressing.
-    ///
-    /// # Panics
-    ///
-    /// - `offset > zone_spec.size` (would read past zone boundary)
-    #[inline]
-    pub fn absolute_offset(&self) -> u64 {
-        assert!(self.offset <= self.zone_spec.size);
-
-        let abs = self.zone_spec.offset(self.offset);
-        assert!(abs >= self.zone_spec.base);
-
-        abs
-    }
-}
-
-impl Default for Read {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// I/O Control Block for a pending write. See module comment for lifecycle.
-#[repr(C)]
-pub struct Write {
-    /// I/O completion state (result, status flags).
-    pub io: IoCompletion,
-    /// Invoked when I/O completes; `None` if not pending.
-    callback: Option<fn(&mut Write)>,
-    /// Expected bytes for validation (short writes are errors in direct I/O).
-    expected_len: usize,
-
-    /// Which zone this write targets.
-    pub zone: Zone,
-    /// Snapshot of zone position/size from [`Layout`] at submission time.
-    pub zone_spec: ZoneSpec,
-    /// Logical offset within the zone (0 = zone start).
-    pub offset: u64,
-}
-
-impl Write {
-    /// Creates a zeroed `Write` targeting the SuperBlock at offset 0.
-    ///
-    /// Call site must populate `zone`, `zone_spec`, and `offset` before use.
-    pub const fn new() -> Self {
-        Self {
-            io: IoCompletion::new(),
-            callback: None,
-            expected_len: 0,
-            zone: Zone::SuperBlock,
-            zone_spec: ZoneSpec { base: 0, size: 0 },
-            offset: 0,
-        }
-    }
-
-    /// Returns `true` if this write is awaiting I/O completion.
-    #[inline]
-    pub fn is_pending(&self) -> bool {
-        self.callback.is_some()
-    }
-
-    /// Expected write length; short writes indicate I/O errors with O_DIRECT.
-    #[inline]
-    pub fn expected_len(&self) -> usize {
-        self.expected_len
-    }
-
-    /// Computes the absolute file offset from zone-relative addressing.
-    ///
-    /// # Panics
-    ///
-    /// - `offset > zone_spec.size` (would write past zone boundary)
-    #[inline]
-    pub fn absolute_offset(&self) -> u64 {
-        assert!(self.offset <= self.zone_spec.size);
-
-        let abs = self.zone_spec.offset(self.offset);
-        assert!(abs >= self.zone_spec.base);
-
-        abs
-    }
-}
-
-impl Default for Write {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Phantom type tag for [`NextTick`] intrusive lists.
-enum NextTickTag {}
-
-/// Intrusive linked list node for deferred callbacks ("next tick" semantics).
-///
-/// Uses an intrusive design to avoid heap allocation during scheduling—nodes
-/// live in caller-owned memory. The `callback` is `None` when idle, `Some`
-/// when queued. This approach guarantees deterministic memory usage and
-/// eliminates allocation failure paths during I/O completion.
-#[repr(C)]
-pub struct NextTick {
-    link: QueueLink<NextTick, NextTickTag>,
-    callback: Option<fn(&mut NextTick)>,
-}
-
-impl NextTick {
-    pub const fn new() -> Self {
-        Self {
-            link: QueueLink::new(),
-            callback: None,
-        }
-    }
-
-    /// Returns `true` if this callback is queued and awaiting execution.
-    #[inline]
-    pub fn is_pending(&self) -> bool {
-        self.callback.is_some()
-    }
-}
-
-impl Default for NextTick {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl QueueNode<NextTickTag> for NextTick {
-    fn queue_link(&mut self) -> &mut QueueLink<Self, NextTickTag> {
-        &mut self.link
-    }
-
-    fn queue_link_ref(&self) -> &QueueLink<Self, NextTickTag> {
-        &self.link
-    }
-}
+use super::iocb::{NextTick, NextTickQueue, NextTickTag, Read, Synchronicity, Write};
+pub use super::layout::{Layout, Zone, ZoneSpec};
 
 /// Direct I/O storage engine with async operation queues and deferred callbacks.
 ///
@@ -682,690 +294,224 @@ impl Storage {
     pub fn file(&self) -> &File {
         &self.file
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ==================== Constants ====================
-
-    #[test]
-    fn const_pow2() {
-        assert!(SECTOR_SIZE_MIN.is_power_of_two());
-        assert!(SECTOR_SIZE_DEFAULT.is_power_of_two());
-        assert!(SECTOR_SIZE_MAX.is_power_of_two());
-    }
-
-    #[test]
-    fn const_values() {
-        assert_eq!(SECTOR_SIZE_MIN, 512);
-        assert_eq!(SECTOR_SIZE_DEFAULT, 4096);
-        assert_eq!(SECTOR_SIZE_MAX, 65536);
-        const { assert!(SECTOR_SIZE_MIN <= SECTOR_SIZE_DEFAULT) };
-        const { assert!(SECTOR_SIZE_DEFAULT <= SECTOR_SIZE_MAX) };
-    }
-
-    // ==================== AlignedBuf ====================
-
-    #[test]
-    fn buf_alloc_default() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.len(), 4096);
-        assert_eq!(buf.align(), SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_DEFAULT, 0);
-    }
-
-    #[test]
-    fn buf_alloc_min() {
-        let buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
-        assert_eq!(buf.len(), 512);
-        assert_eq!(buf.align(), SECTOR_SIZE_MIN);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
-    }
-
-    #[test]
-    fn buf_alloc_max() {
-        let buf = AlignedBuf::new_zeroed(65536, SECTOR_SIZE_MAX);
-        assert_eq!(buf.len(), 65536);
-        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
-    }
-
-    #[test]
-    fn buf_alloc_edges() {
-        // Small len, large align
-        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MAX);
-        assert_eq!(buf.len(), 1);
-        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
-
-        // Large len, small align
-        let buf2 = AlignedBuf::new_zeroed(1024 * 1024, SECTOR_SIZE_MIN);
-        assert_eq!(buf2.len(), 1024 * 1024);
-        assert_eq!(buf2.align(), SECTOR_SIZE_MIN);
-        assert_eq!(buf2.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
-    }
-
-    #[test]
-    fn buf_alloc_alignments() {
-        for align in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
-            let buf = AlignedBuf::new_zeroed(align, align);
-            assert_eq!(buf.as_ptr() as usize % align, 0);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn buf_panic_len_0() {
-        let _ = AlignedBuf::new_zeroed(0, SECTOR_SIZE_DEFAULT);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn buf_panic_align_0() {
-        let _ = AlignedBuf::new_zeroed(4096, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn buf_panic_align_not_pow2() {
-        let _ = AlignedBuf::new_zeroed(4096, 100);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn buf_panic_align_max() {
-        let _ = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_MAX * 2);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn buf_panic_len_over_isize_max() {
-        let _ = AlignedBuf::new_zeroed((isize::MAX as usize) + 1, SECTOR_SIZE_DEFAULT);
-    }
-
-    #[test]
-    fn buf_is_zeroed() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        assert!(buf.as_slice().iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn buf_mut_write() {
-        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        let slice = buf.as_mut_slice();
-        slice[0] = 0xAB;
-        slice[1] = 0xCD;
-        slice[4095] = 0xEF;
-
-        assert_eq!(buf.as_slice()[0], 0xAB);
-        assert_eq!(buf.as_slice()[1], 0xCD);
-        assert_eq!(buf.as_slice()[4095], 0xEF);
-    }
-
-    #[test]
-    fn buf_mut_fill() {
-        let mut buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
-        buf.as_mut_slice().fill(0xFF);
-        assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
-    }
-
-    #[test]
-    fn buf_ptrs() {
-        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        let ptr = buf.as_ptr();
-        assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
-        assert_eq!(ptr, buf.as_slice().as_ptr());
-    }
-
-    #[test]
-    fn buf_slice_lengths() {
-        let mut buf = AlignedBuf::new_zeroed(1234, SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.as_slice().len(), 1234);
-        assert_eq!(buf.as_mut_slice().len(), 1234);
-    }
-
-    #[test]
-    fn buf_not_empty() {
-        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MIN);
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn buf_drop() {
-        for _ in 0..100 {
-            let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-            buf.as_mut_slice().fill(0xAB);
-        }
-    }
-
-    #[test]
-    fn buf_send() {
-        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        buf.as_mut_slice()[0] = 42;
-        let handle = std::thread::spawn(move || {
-            assert_eq!(buf.as_slice()[0], 42);
-            buf.len()
-        });
-        assert_eq!(handle.join().unwrap(), 4096);
-    }
-
-    // ==================== Read ====================
-
-    #[test]
-    fn read_init() {
-        let read = Read::new();
+    /// Submits async read from `zone` at zone-relative `offset`.
+    ///
+    /// Translates to absolute file offset and validates sector alignment for O_DIRECT.
+    /// `read` must outlive the operation; `callback` invoked on completion.
+    ///
+    /// # Panics
+    ///
+    /// - `buffer.is_empty()` or `read.is_pending()`
+    /// - Buffer pointer, length, or offset not sector-aligned
+    /// - Read exceeds zone boundary
+    pub fn read_sectors(
+        &mut self,
+        callback: fn(&mut Read),
+        read: &mut Read,
+        buffer: &mut [u8],
+        zone: Zone,
+        offset: u64,
+    ) {
+        self.assert_invariants();
+        assert!(!buffer.is_empty());
         assert!(!read.is_pending());
-        assert_eq!(read.expected_len(), 0);
-        assert_eq!(read.zone, Zone::SuperBlock);
-        assert_eq!(read.zone_spec.base, 0);
-        assert_eq!(read.offset, 0);
-    }
 
-    #[test]
-    fn read_default() {
-        let r1 = Read::new();
-        let r2 = Read::default();
-        assert_eq!(r1.zone, r2.zone);
-        assert_eq!(r1.offset, r2.offset);
-    }
+        self.assert_buffer_aligned(buffer.as_ptr() as usize, buffer.len(), offset);
 
-    #[test]
-    fn read_pending() {
-        let read = Read::new();
-        assert!(!read.is_pending());
-    }
+        let zone_spec = self.layout.zone(zone);
+        assert!(zone_spec.size > 0);
+        assert!(offset < zone_spec.size);
+        assert!(buffer.len() as u64 <= zone_spec.size - offset);
 
-    #[test]
-    fn read_pending_true_when_callback_set() {
-        fn cb(_: &mut Read) {}
-        let mut read = Read::new();
-        assert!(!read.is_pending());
-        read.callback = Some(cb);
-        assert!(read.is_pending());
-        read.callback = None;
-        assert!(!read.is_pending());
-    }
+        let abs = zone_spec.base.checked_add(offset).expect("offset overflow");
+        assert!(abs >= zone_spec.base);
+        assert!(abs < zone_spec.base + zone_spec.size);
 
-    #[test]
-    fn read_expected_len_accessors() {
-        let mut read = Read::new();
-        assert_eq!(read.expected_len(), 0);
-        read.expected_len = 123;
-        assert_eq!(read.expected_len(), 123);
-    }
-
-    #[test]
-    fn read_io_starts_idle() {
-        let read = Read::new();
-        assert!(read.io.is_idle());
-    }
-
-    #[test]
-    fn read_offset_logic() {
-        let mut read = Read::new();
-        read.zone_spec = ZoneSpec {
-            base: 1000,
-            size: 500,
-        };
-
-        // Start
-        read.offset = 0;
-        assert_eq!(read.absolute_offset(), 1000);
-
-        // Middle
-        read.offset = 250;
-        assert_eq!(read.absolute_offset(), 1250);
-
-        // Limit (inclusive of size for calculation, EOF check is separate)
-        read.offset = 500;
-        assert_eq!(read.absolute_offset(), 1500);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn read_offset_panic() {
-        let mut read = Read::new();
-        read.zone_spec = ZoneSpec {
-            base: 1000,
-            size: 500,
-        };
-        read.offset = 501;
-        let _ = read.absolute_offset();
-    }
-
-    #[test]
-    fn read_zero_size_zone_allows_only_zero_offset() {
-        let mut read = Read::new();
-        read.zone_spec = ZoneSpec { base: 42, size: 0 };
-        read.offset = 0;
-        assert_eq!(read.absolute_offset(), 42);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn read_zero_size_zone_panics_on_nonzero_offset() {
-        let mut read = Read::new();
-        read.zone_spec = ZoneSpec { base: 42, size: 0 };
-        read.offset = 1;
-        let _ = read.absolute_offset();
-    }
-
-    #[test]
-    fn read_layout() {
-        let layout = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
-        let mut read = Read::new();
-        read.zone = Zone::WalPrepares;
-        read.zone_spec = layout.zone(Zone::WalPrepares);
-        read.offset = 100;
-        assert_eq!(
-            read.absolute_offset(),
-            layout.start(Zone::WalPrepares) + 100
-        );
-    }
-
-    // ==================== Write ====================
-
-    #[test]
-    fn write_init() {
-        let write = Write::new();
-        assert!(!write.is_pending());
-        assert_eq!(write.expected_len(), 0);
-        assert_eq!(write.zone, Zone::SuperBlock);
-        assert_eq!(write.zone_spec.base, 0);
-        assert_eq!(write.offset, 0);
-    }
-
-    #[test]
-    fn write_default() {
-        let w1 = Write::new();
-        let w2 = Write::default();
-        assert_eq!(w1.zone, w2.zone);
-        assert_eq!(w1.offset, w2.offset);
-    }
-
-    #[test]
-    fn write_pending() {
-        let write = Write::new();
-        assert!(!write.is_pending());
-    }
-
-    #[test]
-    fn write_pending_true_when_callback_set() {
-        fn cb(_: &mut Write) {}
-        let mut write = Write::new();
-        assert!(!write.is_pending());
-        write.callback = Some(cb);
-        assert!(write.is_pending());
-        write.callback = None;
-        assert!(!write.is_pending());
-    }
-
-    #[test]
-    fn write_expected_len_accessors() {
-        let mut write = Write::new();
-        assert_eq!(write.expected_len(), 0);
-        write.expected_len = 456;
-        assert_eq!(write.expected_len(), 456);
-    }
-
-    #[test]
-    fn write_io_starts_idle() {
-        let write = Write::new();
-        assert!(write.io.is_idle());
-    }
-
-    #[test]
-    fn write_offset_logic() {
-        let mut write = Write::new();
-        write.zone_spec = ZoneSpec {
-            base: 2000,
-            size: 1000,
-        };
-
-        write.offset = 0;
-        assert_eq!(write.absolute_offset(), 2000);
-
-        write.offset = 500;
-        assert_eq!(write.absolute_offset(), 2500);
-
-        write.offset = 1000;
-        assert_eq!(write.absolute_offset(), 3000);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn write_offset_panic() {
-        let mut write = Write::new();
-        write.zone_spec = ZoneSpec {
-            base: 2000,
-            size: 1000,
-        };
-        write.offset = 1001;
-        let _ = write.absolute_offset();
-    }
-
-    #[test]
-    fn write_zero_size_zone_allows_only_zero_offset() {
-        let mut write = Write::new();
-        write.zone_spec = ZoneSpec { base: 99, size: 0 };
-        write.offset = 0;
-        assert_eq!(write.absolute_offset(), 99);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn write_zero_size_zone_panics_on_nonzero_offset() {
-        let mut write = Write::new();
-        write.zone_spec = ZoneSpec { base: 99, size: 0 };
-        write.offset = 1;
-        let _ = write.absolute_offset();
-    }
-
-    #[test]
-    fn write_layout() {
-        let layout = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
-        let mut write = Write::new();
-        write.zone = Zone::ClientReplies;
-        write.zone_spec = layout.zone(Zone::ClientReplies);
-        write.offset = 200;
-        assert_eq!(
-            write.absolute_offset(),
-            layout.start(Zone::ClientReplies) + 200
-        );
-    }
-
-    // ==================== Consistency ====================
-
-    #[test]
-    fn rw_consistency() {
-        let zone_spec = ZoneSpec {
-            base: 8192,
-            size: 4096,
-        };
-        let mut read = Read::new();
+        read.callback = Some(callback);
+        read.expected_len = buffer.len();
+        read.zone = zone;
         read.zone_spec = zone_spec;
-        read.offset = 100;
-        let mut write = Write::new();
+        read.offset = offset;
+
+        assert!(read.is_pending());
+        assert_eq!(read.expected_len, buffer.len());
+        assert_eq!(read.absolute_offset(), abs);
+
+        let ctx = (read as *mut Read).cast::<c_void>();
+        let buf = NonNull::new(buffer.as_mut_ptr()).expect("buffer pointer is null");
+        self.io.submit(
+            &mut read.io,
+            Operation::Read {
+                fd: self.fd,
+                buf,
+                len: buffer.len() as u32,
+                offset: abs,
+            },
+            ctx,
+            read_complete_trampoline,
+        );
+    }
+
+    /// Submits async write to `zone` at zone-relative `offset`.
+    ///
+    /// Translates to absolute file offset and validates sector alignment for O_DIRECT.
+    /// `write` must outlive the operation; `callback` invoked on completion.
+    /// `buffer` is const but cast to `*mut u8` for io_uring API (kernel doesn't modify).
+    ///
+    /// # Panics
+    ///
+    /// - `buffer.is_empty()` or `write.is_pending()`
+    /// - Buffer pointer, length, or offset not sector-aligned
+    /// - Write exceeds zone boundary
+    pub fn write_sectors(
+        &mut self,
+        callback: fn(&mut Write),
+        write: &mut Write,
+        buffer: &[u8],
+        zone: Zone,
+        offset: u64,
+    ) {
+        self.assert_invariants();
+        assert!(!buffer.is_empty());
+        assert!(!write.is_pending());
+
+        self.assert_buffer_aligned(buffer.as_ptr() as usize, buffer.len(), offset);
+
+        let zone_spec = self.layout.zone(zone);
+        assert!(zone_spec.size > 0);
+        assert!(offset < zone_spec.size);
+        assert!(buffer.len() as u64 <= zone_spec.size - offset);
+
+        let abs = zone_spec.base.checked_add(offset).expect("offset overflow");
+        assert!(abs >= zone_spec.base);
+        assert!(abs < zone_spec.base + zone_spec.size);
+
+        write.callback = Some(callback);
+        write.expected_len = buffer.len();
+        write.zone = zone;
         write.zone_spec = zone_spec;
-        write.offset = 100;
+        write.offset = offset;
 
-        assert_eq!(read.absolute_offset(), write.absolute_offset());
+        assert!(write.is_pending());
+        assert_eq!(write.expected_len, buffer.len());
+        assert_eq!(write.absolute_offset(), abs);
+
+        let ctx = (write as *mut Write).cast::<c_void>();
+        let buf = NonNull::new(buffer.as_ptr() as *mut u8).expect("buffer pointer is null");
+        self.io.submit(
+            &mut write.io,
+            Operation::Write {
+                fd: self.fd,
+                buf,
+                len: buffer.len() as u32,
+                offset: abs,
+            },
+            ctx,
+            write_complete_trampoline,
+        );
     }
 
-    #[test]
-    fn rw_all_zones() {
-        let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
-        for zone in Zone::ALL {
-            let zone_spec = layout.zone(zone);
-            if zone_spec.size > 0 {
-                let offset = zone_spec.size / 2;
+    /// Flushes all writes to stable storage (durability barrier).
+    ///
+    /// Generic `ctx`/`cb` pattern allows caller-defined completion context.
+    pub fn fsync(
+        &mut self,
+        completion: &mut IoCompletion,
+        ctx: *mut c_void,
+        cb: unsafe fn(*mut c_void, &mut IoCompletion),
+    ) {
+        self.assert_invariants();
+        assert!(self.fd >= 0);
 
-                let mut read = Read::new();
-                read.zone = zone;
-                read.zone_spec = zone_spec;
-                read.offset = offset;
-
-                let mut write = Write::new();
-                write.zone = zone;
-                write.zone_spec = zone_spec;
-                write.offset = offset;
-
-                assert_eq!(read.absolute_offset(), write.absolute_offset());
-                assert_eq!(read.absolute_offset(), zone_spec.base + offset);
-            }
-        }
+        self.io
+            .submit(completion, Operation::Fsync { fd: self.fd }, ctx, cb);
     }
 
-    #[test]
-    fn read_io_field_is_first() {
-        let offset = unsafe {
-            let uninit = core::mem::MaybeUninit::<Read>::uninit();
-            let base = uninit.as_ptr();
-            let io_ptr = core::ptr::addr_of!((*base).io);
-            (io_ptr as usize) - (base as usize)
-        };
-        assert_eq!(offset, 0);
-    }
+    /// Validates alignment for O_DIRECT: buffer pointer, length, and offset must
+    /// be sector-aligned. `isize::MAX` check prevents kernel pointer arithmetic overflow.
+    fn assert_buffer_aligned(&self, buf_ptr: usize, len: usize, offset: u64) {
+        assert!(len.is_multiple_of(self.sector_size()));
+        assert!(offset.is_multiple_of(self.sector_size() as u64));
+        assert!(buf_ptr.is_multiple_of(self.sector_size()));
 
-    #[test]
-    fn write_io_field_is_first() {
-        let offset = unsafe {
-            let uninit = core::mem::MaybeUninit::<Write>::uninit();
-            let base = uninit.as_ptr();
-            let io_ptr = core::ptr::addr_of!((*base).io);
-            (io_ptr as usize) - (base as usize)
-        };
-        assert_eq!(offset, 0);
+        assert!(len > 0);
+        assert!(len <= isize::MAX as usize);
     }
 }
 
-#[cfg(test)]
-mod proptests {
-    use super::*;
-    use proptest::prelude::*;
+/// C callback trampoline: casts `ctx` to [`Read`], validates result, invokes typed callback.
+///
+/// Panics on I/O errors or short reads (fail-stop: storage corruption is unrecoverable).
+///
+/// # Safety
+///
+/// `ctx` must point to valid [`Read`] that outlives the operation.
+unsafe fn read_complete_trampoline(ctx: *mut c_void, completion: &mut IoCompletion) {
+    assert!(!ctx.is_null());
 
-    fn align_strategy() -> impl Strategy<Value = usize> {
-        prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192, 16384, 32768, 65536])
+    let read = unsafe { &mut *(ctx as *mut Read) };
+    if completion.result < 0 {
+        let errno = -completion.result;
+        panic!(
+            "storage read failed: errno={errno} (zone={:?}, offset={}, expected_len={})",
+            read.zone, read.offset, read.expected_len
+        );
     }
 
-    fn len_strategy() -> impl Strategy<Value = usize> {
-        1usize..=(1024 * 1024)
+    let n = completion.result as usize;
+    if n != read.expected_len {
+        panic!(
+            "storage read failed: short read {n} != {} (zone={:?}, offset={}, expected_len={})",
+            read.expected_len, read.zone, read.offset, read.expected_len
+        );
     }
 
-    proptest! {
-        #[test]
-        fn prop_aligned_buf_alignment(
-            len in len_strategy(),
-            align in align_strategy(),
-        ) {
-            let buf = AlignedBuf::new_zeroed(len, align);
-            prop_assert_eq!(buf.as_ptr() as usize % align, 0);
-            prop_assert_eq!(buf.len(), len);
-            prop_assert_eq!(buf.align(), align);
-        }
-
-        #[test]
-        fn prop_aligned_buf_zero_init(len in 1usize..10000) {
-            let buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
-            prop_assert!(buf.as_slice().iter().all(|&b| b == 0));
-        }
-
-        #[test]
-        fn prop_aligned_buf_is_empty_always_false(
-            len in len_strategy(),
-            align in align_strategy(),
-        ) {
-            let buf = AlignedBuf::new_zeroed(len, align);
-            prop_assert!(!buf.is_empty());
-        }
-
-        #[test]
-        fn prop_aligned_buf_ptr_consistency(
-            len in len_strategy(),
-            align in align_strategy(),
-        ) {
-            let mut buf = AlignedBuf::new_zeroed(len, align);
-            let ptr = buf.as_ptr();
-            prop_assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
-            prop_assert_eq!(ptr, buf.as_slice().as_ptr());
-        }
-
-        #[test]
-        fn prop_aligned_buf_mutability(
-            len in 1usize..10000,
-            pattern in any::<u8>(),
-        ) {
-            let mut buf = AlignedBuf::new_zeroed(len, SECTOR_SIZE_MIN);
-            buf.as_mut_slice().fill(pattern);
-            prop_assert!(buf.as_slice().iter().all(|&b| b == pattern));
-        }
-
-        #[test]
-        fn prop_read_absolute_offset(
-            base in 0u64..1_000_000,
-            size in 1u64..100_000,
-            offset_factor in 0.0f64..1.0,
-        ) {
-            let mut read = Read::new();
-            read.zone_spec = ZoneSpec { base, size };
-            read.offset = (size as f64 * offset_factor) as u64;
-
-            let abs = read.absolute_offset();
-            prop_assert_eq!(abs, base + read.offset);
-            prop_assert!(abs >= base);
-        }
-
-        #[test]
-        fn prop_write_absolute_offset(
-            base in 0u64..1_000_000,
-            size in 1u64..100_000,
-            offset_factor in 0.0f64..1.0,
-        ) {
-            let mut write = Write::new();
-            write.zone_spec = ZoneSpec { base, size };
-            write.offset = (size as f64 * offset_factor) as u64;
-
-            let abs = write.absolute_offset();
-            prop_assert_eq!(abs, base + write.offset);
-            prop_assert!(abs >= base);
-        }
-
-        #[test]
-        fn prop_read_write_consistency(
-            base in 0u64..1_000_000,
-            size in 1u64..100_000,
-            offset_factor in 0.0f64..1.0,
-        ) {
-            let zone_spec = ZoneSpec { base, size };
-            let offset = (size as f64 * offset_factor) as u64;
-
-            let mut read = Read::new();
-            read.zone_spec = zone_spec;
-            read.offset = offset;
-
-            let mut write = Write::new();
-            write.zone_spec = zone_spec;
-            write.offset = offset;
-
-            prop_assert_eq!(read.absolute_offset(), write.absolute_offset());
-        }
-
-        #[test]
-        fn prop_read_offset_within_zone(
-            base in 0u64..1_000_000,
-            size in 1u64..100_000,
-            offset_factor in 0.0f64..1.0,
-        ) {
-            let zone_spec = ZoneSpec { base, size };
-            let offset = (size as f64 * offset_factor) as u64;
-
-            let mut read = Read::new();
-            read.zone_spec = zone_spec;
-            read.offset = offset;
-
-            let abs = read.absolute_offset();
-            prop_assert!(abs >= zone_spec.base);
-            prop_assert!(abs <= zone_spec.end());
-        }
-
-        #[test]
-        fn prop_layout_integration(
-            sector_exp in 9u32..13u32,
-            block_exp in 0u32..4u32,
-            zone_idx in 0usize..Zone::COUNT,
-        ) {
-            let sector_size = 1u64 << sector_exp;
-            let block_size = sector_size << block_exp;
-
-            let layout = Layout::new(
-                sector_size,
-                block_size,
-                sector_size * 2,
-                sector_size * 4,
-                sector_size * 8,
-                sector_size * 2,
-                block_size * 16,
-            );
-
-            let zone = Zone::ALL[zone_idx];
-            let zone_spec = layout.zone(zone);
-
-            if zone_spec.size > 0 {
-                let offset = zone_spec.size / 2;
-
-                let mut read = Read::new();
-                read.zone = zone;
-                read.zone_spec = zone_spec;
-                read.offset = offset;
-
-                let abs = read.absolute_offset();
-                prop_assert_eq!(abs, layout.offset(zone, offset));
-            }
-        }
+    if let Some(cb) = read.callback.take() {
+        assert!(!read.is_pending());
+        cb(read);
     }
 }
 
-#[cfg(test)]
-mod security_tests {
-    use super::*;
+/// C callback trampoline: casts `ctx` to [`Write`], validates result, invokes typed callback.
+///
+/// Panics on I/O errors or short writes (fail-stop: storage corruption is unrecoverable).
+///
+/// # Safety
+///
+/// `ctx` must point to valid [`Write`] that outlives the operation.
+unsafe fn write_complete_trampoline(ctx: *mut c_void, completion: &mut IoCompletion) {
+    assert!(!ctx.is_null());
 
-    #[test]
-    #[should_panic(expected = "ZoneSpec::offset overflow")]
-    fn test_read_absolute_offset_overflow() {
-        // Scenario: ZoneSpec is corrupted or maliciously crafted such that
-        // base + size overflows u64, but we try to read within "size".
-        let mut read = Read::new();
-        read.zone_spec = ZoneSpec {
-            base: u64::MAX - 10,
-            size: 20, // base + size overflows
-        };
-        // offset is within "size" (15 <= 20), so the first check passes.
-        // But base + offset (MAX - 10 + 15) = MAX + 5 -> Overflows.
-        read.offset = 15;
-
-        let _ = read.absolute_offset();
+    let write = unsafe { &mut *(ctx as *mut Write) };
+    if completion.result < 0 {
+        let errno = -completion.result;
+        panic!(
+            "storage write failed: errno={errno} (zone={:?}, offset={}, expected_len={})",
+            write.zone, write.offset, write.expected_len
+        );
     }
 
-    #[test]
-    #[should_panic(expected = "ZoneSpec::offset overflow")]
-    fn test_write_absolute_offset_overflow() {
-        let mut write = Write::new();
-        write.zone_spec = ZoneSpec {
-            base: u64::MAX - 100,
-            size: 200,
-        };
-        write.offset = 150;
-        let _ = write.absolute_offset();
+    let n = completion.result as usize;
+    if n != write.expected_len {
+        panic!(
+            "storage write failed: short write {n} != {} (zone={:?}, offset={}, expected_len={})",
+            write.expected_len, write.zone, write.offset, write.expected_len
+        );
     }
 
-    #[test]
-    fn test_struct_sizes() {
-        // Ensure structs don't accidentally grow or shrink in ways that might affect FFI or cache lines.
-        // These assertions are platform-dependent (likely 64-bit), but valuable for tracking changes.
-        // Read/Write:
-        // IoCompletion (approx 88 bytes, includes Operation(32), ListLink(16), etc.)
-        // + Option<fn> (8)
-        // + usize (8)
-        // + Zone (1+7pad = 8)
-        // + ZoneSpec (16)
-        // + u64 (8)
-        // = 88 + 8 + 8 + 8 + 16 + 8 = 136 bytes.
-        assert_eq!(std::mem::size_of::<Read>(), 136);
-        assert_eq!(std::mem::size_of::<Write>(), 136);
-
-        assert_eq!(std::mem::align_of::<Read>(), 8);
-        assert_eq!(std::mem::align_of::<Write>(), 8);
+    if let Some(cb) = write.callback.take() {
+        assert!(!write.is_pending());
+        cb(write);
     }
 }
 
 #[cfg(test)]
 mod integration_tests {
     use super::*;
-    use crate::io::{Completion, Operation};
+    use crate::io::Completion;
+    use crate::storage::buffer::AlignedBuf;
     use std::cell::{Cell, RefCell};
-    use std::fs::File;
     use std::io::{Read as IoRead, Seek, Write as IoWrite};
     use tempfile::tempdir;
 
@@ -1833,5 +979,722 @@ mod integration_tests {
 
         IO_DONE.with(|b| b.set(false));
         NEXT_TICK_DONE.with(|b| b.set(false));
+    }
+
+    #[test]
+    fn read_sectors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_sectors");
+        let layout = default_layout();
+
+        // Setup file content
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+                .unwrap();
+            f.write_all(&[0xBB; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.read_sectors(cb, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert_eq!(buf.as_slice()[0], 0xBB);
+        assert!(!read.is_pending());
+    }
+
+    #[test]
+    fn write_sectors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_sectors");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xCC);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(cb, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(!write.is_pending());
+
+        // Verify content
+        let mut f = File::open(&path).unwrap();
+        f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+            .unwrap();
+        let mut check = [0u8; 512];
+        f.read_exact(&mut check).unwrap();
+        assert!(check.iter().all(|&b| b == 0xCC));
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_buffer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_unaligned");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+
+        // Unaligned slice (offset by 1)
+        let mut raw = vec![0u8; 512 + 1];
+        let slice = &mut raw[1..];
+
+        storage.read_sectors(|_| {}, &mut read, slice, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_buffer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_unaligned");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+
+        let raw = vec![0u8; 512 + 1];
+        let slice = &raw[1..];
+
+        storage.write_sectors(|_| {}, &mut write, slice, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_len() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_len");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(1024, 512); // aligned
+
+        // Valid ptr, invalid len
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            &mut buf.as_mut_slice()[..511],
+            Zone::WalPrepares,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_unaligned_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_offset");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Invalid offset
+        storage.read_sectors(|_| {}, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_out_of_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_oob");
+        let layout = default_layout(); // WalPrepares is 4096 bytes
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Offset 4096 is exactly at end, but len 512 pushes it over
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            4096,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_len_overflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_len_overflow");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        // 1024 bytes buffer
+        let mut buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Offset 3584 (4096 - 512). Reading 1024 bytes goes past end (4096 + 512).
+        storage.read_sectors(
+            |_| {},
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            3584,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_out_of_bounds() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_oob");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(512, 512);
+
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 4096);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_empty_buffer_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_empty");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        let empty: &mut [u8] = &mut [];
+
+        storage.read_sectors(|_| {}, &mut read, empty, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_empty_buffer_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_empty");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let empty: &[u8] = &[];
+
+        storage.write_sectors(|_| {}, &mut write, empty, Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn read_sectors_pending_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_read_pending");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut read = Read::new();
+        // Force pending state
+        read.callback = Some(|_: &mut Read| {});
+        assert!(read.is_pending());
+
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        storage.read_sectors(|_| {}, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_pending_panics() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_pending");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        // Force pending state
+        write.callback = Some(|_: &mut Write| {});
+        assert!(write.is_pending());
+
+        let buf = AlignedBuf::new_zeroed(512, 512);
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_len() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_len");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Valid ptr, invalid len (511 not multiple of 512)
+        storage.write_sectors(
+            |_| {},
+            &mut write,
+            &buf.as_slice()[..511],
+            Zone::WalPrepares,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_unaligned_offset() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_offset");
+        let opts = Options {
+            path: &path,
+            layout: default_layout(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        let buf = AlignedBuf::new_zeroed(512, 512);
+
+        // Invalid offset (1 not multiple of 512)
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn write_sectors_len_overflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_len_overflow");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+        let mut write = Write::new();
+        // 1024 bytes buffer
+        let buf = AlignedBuf::new_zeroed(1024, 512);
+
+        // Offset 3584 (4096 - 512). Writing 1024 bytes goes past end.
+        storage.write_sectors(|_| {}, &mut write, buf.as_slice(), Zone::WalPrepares, 3584);
+    }
+
+    #[test]
+    fn read_write_roundtrip_data_integrity() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_roundtrip");
+        let layout = default_layout();
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Write known pattern
+        let mut write = Write::new();
+        let mut write_buf = AlignedBuf::new_zeroed(512, 512);
+        for (i, b) in write_buf.as_mut_slice().iter_mut().enumerate() {
+            *b = (i % 256) as u8;
+        }
+
+        thread_local! {
+            static WRITE_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn write_cb(_: &mut Write) {
+            WRITE_DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(
+            write_cb,
+            &mut write,
+            write_buf.as_slice(),
+            Zone::WalPrepares,
+            512,
+        );
+        storage.tick();
+        WRITE_DONE.with(|b| assert!(b.get()));
+
+        // Read it back
+        let mut read = Read::new();
+        let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static READ_DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn read_cb(_: &mut Read) {
+            READ_DONE.with(|b| b.set(true));
+        }
+
+        storage.read_sectors(
+            read_cb,
+            &mut read,
+            read_buf.as_mut_slice(),
+            Zone::WalPrepares,
+            512,
+        );
+        storage.tick();
+        READ_DONE.with(|b| assert!(b.get()));
+
+        // Verify data integrity
+        for (i, &b) in read_buf.as_slice().iter().enumerate() {
+            assert_eq!(b, (i % 256) as u8, "data mismatch at byte {i}");
+        }
+    }
+
+    #[test]
+    fn read_sectors_exact_zone_fill() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_exact_fill");
+        let layout = default_layout();
+
+        // Pre-fill the zone
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalPrepares)))
+                .unwrap();
+            let zone_size = layout.zone(Zone::WalPrepares).size as usize;
+            f.write_all(&vec![0xEE; zone_size]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let zone_size = layout.zone(Zone::WalPrepares).size as usize;
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(zone_size, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Read exactly zone.size bytes starting at offset 0
+        storage.read_sectors(cb, &mut read, buf.as_mut_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(buf.as_slice().iter().all(|&b| b == 0xEE));
+    }
+
+    #[test]
+    fn read_sectors_last_sector() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_last_sector");
+        let layout = default_layout();
+        let zone_size = layout.zone(Zone::WalPrepares).size;
+        let last_sector_offset = zone_size - 512;
+
+        // Pre-fill last sector
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            let abs_offset = layout.start(Zone::WalPrepares) + last_sector_offset;
+            f.seek(std::io::SeekFrom::Start(abs_offset)).unwrap();
+            f.write_all(&[0xFF; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut read = Read::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Read last sector of zone
+        storage.read_sectors(
+            cb,
+            &mut read,
+            buf.as_mut_slice(),
+            Zone::WalPrepares,
+            last_sector_offset,
+        );
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+        assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
+    }
+
+    #[test]
+    fn write_sectors_last_sector() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_write_last");
+        let layout = default_layout();
+        let zone_size = layout.zone(Zone::WalPrepares).size;
+        let last_sector_offset = zone_size - 512;
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xAA);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        // Write last sector of zone
+        storage.write_sectors(
+            cb,
+            &mut write,
+            buf.as_slice(),
+            Zone::WalPrepares,
+            last_sector_offset,
+        );
+        storage.tick();
+
+        DONE.with(|b| assert!(b.get()));
+
+        // Verify
+        let mut f = File::open(&path).unwrap();
+        let abs_offset = layout.start(Zone::WalPrepares) + last_sector_offset;
+        f.seek(std::io::SeekFrom::Start(abs_offset)).unwrap();
+        let mut check = [0u8; 512];
+        f.read_exact(&mut check).unwrap();
+        assert!(check.iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn read_write_multiple_zones() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_multi_zone");
+        let layout = default_layout();
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Test zones with non-zero size
+        let test_zones = [
+            Zone::SuperBlock,
+            Zone::WalHeaders,
+            Zone::WalPrepares,
+            Zone::ClientReplies,
+            Zone::Grid,
+        ];
+
+        for (idx, &zone) in test_zones.iter().enumerate() {
+            let zone_spec = layout.zone(zone);
+            if zone_spec.size == 0 {
+                continue;
+            }
+
+            // Write unique pattern per zone
+            let pattern = ((idx + 1) * 0x11) as u8;
+            let mut write = Write::new();
+            let mut buf = AlignedBuf::new_zeroed(512, 512);
+            buf.as_mut_slice().fill(pattern);
+
+            thread_local! {
+                static DONE: Cell<bool> = const { Cell::new(false) };
+            }
+            fn cb_w(_: &mut Write) {
+                DONE.with(|b| b.set(true));
+            }
+
+            DONE.with(|b| b.set(false));
+            storage.write_sectors(cb_w, &mut write, buf.as_slice(), zone, 0);
+            storage.tick();
+            DONE.with(|b| assert!(b.get(), "write failed for zone {:?}", zone));
+
+            // Read back and verify
+            let mut read = Read::new();
+            let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+            fn cb_r(_: &mut Read) {
+                DONE.with(|b| b.set(true));
+            }
+
+            DONE.with(|b| b.set(false));
+            storage.read_sectors(cb_r, &mut read, read_buf.as_mut_slice(), zone, 0);
+            storage.tick();
+            DONE.with(|b| assert!(b.get(), "read failed for zone {:?}", zone));
+
+            assert!(
+                read_buf.as_slice().iter().all(|&b| b == pattern),
+                "data mismatch for zone {:?}",
+                zone
+            );
+        }
+    }
+
+    #[test]
+    fn zone_isolation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("storage_isolation");
+        let layout = default_layout();
+
+        // Pre-fill WalHeaders with 0xAA
+        {
+            let mut f = File::create(&path).unwrap();
+            f.set_len(layout.total_size()).unwrap();
+            f.seek(std::io::SeekFrom::Start(layout.start(Zone::WalHeaders)))
+                .unwrap();
+            f.write_all(&[0xAA; 512]).unwrap();
+        }
+
+        let opts = Options {
+            path: &path,
+            layout: layout.clone(),
+            direct_io: false,
+            sector_size: 512,
+        };
+        let mut storage = Storage::open(opts).unwrap();
+
+        // Write 0xBB to WalPrepares
+        let mut write = Write::new();
+        let mut buf = AlignedBuf::new_zeroed(512, 512);
+        buf.as_mut_slice().fill(0xBB);
+
+        thread_local! {
+            static DONE: Cell<bool> = const { Cell::new(false) };
+        }
+        fn cb_w(_: &mut Write) {
+            DONE.with(|b| b.set(true));
+        }
+
+        storage.write_sectors(cb_w, &mut write, buf.as_slice(), Zone::WalPrepares, 0);
+        storage.tick();
+        DONE.with(|b| assert!(b.get()));
+
+        // Verify WalHeaders is still 0xAA (not corrupted by WalPrepares write)
+        let mut read = Read::new();
+        let mut read_buf = AlignedBuf::new_zeroed(512, 512);
+
+        fn cb_r(_: &mut Read) {
+            DONE.with(|b| b.set(true));
+        }
+
+        DONE.with(|b| b.set(false));
+        storage.read_sectors(
+            cb_r,
+            &mut read,
+            read_buf.as_mut_slice(),
+            Zone::WalHeaders,
+            0,
+        );
+        storage.tick();
+        DONE.with(|b| assert!(b.get()));
+
+        assert!(
+            read_buf.as_slice().iter().all(|&b| b == 0xAA),
+            "WalHeaders was corrupted by WalPrepares write"
+        );
     }
 }

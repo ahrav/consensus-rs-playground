@@ -15,10 +15,10 @@
 //! [`reset`]: Message::reset
 //! [`set_body`]: Message::set_body
 
-use super::{Command, Header};
-use crate::constants::{
+use super::constants::{
     HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_BODY_SIZE_MAX, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
 };
+use super::{Command, Header};
 use core::cell::Cell;
 use std::alloc::{Layout, alloc_zeroed, handle_alloc_error};
 
