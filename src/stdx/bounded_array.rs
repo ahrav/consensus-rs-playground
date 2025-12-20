@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "push on full array")]
-    fn push_overflow_panics() {
+    fn push_overflow() {
         let mut arr: BoundedArray<u32, 2> = BoundedArray::new();
         arr.push(1);
         arr.push(2);
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "index out of bounds")]
-    fn get_out_of_bounds_panics() {
+    fn get_out_of_bounds() {
         let arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.get(0); // Empty array, should panic
     }
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "extend exceeds capacity")]
-    fn extend_overflow_panics() {
+    fn extend_overflow() {
         let mut arr: BoundedArray<u32, 3> = BoundedArray::new();
         arr.push(1);
         arr.extend_from_slice(&[2, 3, 4]); // Would need 4 total, capacity is 3
@@ -533,7 +533,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "truncate length exceeds current len")]
-    fn truncate_larger_panics() {
+    fn truncate_out_of_bounds() {
         let mut arr: BoundedArray<u32, 10> = BoundedArray::new();
         arr.push(1);
         arr.truncate(5); // Current len is 1, should panic
@@ -641,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_capacity_one() {
+    fn capacity_min() {
         // Tiger Style: test edge case of minimum capacity
         let mut arr: BoundedArray<u32, 1> = BoundedArray::new();
 
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "index out of bounds")]
-    fn index_mut_out_of_bounds_panics() {
+    fn index_mut_out_of_bounds() {
         let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.push(1);
         arr[5] = 10; // Should panic
@@ -735,7 +735,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn from_value_exceeds_capacity_panics() {
+    fn from_value_overflow() {
         let _arr: BoundedArray<u32, 3> = BoundedArray::from_value(1, 5);
     }
 
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "index out of bounds")]
-    fn set_out_of_bounds_panics() {
+    fn set_out_of_bounds() {
         let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.push(1);
         arr.set(5, 10); // Should panic
@@ -762,7 +762,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn swap_first_out_of_bounds_panics() {
+    fn swap_out_of_bounds_first() {
         let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.push(1);
         arr.swap(5, 0); // First index out of bounds
@@ -770,7 +770,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn swap_second_out_of_bounds_panics() {
+    fn swap_out_of_bounds_second() {
         let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.push(1);
         arr.swap(0, 5); // Second index out of bounds
@@ -833,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn push_pop_reuse_slots() {
+    fn slot_reuse() {
         // Verify slots can be reused after pop
         let mut arr: BoundedArray<u32, 2> = BoundedArray::new();
 
@@ -870,7 +870,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "out of bounds")]
-    fn index_trait_out_of_bounds_panics() {
+    fn index_out_of_bounds() {
         let arr: BoundedArray<u32, 4> = BoundedArray::new();
         let _ = arr[0]; // Empty array, should panic
     }
