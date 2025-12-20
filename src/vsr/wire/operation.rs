@@ -1,9 +1,18 @@
+//! Wire-format operation codes for client requests.
+//!
+//! Operations occupy the reserved range `128..=145`. Discriminants are part of the wire
+//! protocol and must never change. Use [`Operation::try_from`] to parse from bytes.
+
+/// First byte value reserved for user-defined operations.
 pub const VSR_OPERATIONS_RESERVED: u8 = 128;
 
+/// Total number of defined operations.
 pub const OPERATION_COUNT: u8 = 18;
 
+/// Minimum valid operation discriminant.
 pub const OPERATION_MIN: u8 = VSR_OPERATIONS_RESERVED;
 
+/// Maximum valid operation discriminant.
 pub const OPERATION_MAX: u8 = VSR_OPERATIONS_RESERVED + OPERATION_COUNT - 1;
 
 const _: () = {
@@ -18,52 +27,53 @@ const _: () = {
     assert!(OPERATION_MAX - OPERATION_MIN + 1 == OPERATION_COUNT);
 };
 
+/// Client request operation codes with stable wire-format discriminants.
+///
+/// Each variant maps to a fixed `u8` value in the range [`OPERATION_MIN`]..=[`OPERATION_MAX`].
+/// Discriminants are part of the protocol specification and must never change.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum Operation {
-    /// `constants.vsr_operations_reserved + 0`
+    /// Internal heartbeat/keepalive operation.
     Pulse = 128,
 
-    /// `constants.vsr_operations_reserved + 1`
+    // Deprecated unbatched operations (129-134). Retained for wire compatibility.
+    #[doc(hidden)]
     DeprecatedCreateAccountsUnbatched = 129,
-    /// `constants.vsr_operations_reserved + 2`
+    #[doc(hidden)]
     DeprecatedCreateTransfersUnbatched = 130,
-    /// `constants.vsr_operations_reserved + 3`
+    #[doc(hidden)]
     DeprecatedLookupAccountsUnbatched = 131,
-    /// `constants.vsr_operations_reserved + 4`
+    #[doc(hidden)]
     DeprecatedLookupTransfersUnbatched = 132,
-    /// `constants.vsr_operations_reserved + 5`
+    #[doc(hidden)]
     DeprecatedGetAccountTransfersUnbatched = 133,
-    /// `constants.vsr_operations_reserved + 6`
+    #[doc(hidden)]
     DeprecatedGetAccountBalancesUnbatched = 134,
 
-    /// `constants.vsr_operations_reserved + 7`
+    /// Batch create accounts.
     CreateAccounts = 135,
-    /// `constants.vsr_operations_reserved + 8`
+    /// Batch create transfers.
     CreateTransfers = 136,
-    /// `constants.vsr_operations_reserved + 9`
+    /// Lookup accounts by ID.
     LookupAccounts = 137,
-    /// `constants.vsr_operations_reserved + 10`
+    /// Lookup transfers by ID.
     LookupTransfers = 138,
-    /// `constants.vsr_operations_reserved + 11`
+    /// Get transfers for a specific account.
     GetAccountTransfers = 139,
-    /// `constants.vsr_operations_reserved + 12`
+    /// Get balance history for a specific account.
     GetAccountBalances = 140,
-    /// `constants.vsr_operations_reserved + 13`
+    /// Query accounts with filters.
     QueryAccounts = 141,
-    /// `constants.vsr_operations_reserved + 14`
+    /// Query transfers with filters.
     QueryTransfers = 142,
-    /// `constants.vsr_operations_reserved + 15`
+    /// Subscribe to change events.
     GetChangeEvents = 143,
 
-    /// `constants.vsr_operations_reserved + 16`
-    ///
-    /// Intentionally reserved/unused slot (kept to preserve numeric stability).
+    /// Reserved slot for future use. Preserves discriminant stability.
     UnusedReserved = 144,
 
-    /// `constants.vsr_operations_reserved + 17`
-    ///
-    /// Internal op used by TB (keep the numeric value stable).
+    /// Internal query operation. Not client-facing.
     QueryTransfersOp = 145,
 }
 
@@ -98,6 +108,7 @@ const _: () = {
 };
 
 impl Operation {
+    /// Returns the wire-format byte value.
     #[inline]
     pub fn as_u8(self) -> u8 {
         let value = self as u8;
@@ -111,6 +122,7 @@ impl Operation {
         value
     }
 
+    /// Returns `true` for legacy operations no longer accepted by clients.
     #[inline]
     pub const fn is_deprecated(self) -> bool {
         matches!(
@@ -124,6 +136,7 @@ impl Operation {
         )
     }
 
+    /// Returns `true` for operations exposed to external clients.
     #[inline]
     pub const fn is_client_facing(self) -> bool {
         matches!(
@@ -140,21 +153,15 @@ impl Operation {
         )
     }
 
+    /// Returns `true` if this operation can be requested by clients.
+    ///
+    /// Equivalent to `is_client_facing() && !is_deprecated()`.
     #[inline]
     pub const fn is_valid_client_request(self) -> bool {
-        let valid = self.is_client_facing();
-
-        #[cfg(debug_assertions)]
-        {
-            if valid {
-                debug_assert!(!self.is_deprecated());
-            }
-        }
-
-        valid
+        self.is_client_facing() && !self.is_deprecated()
     }
 
-    /// Checks if a raw `u8` value is in the valid operation range.
+    /// Checks if a raw byte is within the valid operation range.
     #[inline]
     pub const fn is_valid_discriminant(v: u8) -> bool {
         v >= OPERATION_MIN && v <= OPERATION_MAX
@@ -175,23 +182,24 @@ impl From<Operation> for u8 {
     }
 }
 
+/// Error returned when parsing an invalid operation byte.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct InvalidOperation(pub u8);
 
 impl InvalidOperation {
-    /// Returns the invalid value that caused this error.
+    /// Returns the invalid byte value.
     #[inline]
     pub const fn value(self) -> u8 {
         self.0
     }
 
-    /// Returns true if the value was below the valid range.
+    /// Returns `true` if the value was below [`OPERATION_MIN`].
     #[inline]
     pub const fn is_below_range(self) -> bool {
         self.0 < OPERATION_MIN
     }
 
-    /// Returns true if the value was above the valid range.
+    /// Returns `true` if the value was above [`OPERATION_MAX`].
     #[inline]
     pub const fn is_above_range(self) -> bool {
         self.0 > OPERATION_MAX
@@ -264,14 +272,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    // Tiger Style: compile-time test of constants
     const _: () = {
         assert!(OPERATION_MIN == 128);
         assert!(OPERATION_MAX == 145);
         assert!(OPERATION_COUNT == 18);
     };
 
-    // All operation variants in discriminant order for exhaustive testing.
     const ALL_OPERATIONS: [Operation; OPERATION_COUNT as usize] = [
         Operation::Pulse,
         Operation::DeprecatedCreateAccountsUnbatched,
@@ -293,12 +299,7 @@ mod tests {
         Operation::QueryTransfersOp,
     ];
 
-    // Compile-time: validates ALL_OPERATIONS array has correct length
     const _: () = assert!(ALL_OPERATIONS.len() == OPERATION_COUNT as usize);
-
-    // ==========================================================================
-    // PropTest Strategy for Operation Enum
-    // ==========================================================================
 
     impl Arbitrary for Operation {
         type Parameters = ();
@@ -311,13 +312,9 @@ mod tests {
         }
     }
 
-    // ==========================================================================
-    // Property-Based Tests: Core Invariants
-    // ==========================================================================
-
     proptest! {
         #[test]
-        fn prop_roundtrip_all_variants(op in any::<Operation>()) {
+        fn prop_roundtrip(op in any::<Operation>()) {
             let byte = op.as_u8();
             let recovered = Operation::try_from(byte)
                 .expect("Valid operation must convert back from its byte");
@@ -325,14 +322,14 @@ mod tests {
         }
 
         #[test]
-        fn prop_inverse_for_valid_bytes(byte in OPERATION_MIN..=OPERATION_MAX) {
+        fn prop_inverse_roundtrip(byte in OPERATION_MIN..=OPERATION_MAX) {
             let op = Operation::try_from(byte)
                 .expect("Byte in valid range must convert");
             prop_assert_eq!(op.as_u8(), byte);
         }
 
         #[test]
-        fn prop_all_variants_have_unique_discriminants(
+        fn prop_unique_discriminants(
             v1 in any::<Operation>(),
             v2 in any::<Operation>()
         ) {
@@ -342,29 +339,27 @@ mod tests {
         }
 
         #[test]
-        fn prop_from_trait_matches_as_u8(op in any::<Operation>()) {
+        fn prop_into_u8(op in any::<Operation>()) {
             let byte: u8 = op.into();
             prop_assert_eq!(byte, op.as_u8());
         }
 
         #[test]
-        fn prop_is_valid_discriminant_consistent(byte: u8) {
+        fn prop_is_valid_discriminant(byte: u8) {
             let is_valid = Operation::is_valid_discriminant(byte);
             let try_from_result = Operation::try_from(byte);
             prop_assert_eq!(is_valid, try_from_result.is_ok());
         }
 
         #[test]
-        fn prop_as_u8_always_in_range(op in any::<Operation>()) {
+        fn prop_as_u8_range(op in any::<Operation>()) {
             let byte = op.as_u8();
             prop_assert!(byte >= OPERATION_MIN);
             prop_assert!(byte <= OPERATION_MAX);
         }
 
         #[test]
-        fn prop_client_request_invariant(op in any::<Operation>()) {
-            // If an operation is a valid client request,
-            // it must be client-facing and not deprecated
+        fn prop_client_request(op in any::<Operation>()) {
             if op.is_valid_client_request() {
                 prop_assert!(op.is_client_facing());
                 prop_assert!(!op.is_deprecated());
@@ -372,14 +367,8 @@ mod tests {
         }
     }
 
-    // ==========================================================================
-    // Unit Tests: Wire Protocol Stability
-    // ==========================================================================
-
     #[test]
-    fn discriminants_match_tb() {
-        // Tiger Style: split assertions (one per check)
-        // These values are part of the wire protocol and MUST NOT change
+    fn discriminants() {
         assert_eq!(VSR_OPERATIONS_RESERVED, 128);
 
         assert_eq!(Operation::Pulse as u8, 128);
@@ -402,17 +391,11 @@ mod tests {
         assert_eq!(Operation::QueryTransfersOp as u8, 145);
     }
 
-    // ==========================================================================
-    // Unit Tests: Conversion Correctness
-    // ==========================================================================
-
     #[test]
-    fn try_from_u8_roundtrip() {
-        // Tiger Style: bounded loop with explicit limits
+    fn try_from_roundtrip() {
         for v in OPERATION_MIN..=OPERATION_MAX {
             let op = Operation::try_from(v).expect("valid range should succeed");
 
-            // Paired assertions: roundtrip and range check
             assert_eq!(op as u8, v, "roundtrip failed for {}", v);
             assert!(
                 Operation::is_valid_discriminant(op as u8),
@@ -422,12 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn try_from_rejects_below_range() {
-        // Tiger Style: test boundary conditions explicitly
+    fn try_from_below_min() {
         for v in 0..OPERATION_MIN {
             let err = Operation::try_from(v).expect_err("below range should fail");
 
-            // Verify error contains correct value
             assert_eq!(err.0, v);
             assert!(err.is_below_range());
             assert!(!err.is_above_range());
@@ -435,8 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn try_from_rejects_above_range() {
-        // Test values above range up to u8::MAX
+    fn try_from_above_max() {
         for v in (OPERATION_MAX + 1)..=u8::MAX {
             let err = Operation::try_from(v).expect_err("above range should fail");
 
@@ -447,33 +427,26 @@ mod tests {
     }
 
     #[test]
-    fn boundary_values() {
-        // Tiger Style: explicit boundary testing
-
-        // Just below valid range
+    fn boundaries() {
         assert!(Operation::try_from(OPERATION_MIN - 1).is_err());
 
-        // First valid value
         assert!(Operation::try_from(OPERATION_MIN).is_ok());
         assert_eq!(
             Operation::try_from(OPERATION_MIN).unwrap(),
             Operation::Pulse
         );
 
-        // Last valid value
         assert!(Operation::try_from(OPERATION_MAX).is_ok());
         assert_eq!(
             Operation::try_from(OPERATION_MAX).unwrap(),
             Operation::QueryTransfersOp
         );
 
-        // Just above valid range
         assert!(Operation::try_from(OPERATION_MAX + 1).is_err());
     }
 
     #[test]
-    fn contiguous_discriminants() {
-        // Tiger Style: verify no gaps in discriminant range
+    fn contiguous() {
         let mut count = 0u8;
         for v in OPERATION_MIN..=OPERATION_MAX {
             assert!(
@@ -487,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn all_operations_array_matches_try_from() {
+    fn all_operations_array() {
         for (i, &op) in ALL_OPERATIONS.iter().enumerate() {
             let byte = OPERATION_MIN + i as u8;
             let expected = Operation::try_from(byte).unwrap();
@@ -499,13 +472,8 @@ mod tests {
         }
     }
 
-    // ==========================================================================
-    // Unit Tests: as_u8() Method
-    // ==========================================================================
-
     #[test]
-    fn as_u8_returns_correct_values() {
-        // Tiger Style: test all variants explicitly
+    fn as_u8_values() {
         assert_eq!(Operation::Pulse.as_u8(), 128);
         assert_eq!(Operation::DeprecatedCreateAccountsUnbatched.as_u8(), 129);
         assert_eq!(Operation::DeprecatedCreateTransfersUnbatched.as_u8(), 130);
@@ -533,24 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn as_u8_always_in_valid_range() {
-        // Tiger Style: verify postcondition for all operations
-        for op in ALL_OPERATIONS {
-            let byte = op.as_u8();
-            assert!(byte >= OPERATION_MIN);
-            assert!(byte <= OPERATION_MAX);
-        }
-    }
-
-    // ==========================================================================
-    // Unit Tests: is_deprecated() - Exhaustive Coverage
-    // ==========================================================================
-
-    #[test]
-    fn deprecated_operations_exhaustive() {
-        // Tiger Style: test ALL variants explicitly
-
-        // Deprecated operations (6 total)
+    fn deprecated() {
         assert!(Operation::DeprecatedCreateAccountsUnbatched.is_deprecated());
         assert!(Operation::DeprecatedCreateTransfersUnbatched.is_deprecated());
         assert!(Operation::DeprecatedLookupAccountsUnbatched.is_deprecated());
@@ -558,7 +509,6 @@ mod tests {
         assert!(Operation::DeprecatedGetAccountTransfersUnbatched.is_deprecated());
         assert!(Operation::DeprecatedGetAccountBalancesUnbatched.is_deprecated());
 
-        // Non-deprecated operations (12 total)
         assert!(!Operation::Pulse.is_deprecated());
         assert!(!Operation::CreateAccounts.is_deprecated());
         assert!(!Operation::CreateTransfers.is_deprecated());
@@ -574,21 +524,13 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_count_matches_expected() {
-        let deprecated_count = ALL_OPERATIONS
-            .iter()
-            .filter(|op| op.is_deprecated())
-            .count();
-        assert_eq!(deprecated_count, 6);
+    fn deprecated_count() {
+        let count = ALL_OPERATIONS.iter().filter(|op| op.is_deprecated()).count();
+        assert_eq!(count, 6);
     }
 
-    // ==========================================================================
-    // Unit Tests: is_client_facing() - Exhaustive Coverage
-    // ==========================================================================
-
     #[test]
-    fn client_facing_operations_exhaustive() {
-        // Client-facing ops (9 total)
+    fn client_facing() {
         assert!(Operation::CreateAccounts.is_client_facing());
         assert!(Operation::CreateTransfers.is_client_facing());
         assert!(Operation::LookupAccounts.is_client_facing());
@@ -599,7 +541,6 @@ mod tests {
         assert!(Operation::QueryTransfers.is_client_facing());
         assert!(Operation::GetChangeEvents.is_client_facing());
 
-        // Non-client-facing (9 total)
         assert!(!Operation::Pulse.is_client_facing());
         assert!(!Operation::DeprecatedCreateAccountsUnbatched.is_client_facing());
         assert!(!Operation::DeprecatedCreateTransfersUnbatched.is_client_facing());
@@ -612,21 +553,16 @@ mod tests {
     }
 
     #[test]
-    fn client_facing_count_matches_expected() {
-        let client_facing_count = ALL_OPERATIONS
+    fn client_facing_count() {
+        let count = ALL_OPERATIONS
             .iter()
             .filter(|op| op.is_client_facing())
             .count();
-        assert_eq!(client_facing_count, 9);
+        assert_eq!(count, 9);
     }
 
-    // ==========================================================================
-    // Unit Tests: is_valid_client_request() - Exhaustive Coverage
-    // ==========================================================================
-
     #[test]
-    fn valid_client_request_exhaustive() {
-        // Valid client requests: client-facing AND not deprecated (9 total)
+    fn valid_client_request() {
         assert!(Operation::CreateAccounts.is_valid_client_request());
         assert!(Operation::CreateTransfers.is_valid_client_request());
         assert!(Operation::LookupAccounts.is_valid_client_request());
@@ -637,7 +573,6 @@ mod tests {
         assert!(Operation::QueryTransfers.is_valid_client_request());
         assert!(Operation::GetChangeEvents.is_valid_client_request());
 
-        // NOT valid client requests (9 total)
         assert!(!Operation::Pulse.is_valid_client_request());
         assert!(!Operation::DeprecatedCreateAccountsUnbatched.is_valid_client_request());
         assert!(!Operation::DeprecatedCreateTransfersUnbatched.is_valid_client_request());
@@ -650,85 +585,49 @@ mod tests {
     }
 
     #[test]
-    fn valid_client_request_invariants() {
-        // Invariant: valid client requests must be client-facing and not deprecated
+    fn valid_client_request_count() {
+        let count = ALL_OPERATIONS
+            .iter()
+            .filter(|op| op.is_valid_client_request())
+            .count();
+        assert_eq!(count, 9);
+    }
+
+    #[test]
+    fn valid_client_request_definition() {
         for op in ALL_OPERATIONS {
-            if op.is_valid_client_request() {
-                assert!(
-                    op.is_client_facing(),
-                    "{:?} is valid client request but not client-facing",
-                    op
-                );
-                assert!(
-                    !op.is_deprecated(),
-                    "{:?} is valid client request but is deprecated",
-                    op
-                );
-            }
+            let expected = op.is_client_facing() && !op.is_deprecated();
+            assert_eq!(
+                op.is_valid_client_request(),
+                expected,
+                "{:?} validity mismatch",
+                op
+            );
         }
     }
 
     #[test]
-    fn valid_client_request_count_matches_expected() {
-        let valid_count = ALL_OPERATIONS
-            .iter()
-            .filter(|op| op.is_valid_client_request())
-            .count();
-        assert_eq!(valid_count, 9);
-    }
-
-    // ==========================================================================
-    // Unit Tests: is_valid_discriminant()
-    // ==========================================================================
-
-    #[test]
-    fn is_valid_discriminant_boundary_values() {
-        // Below range
+    fn is_valid_discriminant_boundaries() {
         assert!(!Operation::is_valid_discriminant(0));
         assert!(!Operation::is_valid_discriminant(127));
 
-        // Exact boundaries
         assert!(Operation::is_valid_discriminant(OPERATION_MIN));
         assert!(Operation::is_valid_discriminant(OPERATION_MAX));
 
-        // Above range
         assert!(!Operation::is_valid_discriminant(146));
         assert!(!Operation::is_valid_discriminant(255));
     }
 
     #[test]
-    fn is_valid_discriminant_matches_try_from() {
-        // Tiger Style: verify two ways of checking validity agree
-        for byte in 0..=255u8 {
-            let is_valid = Operation::is_valid_discriminant(byte);
-            let try_from_ok = Operation::try_from(byte).is_ok();
-            assert_eq!(
-                is_valid, try_from_ok,
-                "Mismatch at byte {}: is_valid={}, try_from.is_ok()={}",
-                byte, is_valid, try_from_ok
-            );
-        }
-    }
-
-    // ==========================================================================
-    // Unit Tests: Memory Layout
-    // ==========================================================================
-
-    #[test]
-    fn enum_size_and_alignment() {
-        // Tiger Style: verify wire format requirements
+    fn layout() {
         assert_eq!(core::mem::size_of::<Operation>(), 1);
         assert_eq!(core::mem::align_of::<Operation>(), 1);
         assert_eq!(core::mem::size_of::<Option<Operation>>(), 1);
     }
 
-    // ==========================================================================
-    // Unit Tests: Derived Traits
-    // ==========================================================================
-
     #[test]
     #[allow(clippy::clone_on_copy)]
-    fn clone_works() {
+    fn clone() {
         for op in ALL_OPERATIONS {
             let cloned = op.clone();
             assert_eq!(op, cloned);
@@ -736,58 +635,37 @@ mod tests {
     }
 
     #[test]
-    fn copy_works() {
+    fn copy() {
         let op = Operation::CreateAccounts;
         let copied = op; // Uses Copy
         assert_eq!(op, copied);
-        // Both should still be usable
         assert_eq!(op.as_u8(), copied.as_u8());
     }
 
     #[test]
-    fn debug_formatting() {
-        // Tiger Style: test Debug impl shows variant names
+    fn debug() {
         assert_eq!(format!("{:?}", Operation::Pulse), "Pulse");
         assert_eq!(format!("{:?}", Operation::CreateAccounts), "CreateAccounts");
-        assert_eq!(
-            format!("{:?}", Operation::DeprecatedCreateAccountsUnbatched),
-            "DeprecatedCreateAccountsUnbatched"
-        );
     }
 
     #[test]
-    fn equality_works() {
-        // Tiger Style: test both positive and negative cases
+    fn equality() {
         assert_eq!(Operation::Pulse, Operation::Pulse);
         assert_ne!(Operation::Pulse, Operation::CreateAccounts);
-
-        // Test roundtrip equality
-        for v in OPERATION_MIN..=OPERATION_MAX {
-            let op1 = Operation::try_from(v).unwrap();
-            let op2 = Operation::try_from(v).unwrap();
-            assert_eq!(op1, op2);
-        }
     }
 
     #[test]
-    fn hash_uniqueness() {
-        // Tiger Style: verify all operations hash to unique values in a set
+    fn hash() {
+        use std::collections::hash_map::DefaultHasher;
         use std::collections::HashSet;
-        let mut set = HashSet::new();
+        use std::hash::{Hash, Hasher};
 
+        let mut set = HashSet::new();
         for op in ALL_OPERATIONS {
             set.insert(op);
         }
-
         assert_eq!(set.len(), OPERATION_COUNT as usize);
-    }
 
-    #[test]
-    fn hash_deterministic() {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        // Same operation should hash to same value
         for op in ALL_OPERATIONS {
             let mut hasher1 = DefaultHasher::new();
             op.hash(&mut hasher1);
@@ -801,58 +679,22 @@ mod tests {
         }
     }
 
-    // ==========================================================================
-    // Unit Tests: Trait Implementations
-    // ==========================================================================
-
     #[test]
-    fn from_operation_for_u8_works() {
-        for op in ALL_OPERATIONS {
-            let byte: u8 = op.into();
-            assert_eq!(byte, op.as_u8());
-        }
-    }
-
-    #[test]
-    fn try_from_u8_for_operation_works() {
-        // Valid bytes
-        for byte in OPERATION_MIN..=OPERATION_MAX {
-            let result: Result<Operation, InvalidOperation> = byte.try_into();
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap().as_u8(), byte);
-        }
-
-        // Invalid bytes
-        let result: Result<Operation, InvalidOperation> = 127u8.try_into();
-        assert_eq!(result, Err(InvalidOperation(127)));
-
-        let result: Result<Operation, InvalidOperation> = 146u8.try_into();
-        assert_eq!(result, Err(InvalidOperation(146)));
-    }
-
-    // ==========================================================================
-    // Unit Tests: InvalidOperation Error Type
-    // ==========================================================================
-
-    #[test]
-    fn invalid_operation_value() {
+    fn error_value() {
         let err = InvalidOperation(42);
         assert_eq!(err.value(), 42);
     }
 
     #[test]
-    fn invalid_operation_range_checks() {
-        // Below range
+    fn error_range() {
         let below = InvalidOperation(100);
         assert!(below.is_below_range());
         assert!(!below.is_above_range());
 
-        // Above range
         let above = InvalidOperation(200);
         assert!(!above.is_below_range());
         assert!(above.is_above_range());
 
-        // Boundary cases
         let just_below = InvalidOperation(OPERATION_MIN - 1);
         assert!(just_below.is_below_range());
 
@@ -861,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_operation_display() {
+    fn error_display() {
         let err = InvalidOperation(127);
         let msg = format!("{}", err);
         assert!(msg.contains("127"));
@@ -870,12 +712,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_operation_is_error() {
-        // Verify Error trait is implemented
+    fn error_trait() {
         fn assert_is_error<T: std::error::Error>() {}
         assert_is_error::<InvalidOperation>();
 
-        // Test source() returns None (default implementation)
         use std::error::Error;
         let err = InvalidOperation(127);
         assert!(err.source().is_none());
@@ -883,26 +723,21 @@ mod tests {
 
     #[test]
     #[allow(clippy::clone_on_copy)]
-    fn invalid_operation_clone() {
+    fn error_clone() {
         let err1 = InvalidOperation(255);
         let err2 = err1.clone();
         assert_eq!(err1, err2);
     }
 
     #[test]
-    fn invalid_operation_debug() {
+    fn error_debug() {
         let err = InvalidOperation(99);
         let debug_str = format!("{:?}", err);
         assert!(debug_str.contains("99"));
     }
 
-    // ==========================================================================
-    // Fuzz Tests: Robustness Against Untrusted Input
-    // ==========================================================================
-
     #[test]
-    fn fuzz_try_from_never_panics() {
-        // Tiger Style: verify all u8 values handled gracefully
+    fn fuzz_try_from() {
         for byte in 0..=255u8 {
             let result = std::panic::catch_unwind(|| Operation::try_from(byte));
             assert!(
@@ -914,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_as_u8_never_panics() {
+    fn fuzz_as_u8() {
         for op in ALL_OPERATIONS {
             let result = std::panic::catch_unwind(|| op.as_u8());
             assert!(result.is_ok(), "{:?}.as_u8() panicked", op);
@@ -922,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_is_valid_discriminant_never_panics() {
+    fn fuzz_is_valid_discriminant() {
         for byte in 0..=255u8 {
             let result = std::panic::catch_unwind(|| Operation::is_valid_discriminant(byte));
             assert!(result.is_ok());
@@ -930,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_is_deprecated_never_panics() {
+    fn fuzz_is_deprecated() {
         for op in ALL_OPERATIONS {
             let result = std::panic::catch_unwind(|| op.is_deprecated());
             assert!(result.is_ok(), "{:?}.is_deprecated() panicked", op);
@@ -938,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_is_client_facing_never_panics() {
+    fn fuzz_is_client_facing() {
         for op in ALL_OPERATIONS {
             let result = std::panic::catch_unwind(|| op.is_client_facing());
             assert!(result.is_ok(), "{:?}.is_client_facing() panicked", op);
@@ -946,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_is_valid_client_request_never_panics() {
+    fn fuzz_is_valid_client_request() {
         for op in ALL_OPERATIONS {
             let result = std::panic::catch_unwind(|| op.is_valid_client_request());
             assert!(
