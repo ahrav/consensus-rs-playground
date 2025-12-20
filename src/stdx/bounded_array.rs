@@ -6,7 +6,8 @@
 //! # Design Constraints
 //!
 //! - `T: Copy` required: enables bitwise copies of `MaybeUninit<T>` without Drop concerns
-//! - Capacity `N` validated at compile time (must be in `1..=isize::MAX`)
+//! - Capacity `N` validated at compile time (must be in `1..=isize::MAX` and
+//!   `N * size_of::<T>() <= isize::MAX` for non-ZSTs)
 //! - Panics on capacity overflow rather than returning errors (fail-fast philosophy)
 //!
 //! # Invariant
@@ -15,9 +16,13 @@
 
 use core::{mem::MaybeUninit, slice};
 
-const fn assert_valid_capacity<const N: usize>() {
+const fn assert_valid_capacity<T, const N: usize>() {
     assert!(N > 0);
     assert!(N <= isize::MAX as usize);
+    let elem_size = core::mem::size_of::<T>();
+    if elem_size != 0 {
+        assert!(N <= (isize::MAX as usize) / elem_size);
+    }
 }
 
 /// Fixed-capacity array with tracked length, allocated on the stack.
@@ -31,7 +36,7 @@ pub struct BoundedArray<T: Copy, const N: usize> {
 }
 
 impl<T: Copy, const N: usize> BoundedArray<T, N> {
-    const CAPACITY_CHECK: () = assert_valid_capacity::<N>();
+    const CAPACITY_CHECK: () = assert_valid_capacity::<T, N>();
 
     #[inline]
     fn assert_invariants(&self) {
@@ -459,10 +464,16 @@ mod tests {
     };
 
     #[test]
+    #[should_panic]
+    fn capacity_check_rejects_len_overflow() {
+        const TOO_LARGE: usize = (isize::MAX as usize / 2) + 1;
+        assert_valid_capacity::<[u8; 2], TOO_LARGE>();
+    }
+
+    #[test]
     fn new_is_empty() {
         let arr: BoundedArray<u32, 10> = BoundedArray::new();
 
-        // Tiger Style: split assertions
         assert_eq!(arr.len(), 0);
         assert_eq!(arr.count(), 0);
         assert!(arr.is_empty());
@@ -730,7 +741,6 @@ mod tests {
 
     #[test]
     fn capacity_min() {
-        // Tiger Style: test edge case of minimum capacity
         let mut arr: BoundedArray<u32, 1> = BoundedArray::new();
 
         assert!(arr.is_empty());

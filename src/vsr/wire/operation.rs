@@ -223,7 +223,6 @@ impl TryFrom<u8> for Operation {
 
     #[inline]
     fn try_from(v: u8) -> Result<Self, Self::Error> {
-        // Tiger Style: early rejection with clear bounds check
         if !(OPERATION_MIN..=OPERATION_MAX).contains(&v) {
             return Err(InvalidOperation(v));
         }
