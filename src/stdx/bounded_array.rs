@@ -134,8 +134,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         );
         assert!(self.len <= N);
 
-        let value = unsafe { self.data[index].assume_init() };
-        value
+        unsafe { self.data[index].assume_init() }
     }
 
     #[inline]
@@ -672,8 +671,6 @@ mod tests {
         assert!(arr.is_empty());
     }
 
-    // ========== Additional test coverage ==========
-
     #[test]
     fn default_trait() {
         let arr: BoundedArray<u32, 10> = BoundedArray::default();
@@ -954,5 +951,311 @@ mod tests {
         assert_eq!(arr.len(), 1000);
         assert_eq!(arr.get(0), 0);
         assert_eq!(arr.get(999), 231); // 999 % 256 = 231
+    }
+
+    #[test]
+    fn iter_and_iter_mut() {
+        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
+        arr.extend_from_slice(&[1, 2, 3]);
+
+        // iter
+        let collected: Vec<&u32> = arr.iter().collect();
+        assert_eq!(collected, vec![&1, &2, &3]);
+
+        // iter_mut
+        for v in arr.iter_mut() {
+            *v *= 10;
+        }
+        assert_eq!(arr.const_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn ordering_and_hashing() {
+        use core::cmp::Ordering;
+        use core::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut a: BoundedArray<u32, 4> = BoundedArray::new();
+        a.extend_from_slice(&[1, 2, 3]);
+
+        let mut b: BoundedArray<u32, 4> = BoundedArray::new();
+        b.extend_from_slice(&[1, 2, 3]);
+
+        // Ordering
+        assert_eq!(a.cmp(&b), Ordering::Equal);
+        b.push(4);
+        assert_eq!(a.cmp(&b), Ordering::Less); // [1,2,3] < [1,2,3,4]
+
+        // Hashing
+        let mut hasher_a = DefaultHasher::new();
+        a.hash(&mut hasher_a);
+
+        let mut c: BoundedArray<u32, 4> = BoundedArray::new();
+        c.extend_from_slice(&[1, 2, 3]);
+        let mut hasher_c = DefaultHasher::new();
+        c.hash(&mut hasher_c);
+
+        assert_eq!(hasher_a.finish(), hasher_c.finish());
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    const TEST_CAPACITY: usize = 64;
+
+    proptest! {
+        /// Property: push increases len by 1 until capacity
+        #[test]
+        fn push_increments_len(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for (i, &v) in values.iter().enumerate() {
+                prop_assert_eq!(arr.len(), i);
+                arr.push(v);
+                prop_assert_eq!(arr.len(), i + 1);
+            }
+        }
+
+        /// Property: pop decrements len by 1 and returns LIFO order
+        #[test]
+        fn pop_decrements_len_lifo(values in prop::collection::vec(any::<u32>(), 1..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for &v in &values {
+                arr.push(v);
+            }
+
+            for i in (0..values.len()).rev() {
+                prop_assert_eq!(arr.len(), i + 1);
+                let popped = arr.pop();
+                prop_assert_eq!(popped, Some(values[i]));
+                prop_assert_eq!(arr.len(), i);
+            }
+
+            prop_assert!(arr.is_empty());
+            prop_assert_eq!(arr.pop(), None);
+        }
+
+        /// Property: const_slice returns exactly the pushed values in order
+        #[test]
+        fn const_slice_matches_pushed_values(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for &v in &values {
+                arr.push(v);
+            }
+
+            prop_assert_eq!(arr.const_slice(), values.as_slice());
+        }
+
+        /// Property: get(i) returns the i-th pushed value
+        #[test]
+        fn get_returns_correct_value(values in prop::collection::vec(any::<u32>(), 1..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for &v in &values {
+                arr.push(v);
+            }
+
+            for (i, &expected) in values.iter().enumerate() {
+                prop_assert_eq!(arr.get(i), expected);
+                prop_assert_eq!(arr[i], expected);
+                prop_assert_eq!(arr.try_get(i), Some(&expected));
+            }
+        }
+
+        /// Property: remaining_capacity + len == capacity
+        #[test]
+        fn remaining_capacity_invariant(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for &v in &values {
+                arr.push(v);
+                prop_assert_eq!(arr.len() + arr.remaining_capacity(), TEST_CAPACITY);
+            }
+        }
+
+        /// Property: extend_from_slice equivalent to multiple pushes
+        #[test]
+        fn extend_equivalent_to_push(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr1: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            let mut arr2: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            // Method 1: push each value
+            for &v in &values {
+                arr1.push(v);
+            }
+
+            // Method 2: extend_from_slice
+            arr2.extend_from_slice(&values);
+
+            prop_assert_eq!(arr1, arr2);
+        }
+
+        /// Property: truncate preserves prefix
+        #[test]
+        fn truncate_preserves_prefix(
+            values in prop::collection::vec(any::<u32>(), 1..TEST_CAPACITY),
+            truncate_to in 0..TEST_CAPACITY
+        ) {
+            let truncate_to = truncate_to.min(values.len());
+
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            arr.truncate(truncate_to);
+
+            prop_assert_eq!(arr.len(), truncate_to);
+            prop_assert_eq!(arr.const_slice(), &values[..truncate_to]);
+        }
+
+        /// Property: set modifies only the target index
+        #[test]
+        fn set_modifies_only_target(
+            values in prop::collection::vec(any::<u32>(), 1..TEST_CAPACITY),
+            new_value: u32
+        ) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            let target_idx = values.len() / 2;
+            arr.set(target_idx, new_value);
+
+            for (i, &expected) in values.iter().enumerate() {
+                if i == target_idx {
+                    prop_assert_eq!(arr.get(i), new_value);
+                } else {
+                    prop_assert_eq!(arr.get(i), expected);
+                }
+            }
+        }
+
+        /// Property: swap exchanges exactly two elements
+        #[test]
+        fn swap_exchanges_elements(
+            values in prop::collection::vec(any::<u32>(), 2..TEST_CAPACITY)
+        ) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            let a = 0;
+            let b = values.len() - 1;
+            let val_a = arr.get(a);
+            let val_b = arr.get(b);
+
+            arr.swap(a, b);
+
+            prop_assert_eq!(arr.get(a), val_b);
+            prop_assert_eq!(arr.get(b), val_a);
+
+            // Other elements unchanged
+            for (i, &expected) in values.iter().enumerate().take(values.len() - 1).skip(1) {
+                prop_assert_eq!(arr.get(i), expected);
+            }
+        }
+
+        /// Property: from_value creates array with all same values
+        #[test]
+        fn from_value_all_same(value: u32, count in 0..TEST_CAPACITY) {
+            let arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::from_value(value, count);
+
+            prop_assert_eq!(arr.len(), count);
+            for i in 0..count {
+                prop_assert_eq!(arr.get(i), value);
+            }
+        }
+
+        /// Property: iterator yields same values as const_slice
+        #[test]
+        fn iterator_matches_slice(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            let slice_values: Vec<u32> = arr.const_slice().to_vec();
+            let iter_values: Vec<u32> = arr.into_iter().collect();
+
+            prop_assert_eq!(slice_values, iter_values);
+        }
+
+        /// Property: clear resets to empty state
+        #[test]
+        fn clear_resets_state(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            arr.clear();
+
+            prop_assert!(arr.is_empty());
+            prop_assert_eq!(arr.len(), 0);
+            prop_assert_eq!(arr.remaining_capacity(), TEST_CAPACITY);
+        }
+
+        /// Property: first/last return correct values
+        #[test]
+        fn first_last_correct(values in prop::collection::vec(any::<u32>(), 1..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            prop_assert_eq!(arr.first(), Some(values[0]));
+            prop_assert_eq!(arr.last(), Some(values[values.len() - 1]));
+        }
+
+        /// Property: try_push succeeds until full, then fails
+        #[test]
+        fn try_push_behavior(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY + 10)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+
+            for (i, &v) in values.iter().enumerate() {
+                let result = arr.try_push(v);
+                if i < TEST_CAPACITY {
+                    prop_assert!(result.is_ok());
+                } else {
+                    prop_assert_eq!(result, Err(v));
+                }
+            }
+        }
+
+        /// Property: equality is reflexive
+        #[test]
+        fn equality_reflexive(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            prop_assert_eq!(arr, arr);
+        }
+
+        /// Property: copy produces equal but independent arrays
+        #[test]
+        fn copy_produces_equal_independent(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {
+            let mut arr1: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr1.extend_from_slice(&values);
+
+            let arr2 = arr1;
+
+            prop_assert_eq!(arr1, arr2);
+            prop_assert_eq!(arr1.const_slice(), arr2.const_slice());
+        }
+
+        /// Property: mutable slice modifications are visible via get
+        #[test]
+        fn mutable_slice_modifications_visible(
+            values in prop::collection::vec(1u32..1000, 1..TEST_CAPACITY)
+        ) {
+            let mut arr: BoundedArray<u32, TEST_CAPACITY> = BoundedArray::new();
+            arr.extend_from_slice(&values);
+
+            // Double each value via mutable slice
+            for v in arr.slice().iter_mut() {
+                *v *= 2;
+            }
+
+            // Verify via get
+            for (i, &original) in values.iter().enumerate() {
+                prop_assert_eq!(arr.get(i), original * 2);
+            }
+        }
     }
 }
