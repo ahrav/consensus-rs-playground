@@ -38,13 +38,16 @@ const _: () = assert!(HEADER_SIZE > CHECKSUM_SIZE);
 /// Not currently used; reserved for future protocol evolution.
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub struct Release {
-    pub value: u32,
-}
+pub struct Release(pub u32);
 
 impl Release {
     /// Zero release indicates no specific version requirement.
-    pub const ZERO: Release = Release { value: 0 };
+    pub const ZERO: Release = Release(0);
+
+    #[inline]
+    pub const fn value(self) -> u32 {
+        self.0
+    }
 }
 
 /// Fixed-size 256-byte header prepended to every VSR message.
@@ -111,7 +114,7 @@ impl core::fmt::Debug for Header {
             .field("size", &self.size)
             .field("epoch", &self.epoch)
             .field("view", &self.view)
-            .field("release", &self.release.value)
+            .field("release", &self.release.value())
             .field("protocol", &self.protocol)
             .field("command", &self.command)
             .field("replica", &self.replica)
@@ -552,7 +555,7 @@ mod tests {
             ("size", |h| h.size ^= 1),
             ("epoch", |h| h.epoch ^= 1),
             ("view", |h| h.view ^= 1),
-            ("release", |h| h.release.value ^= 1),
+            ("release", |h| h.release.0 ^= 1),
             ("protocol", |h| h.protocol ^= 1),
             ("replica", |h| h.replica ^= 1),
             ("reserved_frame", |h| h.reserved_frame[0] ^= 1),
@@ -798,16 +801,12 @@ mod tests {
 
     #[test]
     fn release_zero_constant() {
-        assert_eq!(Release::ZERO.value, 0);
+        assert_eq!(Release::ZERO.value(), 0);
     }
 
     #[test]
     fn release_round_trip() {
-        let releases = [
-            Release { value: 0 },
-            Release { value: 1 },
-            Release { value: u32::MAX },
-        ];
+        let releases = [Release(0), Release(1), Release(u32::MAX)];
 
         for release in releases {
             let mut h = Header::new(Command::Ping, 1, 0);
