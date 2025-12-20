@@ -1,8 +1,15 @@
+//! Low-level byte manipulation and alignment utilities.
+
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 use core::slice;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 
+/// Reinterprets a reference as a byte slice, including padding.
+///
+/// # Panics
+///
+/// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
 #[inline]
 pub fn as_bytes<T: Sized>(v: &T) -> &[u8] {
     const { assert!(size_of::<T>() > 0) };
@@ -21,6 +28,11 @@ pub fn as_bytes<T: Sized>(v: &T) -> &[u8] {
     result
 }
 
+/// Mutable version of [`as_bytes`].
+///
+/// # Panics
+///
+/// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
 #[inline]
 pub fn as_bytes_mut<T: Sized>(v: &mut T) -> &mut [u8] {
     const { assert!(size_of::<T>() > 0) };
@@ -39,6 +51,13 @@ pub fn as_bytes_mut<T: Sized>(v: &mut T) -> &mut [u8] {
     result
 }
 
+/// Compares two values byte-for-byte, including padding.
+///
+/// This checks for exact memory equality, unlike `PartialEq`.
+///
+/// # Panics
+///
+/// Panics if `a` and `b` overlap partially.
 #[inline]
 pub fn equal_bytes<T: Sized>(a: &T, b: &T) -> bool {
     let a_addr = a as *const T as usize;
@@ -57,6 +76,11 @@ pub fn equal_bytes<T: Sized>(a: &T, b: &T) -> bool {
     result
 }
 
+/// Rounds `value` up to the next multiple of `alignment`.
+///
+/// # Panics
+///
+/// Panics if `alignment` is not a power of two or if the result overflows.
 #[inline]
 pub fn align_up(value: usize, alignment: usize) -> usize {
     assert!(alignment > 0);
@@ -80,6 +104,7 @@ pub fn align_up(value: usize, alignment: usize) -> usize {
     result
 }
 
+/// Heap-allocated, zero-initialized value with guaranteed alignment.
 pub struct AlignedBox<T> {
     ptr: NonNull<T>,
     layout: Layout,
@@ -91,6 +116,11 @@ const _: () = {
 };
 
 impl<T> AlignedBox<T> {
+    /// Allocates a zero-initialized `T` on the heap.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `T` is a ZST, too large, or if allocation fails.
     pub fn new_zeroed() -> Self {
         const { assert!(size_of::<T>() > 0) };
 
@@ -109,6 +139,7 @@ impl<T> AlignedBox<T> {
         Self { ptr, layout }
     }
 
+    /// Returns a raw pointer to the allocated value.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         let ptr = self.ptr.as_ptr();
@@ -116,6 +147,7 @@ impl<T> AlignedBox<T> {
         ptr
     }
 
+    /// Returns a mutable raw pointer to the allocated value.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         let ptr = self.ptr.as_ptr();
@@ -123,6 +155,7 @@ impl<T> AlignedBox<T> {
         ptr
     }
 
+    /// Returns the memory layout used for this allocation.
     #[inline]
     pub fn layout(&self) -> Layout {
         self.layout
@@ -161,6 +194,9 @@ impl<T> core::ops::Drop for AlignedBox<T> {
     }
 }
 
+// SAFETY: AlignedBox owns its data exclusively and behaves like Box<T>.
+// Send/Sync bounds follow the same rules as Box: if T can be sent/shared
+// across threads, so can AlignedBox<T>.
 unsafe impl<T: Send> Send for AlignedBox<T> {}
 unsafe impl<T: Sync> Sync for AlignedBox<T> {}
 
@@ -169,7 +205,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_align_up_basic() {
+    fn test_align_up() {
         assert_eq!(align_up(0, 4), 0);
         assert_eq!(align_up(1, 4), 4);
         assert_eq!(align_up(4, 4), 4);
@@ -177,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up_powers_of_two() {
+    fn test_align_up_pow2() {
         for power in 0..16 {
             let alignment = 1usize << power;
             // Already aligned values stay unchanged
@@ -191,45 +227,45 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_align_up_non_power_of_two() {
+    fn test_align_up_panic_non_pow2() {
         align_up(10, 3);
     }
 
     #[test]
     #[should_panic]
-    fn test_align_up_zero_alignment() {
+    fn test_align_up_panic_zero() {
         align_up(10, 0);
     }
 
     #[test]
     #[should_panic]
-    fn test_align_up_overflow() {
+    fn test_align_up_panic_overflow() {
         align_up(usize::MAX, 2);
     }
 
     #[test]
     #[should_panic]
-    fn test_align_up_alignment_too_large() {
+    fn test_align_up_panic_large_align() {
         let alignment = 1usize << (usize::BITS - 1);
         align_up(0, alignment);
     }
 
     #[test]
-    fn test_aligned_box_basic() {
+    fn test_aligned_box() {
         let boxed: AlignedBox<u64> = AlignedBox::new_zeroed();
         assert_eq!(*boxed, 0u64);
         assert!((boxed.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
     }
 
     #[test]
-    fn test_aligned_box_mutate() {
+    fn test_aligned_box_mut() {
         let mut boxed: AlignedBox<u64> = AlignedBox::new_zeroed();
         *boxed = 42;
         assert_eq!(*boxed, 42);
     }
 
     #[test]
-    fn test_as_bytes_roundtrip() {
+    fn test_as_bytes() {
         let value: u32 = 0xDEADBEEF;
         let bytes = as_bytes(&value);
         assert_eq!(bytes.len(), 4);
@@ -271,7 +307,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_align_up_near_overflow() {
+    fn test_align_up_panic_near_max() {
         // usize::MAX is ...1111
         // align 4 mask is ...1100
         // max_alignable is ...1100
@@ -280,12 +316,15 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up_max_alignable_boundary() {
+    fn test_align_up_max() {
         let alignment = 8usize;
         let max_alignable = usize::MAX & !(alignment - 1);
 
         assert_eq!(align_up(max_alignable, alignment), max_alignable);
-        assert_eq!(align_up(max_alignable - (alignment - 1), alignment), max_alignable);
+        assert_eq!(
+            align_up(max_alignable - (alignment - 1), alignment),
+            max_alignable
+        );
     }
 
     #[test]
@@ -325,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_box_drops() {
+    fn test_aligned_box_drop() {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -348,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn test_as_bytes_mut_modification() {
+    fn test_as_bytes_mut() {
         let mut value: u32 = 0;
         let bytes = as_bytes_mut(&mut value);
 
@@ -359,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_as_bytes_high_alignment() {
+    fn test_as_bytes_aligned() {
         #[repr(C, align(64))]
         struct CacheAligned {
             value: u64,
@@ -378,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_box_high_alignment() {
+    fn test_aligned_box_aligned() {
         #[repr(C, align(128))]
         struct HighlyAligned {
             data: [u8; 64],
@@ -390,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn test_equal_bytes_different_addresses_same_value() {
+    fn test_equal_bytes_distinct() {
         let a: u64 = 0xDEADBEEFCAFEBABE;
         let b: u64 = 0xDEADBEEFCAFEBABE;
 
@@ -402,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_up_boundary_values() {
+    fn test_align_up_boundaries() {
         // Test alignment of 1 (no-op)
         assert_eq!(align_up(0, 1), 0);
         assert_eq!(align_up(1, 1), 1);
@@ -418,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn test_aligned_box_layout_matches_type() {
+    fn test_aligned_box_layout() {
         let boxed: AlignedBox<u128> = AlignedBox::new_zeroed();
         let layout = boxed.layout();
 
