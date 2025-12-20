@@ -593,6 +593,18 @@ mod tests {
     }
 
     #[test]
+    fn truncate_then_extend_overwrites_tail() {
+        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
+        arr.extend_from_slice(&[1, 2, 3, 4]);
+
+        arr.truncate(2);
+        arr.extend_from_slice(&[9, 8]);
+
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.const_slice(), &[1, 2, 9, 8]);
+    }
+
+    #[test]
     #[should_panic(expected = "truncate length exceeds current len")]
     fn truncate_out_of_bounds() {
         let mut arr: BoundedArray<u32, 10> = BoundedArray::new();
@@ -648,6 +660,21 @@ mod tests {
         assert!(arr.try_push(1).is_ok());
         assert!(arr.try_push(2).is_ok());
         assert_eq!(arr.try_push(3), Err(3)); // Full, returns value back
+    }
+
+    #[test]
+    fn try_push_err_does_not_mutate() {
+        let mut arr: BoundedArray<u32, 2> = BoundedArray::new();
+        arr.push(1);
+        arr.push(2);
+
+        let before = arr.const_slice().to_vec();
+        let len_before = arr.len();
+
+        assert_eq!(arr.try_push(3), Err(3));
+        assert_eq!(arr.len(), len_before);
+        assert_eq!(arr.remaining_capacity(), 0);
+        assert_eq!(arr.const_slice(), before.as_slice());
     }
 
     #[test]
@@ -753,6 +780,14 @@ mod tests {
 
         assert_eq!(arr.get(1), 200);
         assert_eq!(arr.const_slice(), &[10, 200, 30]);
+    }
+
+    #[test]
+    #[should_panic(expected = "index out of bounds")]
+    fn get_mut_out_of_bounds() {
+        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
+        arr.push(1);
+        let _ = arr.get_mut(1); // Should panic
     }
 
     #[test]
@@ -908,6 +943,17 @@ mod tests {
         arr.push(3);
         assert!(arr.is_full());
         assert_eq!(arr.const_slice(), &[1, 3]);
+    }
+
+    #[test]
+    fn pop_updates_len_and_slice() {
+        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
+        arr.extend_from_slice(&[1, 2, 3]);
+
+        assert_eq!(arr.pop(), Some(3));
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.remaining_capacity(), 2);
+        assert_eq!(arr.const_slice(), &[1, 2]);
     }
 
     #[test]
