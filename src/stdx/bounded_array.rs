@@ -973,6 +973,22 @@ mod tests {
 
         assert_eq!(hasher_a.finish(), hasher_c.finish());
     }
+
+    #[test]
+    fn truncate_noop() {
+        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
+        arr.push(1);
+
+        // Truncate to same length -> no-op
+        arr.truncate(1);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.const_slice(), &[1]);
+
+        // Truncate empty -> no-op
+        arr.clear();
+        arr.truncate(0);
+        assert!(arr.is_empty());
+    }
 }
 
 #[cfg(test)]
