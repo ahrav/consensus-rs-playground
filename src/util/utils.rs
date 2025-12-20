@@ -5,13 +5,63 @@ use core::ptr::NonNull;
 use core::slice;
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 
-/// Reinterprets a reference as a byte slice, including padding.
+/// # Safety
+///
+/// Implementers guarantee the type has no padding bytes and all bytes are
+/// initialized for any valid value.
+pub unsafe trait Pod: Copy {}
+
+/// # Safety
+///
+/// Implementers guarantee the all-zero byte pattern is a valid value.
+pub unsafe trait Zeroable {}
+
+unsafe impl Pod for bool {}
+unsafe impl Pod for u8 {}
+unsafe impl Pod for u16 {}
+unsafe impl Pod for u32 {}
+unsafe impl Pod for u64 {}
+unsafe impl Pod for u128 {}
+unsafe impl Pod for usize {}
+unsafe impl Pod for i8 {}
+unsafe impl Pod for i16 {}
+unsafe impl Pod for i32 {}
+unsafe impl Pod for i64 {}
+unsafe impl Pod for i128 {}
+unsafe impl Pod for isize {}
+unsafe impl Pod for f32 {}
+unsafe impl Pod for f64 {}
+unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
+
+unsafe impl Zeroable for bool {}
+unsafe impl Zeroable for u8 {}
+unsafe impl Zeroable for u16 {}
+unsafe impl Zeroable for u32 {}
+unsafe impl Zeroable for u64 {}
+unsafe impl Zeroable for u128 {}
+unsafe impl Zeroable for usize {}
+unsafe impl Zeroable for i8 {}
+unsafe impl Zeroable for i16 {}
+unsafe impl Zeroable for i32 {}
+unsafe impl Zeroable for i64 {}
+unsafe impl Zeroable for i128 {}
+unsafe impl Zeroable for isize {}
+unsafe impl Zeroable for f32 {}
+unsafe impl Zeroable for f64 {}
+unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
+
+/// Reinterprets a `Pod` reference as a byte slice.
+///
+/// # Safety
+///
+/// `T` must be `Pod`, and callers must not mutate `v` through other means while
+/// the returned slice is alive.
 ///
 /// # Panics
 ///
 /// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
 #[inline]
-pub fn as_bytes<T: Sized>(v: &T) -> &[u8] {
+pub unsafe fn as_bytes<T: Pod>(v: &T) -> &[u8] {
     const { assert!(size_of::<T>() > 0) };
     assert!(size_of::<T>() <= isize::MAX as usize);
 
@@ -30,11 +80,16 @@ pub fn as_bytes<T: Sized>(v: &T) -> &[u8] {
 
 /// Mutable version of [`as_bytes`].
 ///
+/// # Safety
+///
+/// `T` must be `Pod`, and any writes through the returned slice must leave `v`
+/// in a valid state.
+///
 /// # Panics
 ///
 /// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
 #[inline]
-pub fn as_bytes_mut<T: Sized>(v: &mut T) -> &mut [u8] {
+pub unsafe fn as_bytes_mut<T: Pod>(v: &mut T) -> &mut [u8] {
     const { assert!(size_of::<T>() > 0) };
     assert!(size_of::<T>() <= isize::MAX as usize);
 
@@ -51,15 +106,19 @@ pub fn as_bytes_mut<T: Sized>(v: &mut T) -> &mut [u8] {
     result
 }
 
-/// Compares two values byte-for-byte, including padding.
+/// Compares two `Pod` values byte-for-byte.
 ///
 /// This checks for exact memory equality, unlike `PartialEq`.
+///
+/// # Safety
+///
+/// `T` must be `Pod`, and `a`/`b` must not partially overlap.
 ///
 /// # Panics
 ///
 /// Panics if `a` and `b` overlap partially.
 #[inline]
-pub fn equal_bytes<T: Sized>(a: &T, b: &T) -> bool {
+pub unsafe fn equal_bytes<T: Pod>(a: &T, b: &T) -> bool {
     let a_addr = a as *const T as usize;
     let b_addr = b as *const T as usize;
     let size = size_of::<T>();
@@ -68,7 +127,8 @@ pub fn equal_bytes<T: Sized>(a: &T, b: &T) -> bool {
     let identical = a_addr == b_addr;
     assert!(disjoint || identical);
 
-    let result = as_bytes(a) == as_bytes(b);
+    // SAFETY: Caller guarantees `T` is Pod; overlap is checked above.
+    let result = unsafe { as_bytes(a) } == unsafe { as_bytes(b) };
     if identical {
         assert!(result);
     }
@@ -118,10 +178,17 @@ const _: () = {
 impl<T> AlignedBox<T> {
     /// Allocates a zero-initialized `T` on the heap.
     ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the all-zero byte pattern is a valid `T`.
+    ///
     /// # Panics
     ///
     /// Panics if `T` is a ZST, too large, or if allocation fails.
-    pub fn new_zeroed() -> Self {
+    pub unsafe fn new_zeroed() -> Self
+    where
+        T: Zeroable,
+    {
         const { assert!(size_of::<T>() > 0) };
 
         assert!(size_of::<T>() <= isize::MAX as usize);
@@ -252,14 +319,14 @@ mod tests {
 
     #[test]
     fn test_aligned_box() {
-        let boxed: AlignedBox<u64> = AlignedBox::new_zeroed();
+        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed() };
         assert_eq!(*boxed, 0u64);
         assert!((boxed.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
     }
 
     #[test]
     fn test_aligned_box_mut() {
-        let mut boxed: AlignedBox<u64> = AlignedBox::new_zeroed();
+        let mut boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed() };
         *boxed = 42;
         assert_eq!(*boxed, 42);
     }
@@ -267,7 +334,7 @@ mod tests {
     #[test]
     fn test_as_bytes() {
         let value: u32 = 0xDEADBEEF;
-        let bytes = as_bytes(&value);
+        let bytes = unsafe { as_bytes(&value) };
         assert_eq!(bytes.len(), 4);
 
         // Verify we can read the bytes back
@@ -281,20 +348,25 @@ mod tests {
         let b: u64 = 12345;
         let c: u64 = 54321;
 
-        assert!(equal_bytes(&a, &b));
-        assert!(!equal_bytes(&a, &c));
-        assert!(equal_bytes(&a, &a)); // Same address
+        unsafe {
+            assert!(equal_bytes(&a, &b));
+            assert!(!equal_bytes(&a, &c));
+            assert!(equal_bytes(&a, &a)); // Same address
+        }
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct TestStruct {
         a: u32,
         b: u32,
     }
 
+    unsafe impl Zeroable for TestStruct {}
+
     #[test]
     fn test_aligned_box_struct() {
-        let mut boxed: AlignedBox<TestStruct> = AlignedBox::new_zeroed();
+        let mut boxed: AlignedBox<TestStruct> = unsafe { AlignedBox::new_zeroed() };
         assert_eq!(boxed.a, 0);
         assert_eq!(boxed.b, 0);
 
@@ -328,39 +400,42 @@ mod tests {
     }
 
     #[test]
-    fn test_equal_bytes_padding() {
-        #[repr(C, align(8))]
-        #[derive(Clone, Copy)]
+    fn test_equal_bytes_explicit_padding() {
+        #[repr(C)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         struct Padded {
             a: u8,
-            // 7 bytes padding implied here to align `b` to 8
+            padding: [u8; 7],
             b: u64,
         }
 
-        // Ensure we actually have padding
-        assert!(size_of::<Padded>() > size_of::<u8>() + size_of::<u64>());
+        unsafe impl Pod for Padded {}
 
-        let mut x = Padded { a: 1, b: 2 };
-        let mut y = Padded { a: 1, b: 2 };
+        assert_eq!(size_of::<Padded>(), 16);
 
-        // We can't easily safely write to padding in safe Rust,
-        // but let's try to dirty the stack or use unsafe to prove the point.
+        let x = Padded {
+            a: 1,
+            padding: [0xAA; 7],
+            b: 2,
+        };
+        let y = Padded {
+            a: 1,
+            padding: [0xAA; 7],
+            b: 2,
+        };
+        let z = Padded {
+            a: 1,
+            padding: [0x00; 7],
+            b: 2,
+        };
+
+        assert_eq!(x, y);
+        assert_ne!(x, z);
+
         unsafe {
-            // Write non-zero to x's padding
-            let ptr = &mut x as *mut Padded as *mut u8;
-            ptr.add(1).write_bytes(0xAA, 7);
-
-            // Write zero to y's padding
-            let ptr = &mut y as *mut Padded as *mut u8;
-            ptr.add(1).write_bytes(0x00, 7);
+            assert!(equal_bytes(&x, &y));
+            assert!(!equal_bytes(&x, &z));
         }
-
-        // Semantically equal
-        assert_eq!(x.a, y.a);
-        assert_eq!(x.b, y.b);
-
-        // Bytes are not equal
-        assert!(!equal_bytes(&x, &y));
     }
 
     #[test]
@@ -378,8 +453,10 @@ mod tests {
             }
         }
 
+        unsafe impl Zeroable for Dropper {}
+
         {
-            let _boxed: AlignedBox<Dropper> = AlignedBox::new_zeroed();
+            let _boxed: AlignedBox<Dropper> = unsafe { AlignedBox::new_zeroed() };
         }
 
         // Expect 1 because AlignedBox now calls drop_in_place
@@ -389,7 +466,7 @@ mod tests {
     #[test]
     fn test_as_bytes_mut() {
         let mut value: u32 = 0;
-        let bytes = as_bytes_mut(&mut value);
+        let bytes = unsafe { as_bytes_mut(&mut value) };
 
         // Write bytes in native endian
         bytes.copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
@@ -400,14 +477,21 @@ mod tests {
     #[test]
     fn test_as_bytes_aligned() {
         #[repr(C, align(64))]
+        #[derive(Clone, Copy)]
         struct CacheAligned {
             value: u64,
+            padding: [u8; 56],
         }
 
-        let val = CacheAligned { value: 42 };
-        let bytes = as_bytes(&val);
+        unsafe impl Pod for CacheAligned {}
 
-        // Size includes padding to alignment
+        let val = CacheAligned {
+            value: 42,
+            padding: [0u8; 56],
+        };
+        let bytes = unsafe { as_bytes(&val) };
+
+        // Size includes explicit padding to alignment.
         assert_eq!(bytes.len(), size_of::<CacheAligned>());
         assert!((bytes.as_ptr() as usize).is_multiple_of(64));
 
@@ -423,7 +507,9 @@ mod tests {
             data: [u8; 64],
         }
 
-        let boxed: AlignedBox<HighlyAligned> = AlignedBox::new_zeroed();
+        unsafe impl Zeroable for HighlyAligned {}
+
+        let boxed: AlignedBox<HighlyAligned> = unsafe { AlignedBox::new_zeroed() };
         assert!((boxed.as_ptr() as usize).is_multiple_of(128));
         assert_eq!(boxed.data, [0u8; 64]);
     }
@@ -437,7 +523,9 @@ mod tests {
         assert_ne!(&a as *const u64, &b as *const u64);
 
         // But byte-wise equal
-        assert!(equal_bytes(&a, &b));
+        unsafe {
+            assert!(equal_bytes(&a, &b));
+        }
     }
 
     #[test]
@@ -458,7 +546,7 @@ mod tests {
 
     #[test]
     fn test_aligned_box_layout() {
-        let boxed: AlignedBox<u128> = AlignedBox::new_zeroed();
+        let boxed: AlignedBox<u128> = unsafe { AlignedBox::new_zeroed() };
         let layout = boxed.layout();
 
         assert_eq!(layout.size(), size_of::<u128>());
@@ -498,14 +586,14 @@ mod proptests {
 
         #[test]
         fn prop_as_bytes_roundtrip_u64(value: u64) {
-            let bytes = as_bytes(&value);
+            let bytes = unsafe { as_bytes(&value) };
             let restored = u64::from_ne_bytes(bytes.try_into().unwrap());
             prop_assert_eq!(value, restored);
         }
 
         #[test]
         fn prop_as_bytes_roundtrip_u128(value: u128) {
-            let bytes = as_bytes(&value);
+            let bytes = unsafe { as_bytes(&value) };
             let restored = u128::from_ne_bytes(bytes.try_into().unwrap());
             prop_assert_eq!(value, restored);
         }
@@ -513,32 +601,36 @@ mod proptests {
         #[test]
         fn prop_as_bytes_mut_roundtrip(value: u64) {
             let mut v = value;
-            let bytes = as_bytes_mut(&mut v);
+            let bytes = unsafe { as_bytes_mut(&mut v) };
             let restored = u64::from_ne_bytes(bytes.try_into().unwrap());
             prop_assert_eq!(value, restored);
         }
 
         #[test]
         fn prop_equal_bytes_reflexive(value: u64) {
-            prop_assert!(equal_bytes(&value, &value));
+            let result = unsafe { equal_bytes(&value, &value) };
+            prop_assert!(result);
         }
 
         #[test]
         fn prop_equal_bytes_symmetric(a: u64, b: u64) {
-            prop_assert_eq!(equal_bytes(&a, &b), equal_bytes(&b, &a));
+            let ab = unsafe { equal_bytes(&a, &b) };
+            let ba = unsafe { equal_bytes(&b, &a) };
+            prop_assert_eq!(ab, ba);
         }
 
         #[test]
         fn prop_equal_bytes_consistent_with_eq(a: u64, b: u64) {
             // For types without padding, equal_bytes should match ==
-            prop_assert_eq!(equal_bytes(&a, &b), a == b);
+            let ab = unsafe { equal_bytes(&a, &b) };
+            prop_assert_eq!(ab, a == b);
         }
 
         #[test]
         fn prop_aligned_box_zeroed(value in any::<[u8; 32]>()) {
             // Ignore input, just verify zeroing works for various runs
             let _ = value;
-            let boxed: AlignedBox<[u64; 4]> = AlignedBox::new_zeroed();
+            let boxed: AlignedBox<[u64; 4]> = unsafe { AlignedBox::new_zeroed() };
             prop_assert_eq!(*boxed, [0u64; 4]);
         }
     }
