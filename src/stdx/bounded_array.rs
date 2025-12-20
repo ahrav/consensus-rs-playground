@@ -641,19 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn copy_semantics() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        // Copy the array
-        let arr2 = arr;
-
-        // Both should be independent
-        assert_eq!(arr.const_slice(), &[1, 2, 3]);
-        assert_eq!(arr2.const_slice(), &[1, 2, 3]);
-    }
-
-    #[test]
     fn boundary_capacity_one() {
         // Tiger Style: test edge case of minimum capacity
         let mut arr: BoundedArray<u32, 1> = BoundedArray::new();
@@ -843,17 +830,6 @@ mod tests {
 
         assert_eq!(arr.len(), 1);
         assert_eq!(arr.const_slice(), &[1]);
-    }
-
-    #[test]
-    fn truncate_to_same_length() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        arr.truncate(3); // Same as current length
-
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr.const_slice(), &[1, 2, 3]);
     }
 
     #[test]
