@@ -525,7 +525,10 @@ mod tests {
 
     #[test]
     fn deprecated_count() {
-        let count = ALL_OPERATIONS.iter().filter(|op| op.is_deprecated()).count();
+        let count = ALL_OPERATIONS
+            .iter()
+            .filter(|op| op.is_deprecated())
+            .count();
         assert_eq!(count, 6);
     }
 
@@ -656,8 +659,8 @@ mod tests {
 
     #[test]
     fn hash() {
-        use std::collections::hash_map::DefaultHasher;
         use std::collections::HashSet;
+        use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut set = HashSet::new();
