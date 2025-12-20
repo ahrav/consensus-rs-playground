@@ -1,3 +1,18 @@
+//! Stack-allocated array with runtime length tracking.
+//!
+//! Provides a fixed-capacity, variable-length array that lives entirely on the stack.
+//! Unlike `Vec`, requires no heap allocation. Unlike `[T; N]`, tracks actual length.
+//!
+//! # Design Constraints
+//!
+//! - `T: Copy` required: enables bitwise copies of `MaybeUninit<T>` without Drop concerns
+//! - Capacity `N` validated at compile time (must be in `1..=isize::MAX`)
+//! - Panics on capacity overflow rather than returning errors (fail-fast philosophy)
+//!
+//! # Invariant
+//!
+//! Elements `[0..len)` are always initialized; `[len..N)` are uninitialized.
+
 use core::{mem::MaybeUninit, slice};
 
 const fn assert_valid_capacity<const N: usize>() {
@@ -5,6 +20,10 @@ const fn assert_valid_capacity<const N: usize>() {
     assert!(N <= isize::MAX as usize);
 }
 
+/// Fixed-capacity array with tracked length, allocated on the stack.
+///
+/// Behaves like a `Vec<T>` but with compile-time capacity and no heap allocation.
+/// The `Copy` bound on `T` ensures safe handling of uninitialized memory.
 #[derive(Clone, Copy)]
 pub struct BoundedArray<T: Copy, const N: usize> {
     len: usize,
@@ -20,6 +39,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         assert!(self.len <= N);
     }
 
+    /// Creates an empty array. Usable in `const` contexts for static initialization.
     #[inline]
     pub const fn new() -> Self {
         let () = Self::CAPACITY_CHECK;
@@ -29,6 +49,11 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         }
     }
 
+    /// Creates an array with `count` copies of `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count > N`.
     #[inline]
     pub fn from_value(value: T, count: usize) -> Self {
         assert!(count <= N);
@@ -51,6 +76,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         N
     }
 
+    /// Alias for [`len`](Self::len).
     #[inline]
     pub fn count(&self) -> usize {
         assert!(self.len <= N);
@@ -83,6 +109,9 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         remain
     }
 
+    /// Returns initialized elements as a slice.
+    ///
+    /// Named `const_slice` (not `as_slice`) to parallel [`slice`](Self::slice) for mutable access.
     #[inline]
     pub fn const_slice(&self) -> &[T] {
         assert!(self.len <= N);
@@ -90,12 +119,15 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         let ptr = self.data.as_ptr().cast::<T>();
         let len = self.len;
 
+        // SAFETY: Elements [0..len) are initialized per the struct invariant.
+        // MaybeUninit<T> has the same layout as T.
         let result = unsafe { slice::from_raw_parts(ptr, len) };
         assert_eq!(result.as_ptr(), self.data.as_ptr().cast::<T>());
 
         result
     }
 
+    /// Returns initialized elements as a mutable slice.
     #[inline]
     pub fn slice(&mut self) -> &mut [T] {
         assert!(self.len <= N);
@@ -103,12 +135,20 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         let ptr = self.data.as_mut_ptr().cast::<T>();
         let len = self.len;
 
+        // SAFETY: Elements [0..len) are initialized per the struct invariant.
+        // MaybeUninit<T> has the same layout as T.
         let result = unsafe { slice::from_raw_parts_mut(ptr, len) };
         assert_eq!(result.as_ptr(), self.data.as_mut_ptr().cast::<T>());
 
         result
     }
 
+    /// Returns the entire backing array including uninitialized elements.
+    ///
+    /// # Safety Note
+    ///
+    /// Only elements `[0..len)` are initialized. Calling `assume_init` on
+    /// elements `[len..N)` is undefined behavior.
     #[inline]
     pub fn as_uninit_slice(&self) -> &[MaybeUninit<T>] {
         &self.data
@@ -124,6 +164,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         self.slice().iter_mut()
     }
 
+    /// Returns element by value. Panics if out of bounds.
     #[inline]
     pub fn get(&self, index: usize) -> T {
         assert!(
@@ -134,15 +175,18 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         );
         assert!(self.len <= N);
 
+        // SAFETY: Bounds checked above, element is initialized.
         unsafe { self.data[index].assume_init() }
     }
 
+    /// Returns element reference, or `None` if out of bounds.
     #[inline]
     pub fn try_get(&self, index: usize) -> Option<&T> {
         if index >= self.len {
             return None;
         }
 
+        // SAFETY: index < len, element is initialized.
         let value = unsafe { self.data[index].assume_init_ref() };
         Some(value)
     }
@@ -157,6 +201,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         );
         assert!(self.len <= N);
 
+        // SAFETY: Bounds checked above, element is initialized.
         unsafe { self.data[index].assume_init_mut() }
     }
 
@@ -176,6 +221,9 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         Some(self.get(self.len - 1))
     }
 
+    /// Appends an element. Panics if full.
+    ///
+    /// Use [`try_push`](Self::try_push) for fallible insertion.
     #[inline]
     pub fn push(&mut self, value: T) {
         let old_len = self.len;
@@ -192,6 +240,7 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         self.assert_invariants();
     }
 
+    /// Appends an element, returning `Err(value)` if full.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), T> {
         if self.is_full() {
@@ -210,12 +259,14 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         let old_len = self.len;
         self.len = old_len - 1;
 
+        // SAFETY: old_len > 0, element at old_len-1 is initialized.
         let value = unsafe { self.data[old_len - 1].assume_init() };
 
         self.assert_invariants();
         Some(value)
     }
 
+    /// Appends all elements from the slice. Panics if insufficient capacity.
     #[inline]
     pub fn extend_from_slice(&mut self, src: &[T]) {
         let old_len = self.len;
@@ -235,6 +286,10 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         self.assert_invariants();
     }
 
+    /// Reduces length to `new_len`. Panics if `new_len > len`.
+    ///
+    /// Since `T: Copy`, no destructors run. Truncated elements become
+    /// uninitialized and their slots can be reused.
     #[inline]
     pub fn truncate(&mut self, new_len: usize) {
         let old_len = self.len;
@@ -257,6 +312,9 @@ impl<T: Copy, const N: usize> BoundedArray<T, N> {
         self.assert_invariants()
     }
 
+    /// Overwrites element at `index`. Panics if out of bounds.
+    ///
+    /// Does not read the previous value (just overwrites via `MaybeUninit::write`).
     #[inline]
     pub fn set(&mut self, index: usize, value: T) {
         assert!(
@@ -345,6 +403,9 @@ impl<T: Copy, const N: usize> core::ops::IndexMut<usize> for BoundedArray<T, N> 
     }
 }
 
+/// Owning iterator over [`BoundedArray`] elements.
+///
+/// Created by [`BoundedArray::into_iter`]. Yields elements by value since `T: Copy`.
 pub struct BoundedArrayIter<T: Copy, const N: usize> {
     array: BoundedArray<T, N>,
     index: usize,
