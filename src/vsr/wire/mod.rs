@@ -3,6 +3,7 @@ pub mod command;
 pub mod framing;
 pub mod header;
 pub mod message;
+pub mod operation;
 pub mod pool;
 
 pub mod constants {
@@ -22,4 +23,5 @@ pub use constants::{
 };
 pub use header::Header;
 pub use message::Message;
+pub use operation::Operation;
 pub use pool::{MessageHandle, MessagePool};
