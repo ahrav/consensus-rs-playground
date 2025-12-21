@@ -7,7 +7,7 @@
 use core::{mem, slice};
 
 use crate::{
-    constants::VSR_VERSION,
+    constants::{JOURNAL_SLOT_COUNT, VSR_VERSION},
     vsr::wire::{Checksum128, Command, Operation, checksum, constants, header::Release},
 };
 
@@ -439,6 +439,67 @@ impl HeaderPrepare {
         }
 
         None
+    }
+
+    /// Creates a placeholder header to mark a journal slot as occupied but uncommitted.
+    ///
+    ///  Used during log initialization or slot pre-allocation where the actual
+    /// operation hasn't been received yet. The header passes validation but carries
+    /// no meaningful payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `slot >= JOURNAL_SLOT_COUNT`.
+    pub fn reserve(cluster: u128, slot: u64) -> Self {
+        assert!(slot < JOURNAL_SLOT_COUNT as u64);
+
+        let mut h = Self::new();
+
+        h.command = Command::Prepare;
+        h.cluster = cluster;
+        h.release = Release(0);
+        h.op = slot;
+        h.operation = Operation::RESERVED;
+        h.view = 0;
+
+        h.set_checksum_body(&[]);
+        h.set_checksum();
+
+        assert!(h.invalid().is_none());
+
+        h
+    }
+
+    /// Creates the genesis entry (op=0) that anchors the hash chain.
+    ///
+    /// Every replica's log starts with this deterministic header. Subsequent
+    /// entries link back via [`Self::parent`], ensuring log integrity from
+    /// the first operation onward.
+    pub fn root(cluster: u128) -> Self {
+        let mut h = Self::new();
+
+        h.cluster = cluster;
+        h.size = Self::SIZE as u32;
+        h.release = Release(0);
+        h.command = Command::Prepare;
+        h.operation = Operation::ROOT;
+        h.op = 0;
+        h.view = 0;
+
+        h.request_checksum = 0;
+        h.checkpoint_id = 0;
+        h.parent = 0;
+        h.client = 0;
+        h.commit = 0;
+        h.timestamp = 0;
+        h.request = 0;
+
+        h.set_checksum_body(&[]);
+        h.set_checksum();
+
+        assert!(h.invalid().is_none());
+
+        h
     }
 }
 
@@ -1069,6 +1130,50 @@ mod tests {
         h.client = 123;
         h.request = 1;
         assert_eq!(h.invalid(), Some("request != 0"));
+    }
+
+    #[test]
+    fn test_reserve_factory() {
+        let cluster = 0x1234_5678_9ABC_DEF0;
+        let slot = 7;
+        let header = HeaderPrepare::reserve(cluster, slot);
+
+        assert_eq!(header.cluster, cluster);
+        assert_eq!(header.op, slot);
+        assert_eq!(header.command, Command::Prepare);
+        assert_eq!(header.operation, Operation::RESERVED);
+        assert_eq!(header.view, 0);
+        assert_eq!(header.release, Release(0));
+        assert!(header.valid_checksum());
+        assert!(header.invalid().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_reserve_panic() {
+        let cluster = 0x1234_5678_9ABC_DEF0;
+        let slot = crate::constants::JOURNAL_SLOT_COUNT as u64;
+        HeaderPrepare::reserve(cluster, slot);
+    }
+
+    #[test]
+    fn test_root_factory() {
+        let cluster = 0xDEAD_BEEF;
+        let header = HeaderPrepare::root(cluster);
+
+        assert_eq!(header.cluster, cluster);
+        assert_eq!(header.op, 0);
+        assert_eq!(header.command, Command::Prepare);
+        assert_eq!(header.operation, Operation::ROOT);
+        assert_eq!(header.view, 0);
+        assert_eq!(header.release, Release(0));
+        assert_eq!(header.parent, 0);
+        assert_eq!(header.client, 0);
+        assert_eq!(header.commit, 0);
+        assert_eq!(header.timestamp, 0);
+        assert_eq!(header.request, 0);
+        assert!(header.valid_checksum());
+        assert!(header.invalid().is_none());
     }
 }
 
