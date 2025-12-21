@@ -242,6 +242,20 @@ pub const fn as_usize(n: u32) -> usize {
     n as usize
 }
 
+/// Align a `u64` value forward to the specified alignment.
+///
+/// # Examples
+/// ```
+/// # use consensus::constants::*;
+/// let aligned = align_forward_u64(1024, 512);
+/// assert_eq!(aligned, 1536);
+/// ```
+#[inline(always)]
+pub const fn align_forward_u64(x: u64, align: u64) -> u64 {
+    let rem = x % align;
+    if rem == 0 { x } else { x + (align - rem) }
+}
+
 // =============================================================================
 // Pre-converted usize constants
 // =============================================================================
