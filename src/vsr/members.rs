@@ -361,4 +361,246 @@ mod tests {
         }
         assert_eq!(m.get(constants::MEMBERS_MAX as u8), None);
     }
+
+    // Edge case tests for iter_used
+    #[test]
+    fn members_iter_used_empty() {
+        let m = Members::zeroed();
+        let collected: Vec<u128> = m.iter_used().collect();
+        assert!(collected.is_empty());
+    }
+
+    #[test]
+    fn members_iter_used_full() {
+        let mut m = Members::zeroed();
+        for i in 0..constants::MEMBERS_MAX {
+            m.0[i] = (i + 100) as u128;
+        }
+
+        let collected: Vec<u128> = m.iter_used().collect();
+        assert_eq!(collected.len(), constants::MEMBERS_MAX);
+        for (i, &id) in collected.iter().enumerate() {
+            assert_eq!(id, (i + 100) as u128);
+        }
+    }
+
+    // Edge case tests for root_members with boundary cluster IDs
+    #[test]
+    fn root_members_zero_cluster() {
+        let m = root_members(0);
+
+        assert!(valid_members(&m));
+        assert_eq!(member_count(&m), constants::MEMBERS_MAX as u8);
+
+        // All IDs should be non-zero and unique
+        for i in 0..constants::MEMBERS_MAX {
+            assert!(m.0[i] != 0);
+            for j in 0..i {
+                assert!(m.0[i] != m.0[j]);
+            }
+        }
+    }
+
+    #[test]
+    fn root_members_max_cluster() {
+        let m = root_members(u128::MAX);
+
+        assert!(valid_members(&m));
+        assert_eq!(member_count(&m), constants::MEMBERS_MAX as u8);
+
+        // All IDs should be non-zero and unique
+        for i in 0..constants::MEMBERS_MAX {
+            assert!(m.0[i] != 0);
+            for j in 0..i {
+                assert!(m.0[i] != m.0[j]);
+            }
+        }
+    }
+
+    // Edge case: member_index at last position
+    #[test]
+    fn member_index_at_last_position() {
+        let mut m = Members::zeroed();
+        for i in 0..constants::MEMBERS_MAX {
+            m.0[i] = (i + 1) as u128;
+        }
+
+        let last_id = constants::MEMBERS_MAX as u128;
+        assert_eq!(
+            member_index(&m, last_id),
+            Some((constants::MEMBERS_MAX - 1) as u8)
+        );
+    }
+
+    // Edge case: consecutive duplicates
+    #[test]
+    fn members_consecutive_duplicates() {
+        let mut m = Members::zeroed();
+        m.0[0] = 100;
+        m.0[1] = 100; // Consecutive duplicate
+
+        assert!(!valid_members(&m));
+    }
+
+    // Edge case: get boundary conditions
+    #[test]
+    fn members_get_boundary() {
+        let mut m = Members::zeroed();
+        m.0[0] = 100;
+
+        // Last valid index (will be zero, so None)
+        assert_eq!(m.get((constants::MEMBERS_MAX - 1) as u8), None);
+        // Just past bounds
+        assert_eq!(m.get(constants::MEMBERS_MAX as u8), None);
+        // u8::MAX (definitely out of bounds)
+        assert_eq!(m.get(u8::MAX), None);
+    }
+
+    #[test]
+    fn cluster_config_checksum_deterministic() {
+        let c1 = cluster_config_checksum();
+        let c2 = cluster_config_checksum();
+
+        assert_eq!(c1, c2);
+        assert!(c1 != 0, "checksum should be non-zero");
+    }
+
+    // Property-based tests
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property: root_members always produces exactly MEMBERS_MAX unique non-zero IDs.
+        #[test]
+        fn prop_root_members_full_unique(cluster: u128) {
+            let m = root_members(cluster);
+
+            prop_assert!(valid_members(&m));
+            prop_assert_eq!(member_count(&m), constants::MEMBERS_MAX as u8);
+
+            // All non-zero
+            for &id in &m.0 {
+                prop_assert!(id != 0, "root_members produced zero ID");
+            }
+
+            // All unique
+            for i in 0..constants::MEMBERS_MAX {
+                for j in 0..i {
+                    prop_assert!(m.0[i] != m.0[j], "duplicate at {} and {}", i, j);
+                }
+            }
+        }
+
+        /// Property: root_members is deterministic for same cluster ID.
+        #[test]
+        fn prop_root_members_deterministic(cluster: u128) {
+            let m1 = root_members(cluster);
+            let m2 = root_members(cluster);
+
+            prop_assert_eq!(m1, m2);
+        }
+
+        /// Property: Different clusters produce different root member sets.
+        #[test]
+        fn prop_root_members_different_clusters(c1: u128, c2: u128) {
+            prop_assume!(c1 != c2);
+
+            let m1 = root_members(c1);
+            let m2 = root_members(c2);
+
+            prop_assert_ne!(m1, m2, "different clusters should produce different members");
+        }
+
+        /// Property: member_index returns Some(i) iff members[i] == replica_id.
+        #[test]
+        fn prop_member_index_correctness(
+            ids in prop::collection::vec(1u128..=10000u128, 1..=constants::MEMBERS_MAX)
+        ) {
+            // Build a valid members array with unique IDs
+            let mut m = Members::zeroed();
+            let mut unique_ids = Vec::new();
+            for id in ids {
+                if !unique_ids.contains(&id) && unique_ids.len() < constants::MEMBERS_MAX {
+                    unique_ids.push(id);
+                }
+            }
+            for (i, &id) in unique_ids.iter().enumerate() {
+                m.0[i] = id;
+            }
+
+            prop_assert!(valid_members(&m));
+
+            // Check that member_index finds each ID at the correct position
+            for (i, &id) in unique_ids.iter().enumerate() {
+                let result = member_index(&m, id);
+                prop_assert_eq!(result, Some(i as u8));
+            }
+
+            // Check that member_index returns None for an ID not in the list
+            let not_in_list = 99999u128;
+            if !unique_ids.contains(&not_in_list) {
+                prop_assert_eq!(member_index(&m, not_in_list), None);
+            }
+        }
+
+        /// Property: iter_used returns exactly count() elements, all non-zero.
+        #[test]
+        fn prop_iter_used_count_matches(
+            count in 0..=constants::MEMBERS_MAX
+        ) {
+            let mut m = Members::zeroed();
+            for i in 0..count {
+                m.0[i] = (i + 1) as u128;
+            }
+
+            prop_assert!(valid_members(&m));
+            let collected: Vec<u128> = m.iter_used().collect();
+            prop_assert_eq!(collected.len(), count);
+
+            for &id in &collected {
+                prop_assert!(id != 0);
+            }
+        }
+
+        /// Property: valid_members implies no holes (all zeros after first zero).
+        #[test]
+        fn prop_valid_members_no_holes(
+            ids in prop::collection::vec(0u128..=1000u128, constants::MEMBERS_MAX)
+        ) {
+            let mut m = Members::zeroed();
+            for (i, &id) in ids.iter().enumerate().take(constants::MEMBERS_MAX) {
+                m.0[i] = id;
+            }
+
+            if valid_members(&m) {
+                // Find first zero
+                let first_zero = m.0.iter().position(|&id| id == 0);
+                if let Some(pos) = first_zero {
+                    // All subsequent must be zero
+                    for i in pos..constants::MEMBERS_MAX {
+                        prop_assert_eq!(m.0[i], 0, "found non-zero after first zero at {}", i);
+                    }
+                }
+            }
+        }
+
+        /// Property: valid_members implies no duplicates in active range.
+        #[test]
+        fn prop_valid_members_no_duplicates(
+            ids in prop::collection::vec(1u128..=1000u128, 0..=constants::MEMBERS_MAX)
+        ) {
+            let mut m = Members::zeroed();
+            for (i, &id) in ids.iter().enumerate().take(constants::MEMBERS_MAX) {
+                m.0[i] = id;
+            }
+
+            if valid_members(&m) {
+                let count = member_count(&m) as usize;
+                for i in 0..count {
+                    for j in 0..i {
+                        prop_assert_ne!(m.0[i], m.0[j], "found duplicate at {} and {}", i, j);
+                    }
+                }
+            }
+        }
+    }
 }
