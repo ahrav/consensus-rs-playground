@@ -22,6 +22,9 @@ const _: () = {
     assert!(mem::size_of::<CheckpointState>() == 1024);
     assert!(mem::align_of::<CheckpointState>() >= 8);
 
+    assert!(mem::size_of::<VsrState>() == 2048);
+    assert!(mem::align_of::<VsrState>() >= 8);
+
     assert!(constants::REPLICAS_MAX > 0);
     assert!(constants::REPLICAS_MAX <= 128);
     assert!(constants::CLIENTS_MAX > 0);
