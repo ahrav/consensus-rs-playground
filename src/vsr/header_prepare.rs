@@ -27,18 +27,7 @@ const _: () = {
 
     assert!(HeaderPrepare::SIZE == 256);
     assert!(HeaderPrepare::SIZE == mem::size_of::<HeaderPrepare>());
-
-    assert!(CLUSTER_CONFIG_FIELD_COUNT == 17);
-    assert!(CLUSTER_CONFIG_SEED_SIZE == CLUSTER_CONFIG_FIELD_COUNT * 8);
-
-    assert!(ID_SEED_SIZE == 33);
 };
-
-const CLUSTER_CONFIG_FIELD_COUNT: usize = 17;
-
-const CLUSTER_CONFIG_SEED_SIZE: usize = CLUSTER_CONFIG_FIELD_COUNT * 8;
-
-const ID_SEED_SIZE: usize = 33;
 
 /// Specialized header for `Command::Prepare` messages.
 ///
