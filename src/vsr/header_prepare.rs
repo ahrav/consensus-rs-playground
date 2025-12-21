@@ -89,7 +89,8 @@ pub struct HeaderPrepare {
 
     // --- Prepare-specific fields (offset 128-255) ---
     /// Checksum of the parent `Prepare` message (the previous operation in the log).
-    /// Used to enforce the hash chain and log integrity.
+    /// Used to enforce the hash chain and log integrity; must be non-zero for
+    /// non-`ROOT`/non-`RESERVED` prepares.
     pub parent: u128,
     /// Reserved; must be zero.
     pub parent_padding: u128,
@@ -400,6 +401,11 @@ impl HeaderPrepare {
             return Some("release == 0");
         }
 
+        // Normal operations must link to the previous log entry.
+        if self.parent == 0 {
+            return Some("parent == 0");
+        }
+
         // Client ID validation depends on operation type
         if self.operation == Operation::PULSE || self.operation == Operation::UPGRADE {
             if self.client != 0 {
@@ -614,6 +620,7 @@ mod tests {
         header.commit = 9;
         header.timestamp = 100;
         header.release = Release(1);
+        header.parent = 1;
         header.set_checksum_body(&[]);
         header.set_checksum();
         assert_eq!(header.invalid(), None);
@@ -630,6 +637,7 @@ mod tests {
         header.commit = 9;
         header.timestamp = 100;
         header.release = Release(1);
+        header.parent = 1;
         header.set_checksum_body(&[]);
         header.set_checksum();
         assert_eq!(header.invalid(), None);
@@ -872,7 +880,12 @@ mod tests {
         header.client = 123;
         header.request = 1;
         header.release = Release(1);
+        header.parent = 1;
         header.set_checksum_body(&[]);
+
+        let mut h = header;
+        h.parent = 0;
+        assert_eq!(h.invalid(), Some("parent == 0"));
 
         let mut h = header;
         h.release = Release(0);
@@ -910,6 +923,7 @@ mod tests {
         header.client = 123;
         header.request = 1;
         header.release = Release(1);
+        header.parent = 1;
         assert_eq!(header.invalid(), Some("operation reserved"));
     }
 
@@ -924,6 +938,7 @@ mod tests {
         header.release = Release(1);
         header.client = 0;
         header.request = 0;
+        header.parent = 1;
         header.set_checksum_body(&[]);
 
         let mut h = header;
@@ -954,6 +969,7 @@ mod tests {
         header.commit = 9;
         header.timestamp = 100;
         header.release = Release(1);
+        header.parent = 1;
         header.set_checksum_body(&[]);
         header.set_checksum();
         assert_eq!(header.invalid(), None);
@@ -970,6 +986,7 @@ mod tests {
         header.release = Release(1);
         header.client = 0;
         header.request = 0;
+        header.parent = 1;
         header.set_checksum_body(&[]);
 
         let mut h = header;
@@ -1005,6 +1022,7 @@ mod tests {
         header.timestamp = 1;
         header.op = 1;
         header.commit = 0;
+        header.parent = 1;
         header.set_checksum_body(&[]);
         assert!(header.invalid().is_none());
     }
@@ -1020,6 +1038,7 @@ mod tests {
         header.timestamp = 1;
         header.op = 2;
         header.commit = 1;
+        header.parent = 1;
         header.size = constants::MESSAGE_SIZE_MAX;
         assert_ne!(header.invalid(), Some("size > message_size_max"));
     }
@@ -1033,6 +1052,7 @@ mod tests {
         header.op = 2;
         header.commit = 1;
         header.timestamp = 1;
+        header.parent = 1;
         header.set_checksum_body(&[]);
 
         let mut h = header;
@@ -1067,19 +1087,20 @@ mod proptests {
             1u32..=u32::MAX,
             1u32..=u32::MAX,
             any::<u128>(),
+            1u128..=u128::MAX,
         )
             .prop_filter_map(
                 "op must be greater than commit",
-                |(op, commit, ts, client, req, rel, cluster)| {
+                |(op, commit, ts, client, req, rel, cluster, parent)| {
                     if op > commit {
-                        Some((op, commit, ts, client, req, rel, cluster))
+                        Some((op, commit, ts, client, req, rel, cluster, parent))
                     } else {
                         None
                     }
                 },
             )
             .prop_map(
-                |(op, commit, timestamp, client, request, release, cluster)| {
+                |(op, commit, timestamp, client, request, release, cluster, parent)| {
                     let mut header = HeaderPrepare::new();
                     header.command = Command::Prepare;
                     header.operation = Operation::NOOP;
@@ -1090,6 +1111,7 @@ mod proptests {
                     header.request = request;
                     header.release = Release(release);
                     header.cluster = cluster;
+                    header.parent = parent;
                     header.set_checksum_body(&[]);
                     header.set_checksum();
                     header
@@ -1162,6 +1184,7 @@ mod proptests {
             header.client = client;
             header.request = request;
             header.release = Release(release);
+            header.parent = 1;
             header.set_checksum_body(&[]);
 
             header.op = commit;
@@ -1184,15 +1207,16 @@ mod proptests {
             0u64..=u64::MAX - 1,
             1u64..=u64::MAX,
             1u32..=u32::MAX,
+            1u128..=u128::MAX,
         )
-            .prop_filter_map("op must be greater than commit", |(op, commit, ts, rel)| {
+            .prop_filter_map("op must be greater than commit", |(op, commit, ts, rel, parent)| {
                 if op > commit {
-                    Some((op, commit, ts, rel))
+                    Some((op, commit, ts, rel, parent))
                 } else {
                     None
                 }
             })
-            .prop_map(|(op, commit, timestamp, release)| {
+            .prop_map(|(op, commit, timestamp, release, parent)| {
                 let mut header = HeaderPrepare::new();
                 header.command = Command::Prepare;
                 header.operation = Operation::PULSE;
@@ -1202,6 +1226,7 @@ mod proptests {
                 header.release = Release(release);
                 header.client = 0;
                 header.request = 0;
+                header.parent = parent;
                 header.set_checksum_body(&[]);
                 header.set_checksum();
                 header
