@@ -136,7 +136,8 @@ impl Operation {
         let v = operation.as_u8();
 
         assert!(v >= constants::VSR_OPERATIONS_RESERVED);
-        assert!(SM::from_u8(v).is_some());
+        let roundtrip = SM::from_u8(v).expect("state machine operation must round-trip");
+        assert!(roundtrip.as_u8() == v);
 
         Self(v)
     }
@@ -179,13 +180,18 @@ impl Operation {
         result
     }
 
-    /// Returns `true` if this operation is valid: either VSR-reserved or a known `SM` operation.
+    /// Returns `true` if this operation is a defined VSR operation (0-6) or a
+    /// user-defined `SM` operation in the `128..=255` range that round-trips.
     #[inline]
     pub fn valid<SM: StateMachineOperation>(self) -> bool {
         if self.0 <= VSR_RESERVED_MAX {
             true
+        } else if self.0 < constants::VSR_OPERATIONS_RESERVED {
+            false
         } else {
-            SM::from_u8(self.0).is_some()
+            SM::from_u8(self.0)
+                .map(|op| op.as_u8() == self.0)
+                .unwrap_or(false)
         }
     }
 
@@ -303,43 +309,48 @@ mod tests {
         }
     }
 
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct InconsistentOp(u8);
+
+    impl StateMachineOperation for InconsistentOp {
+        fn from_u8(v: u8) -> Option<Self> {
+            if v == 128 { Some(Self(129)) } else { None }
+        }
+
+        fn as_u8(&self) -> u8 {
+            self.0
+        }
+
+        fn tag_name(self) -> &'static str {
+            "inconsistent"
+        }
+    }
+
     // =========================================================================
     // Basic validity tests
     // =========================================================================
 
     #[test]
-    fn test_reserved_operations_are_valid() {
-        assert!(Operation::RESERVED.valid::<TestOp>());
-        assert!(Operation::ROOT.valid::<TestOp>());
-        assert!(Operation::REGISTER.valid::<TestOp>());
-        assert!(Operation::RECONFIGURE.valid::<TestOp>());
-        assert!(Operation::PULSE.valid::<TestOp>());
-        assert!(Operation::UPGRADE.valid::<TestOp>());
-        assert!(Operation::NOOP.valid::<TestOp>());
+    fn test_vsr_constants() {
+        // All named VSR constants must be valid and reserved.
+        let constants = [
+            Operation::RESERVED,
+            Operation::ROOT,
+            Operation::REGISTER,
+            Operation::RECONFIGURE,
+            Operation::PULSE,
+            Operation::UPGRADE,
+            Operation::NOOP,
+        ];
+
+        for op in constants {
+            assert!(op.valid::<TestOp>());
+            assert!(op.vsr_reserved());
+        }
     }
 
     #[test]
-    fn test_all_vsr_constants_are_vsr_reserved() {
-        assert!(Operation::RESERVED.vsr_reserved());
-        assert!(Operation::ROOT.vsr_reserved());
-        assert!(Operation::REGISTER.vsr_reserved());
-        assert!(Operation::RECONFIGURE.vsr_reserved());
-        assert!(Operation::PULSE.vsr_reserved());
-        assert!(Operation::UPGRADE.vsr_reserved());
-        assert!(Operation::NOOP.vsr_reserved());
-    }
-
-    #[test]
-    fn test_reserved_operations_are_vsr_reserved() {
-        assert!(Operation::RESERVED.vsr_reserved());
-        assert!(Operation::NOOP.vsr_reserved());
-
-        // Explicitly check VSR_RESERVED_MAX boundary
-        assert!(Operation::from_u8(VSR_RESERVED_MAX).vsr_reserved());
-    }
-
-    #[test]
-    fn test_gap_operations_are_invalid() {
+    fn test_invalid_gap() {
         // Ensure operations in the gap 7..128 are invalid
         for op_code in (VSR_RESERVED_MAX + 1)..constants::VSR_OPERATIONS_RESERVED {
             let op = Operation::from_u8(op_code);
@@ -349,7 +360,31 @@ mod tests {
     }
 
     #[test]
-    fn test_state_machine_operation_roundtrip() {
+    fn test_reserved_range_not_valid_for_sm() {
+        #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+        struct ReservedRangeOp;
+
+        impl StateMachineOperation for ReservedRangeOp {
+            fn from_u8(v: u8) -> Option<Self> {
+                if v == 42 { Some(Self) } else { None }
+            }
+
+            fn as_u8(&self) -> u8 {
+                42
+            }
+
+            fn tag_name(self) -> &'static str {
+                "reserved_range"
+            }
+        }
+
+        let op = Operation::from_u8(42);
+        assert!(op.vsr_reserved());
+        assert!(!op.valid::<ReservedRangeOp>());
+    }
+
+    #[test]
+    fn test_sm_roundtrip() {
         let op = Operation::from(TestOp::CreateAccount);
         assert!(op.as_u8() == 128);
         assert!(op.valid::<TestOp>());
@@ -359,13 +394,19 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_opcode_not_valid() {
+    fn test_invalid_opcode() {
         let op = Operation::from_u8(200); // Not a TestOp
         assert!(!op.valid::<TestOp>());
     }
 
     #[test]
-    fn test_sm_operations_are_not_vsr_reserved() {
+    fn test_inconsistent_sm_not_valid() {
+        let op = Operation::from_u8(128);
+        assert!(!op.valid::<InconsistentOp>());
+    }
+
+    #[test]
+    fn test_sm_not_reserved() {
         let create = Operation::from(TestOp::CreateAccount);
         let transfer = Operation::from(TestOp::Transfer);
 
@@ -374,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sm_operations_are_valid() {
+    fn test_sm_valid() {
         let create = Operation::from(TestOp::CreateAccount);
         let transfer = Operation::from(TestOp::Transfer);
 
@@ -387,19 +428,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_boundary_127_is_vsr_reserved() {
-        let op = Operation::from_u8(127);
-        assert!(op.vsr_reserved());
-    }
-
-    #[test]
-    fn test_boundary_128_is_not_vsr_reserved() {
-        let op = Operation::from_u8(128);
-        assert!(!op.vsr_reserved());
-    }
-
-    #[test]
-    fn test_vsr_reserved_boundary_exhaustive() {
+    fn test_reserved_boundary() {
         // All 0-127 should be vsr_reserved
         for opcode in 0..128 {
             assert!(
@@ -422,7 +451,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_from_vsr_returns_none_for_all_vsr_reserved() {
+    fn test_from_vsr_reserved() {
         for opcode in 0..128 {
             let op = Operation::from_u8(opcode);
             assert!(
@@ -433,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vsr_returns_some_for_valid_sm_op() {
+    fn test_from_vsr_sm() {
         let create_op = Operation::from_u8(128);
         let transfer_op = Operation::from_u8(129);
 
@@ -442,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_vsr_returns_none_for_invalid_sm_op() {
+    fn test_from_vsr_invalid() {
         let invalid_op = Operation::from_u8(200);
         assert!(TestOp::from_vsr(invalid_op).is_none());
     }
@@ -452,7 +481,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_cast_succeeds_for_valid_sm_operation() {
+    fn test_cast_sm() {
         let create_op = Operation::from_u8(128);
         let transfer_op = Operation::from_u8(129);
 
@@ -465,13 +494,13 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "operation not covertible to state machine operation")]
-    fn test_cast_reserved_panics_by_default() {
+    fn test_cast_reserved_panic() {
         Operation::ROOT.cast::<TestOp>();
     }
 
     #[test]
     #[should_panic(expected = "operation not covertible to state machine operation")]
-    fn test_cast_panics_for_invalid_sm_operation() {
+    fn test_cast_invalid_panic() {
         let invalid = Operation::from_u8(200);
         let _: TestOp = invalid.cast();
     }
@@ -511,7 +540,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_tag_name_for_all_vsr_reserved_operations() {
+    fn test_tag_name_reserved() {
         assert_eq!(Operation::RESERVED.tag_name::<TestOp>(), "reserved");
         assert_eq!(Operation::ROOT.tag_name::<TestOp>(), "root");
         assert_eq!(Operation::REGISTER.tag_name::<TestOp>(), "register");
@@ -522,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_name_for_sm_operations() {
+    fn test_tag_name_sm() {
         let create = Operation::from(TestOp::CreateAccount);
         let transfer = Operation::from(TestOp::Transfer);
 
@@ -532,7 +561,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_tag_name_panics_for_invalid_operation() {
+    fn test_tag_name_panic() {
         let invalid = Operation::from_u8(200);
         let _ = invalid.tag_name::<TestOp>();
     }
@@ -561,22 +590,28 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_operation_from_panics_for_vsr_reserved_discriminant() {
+    fn test_from_panic_reserved() {
         // MalformedOp has discriminant 5, which is in VSR-reserved range
         let _ = Operation::from(MalformedOp);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_panic_inconsistent_roundtrip() {
+        let _ = Operation::from(InconsistentOp(128));
     }
 
     #[test]
     #[should_panic(
         expected = "reserved operations cannot be converted to state machine operations"
     )]
-    fn test_to_reserved_panics() {
+    fn test_to_panic_reserved() {
         Operation::to::<TestOp>(Operation::ROOT);
     }
 
     #[test]
     #[should_panic]
-    fn test_operation_to_panics_for_invalid_operation() {
+    fn test_to_panic_invalid() {
         let invalid = Operation::from_u8(200);
         let _: TestOp = Operation::to(invalid);
     }
@@ -596,22 +631,11 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_from_u8_trait() {
-        let op: Operation = 42u8.into();
-        assert_eq!(op.as_u8(), 42);
-    }
-
-    #[test]
-    fn test_from_operation_to_u8() {
-        let op = Operation::from_u8(42);
-        let v: u8 = op.into();
-        assert_eq!(v, 42);
-    }
-
-    #[test]
-    fn test_u8_roundtrip_via_from_traits() {
+    fn test_from_trait_roundtrip() {
         for byte in 0..=255u8 {
             let op: Operation = byte.into();
+            assert_eq!(op.as_u8(), byte);
+
             let back: u8 = op.into();
             assert_eq!(byte, back);
         }
@@ -622,7 +646,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_debug_format_vsr_reserved_includes_name() {
+    fn test_debug_reserved() {
         let debug_str = format!("{:?}", Operation::RESERVED);
         assert_eq!(debug_str, "Operation(reserved=0)");
 
@@ -634,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_format_user_operation() {
+    fn test_debug_sm() {
         let op = Operation::from_u8(128);
         let debug_str = format!("{:?}", op);
         assert_eq!(debug_str, "Operation(128)");
@@ -645,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_debug_format_undefined_vsr_reserved() {
+    fn test_debug_undefined() {
         // Operations 7-127 are VSR reserved but undefined, so they show as raw numbers
         let op = Operation::from_u8(50);
         let debug_str = format!("{:?}", op);
@@ -657,18 +681,7 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_operation_ordering() {
-        assert!(Operation::RESERVED < Operation::ROOT);
-        assert!(Operation::ROOT < Operation::REGISTER);
-        assert!(Operation::NOOP < Operation::from_u8(128));
-
-        let op1 = Operation::from_u8(128);
-        let op2 = Operation::from_u8(129);
-        assert!(op1 < op2);
-    }
-
-    #[test]
-    fn test_operation_ordering_exhaustive() {
+    fn test_ordering() {
         // Verify ordering matches underlying u8 ordering
         for i in 0..255u8 {
             let op1 = Operation::from_u8(i);
