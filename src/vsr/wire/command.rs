@@ -1,36 +1,54 @@
-//! Wire-level command identifiers; discriminants are stable protocol bytes.
+//! Wire-level VSR command identifiers.
+//!
+//! This enum is parsed from the on-the-wire `Header.command` byte.
+//! Discriminants are stable protocol bytes and MUST NOT change.
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Command {
     Reserved = 0,
+
     Ping = 1,
     Pong = 2,
+
     PingClient = 3,
     PongClient = 4,
+
     Request = 5,
     Prepare = 6,
     PrepareOk = 7,
     Reply = 8,
     Commit = 9,
+
     StartViewChange = 10,
     DoViewChange = 11,
-    StartView = 12,
+
+    Deprecated12 = 12,
+
     RequestStartView = 13,
     RequestHeaders = 14,
     RequestPrepare = 15,
     RequestReply = 16,
     Headers = 17,
+
     Eviction = 18,
+
     RequestBlocks = 19,
     Block = 20,
+
+    Deprecated21 = 21,
+    Deprecated22 = 22,
+    Deprecated23 = 23,
+
+    StartView = 24,
 }
 
 impl Command {
     pub const MIN: u8 = 0;
-    pub const MAX: u8 = 20;
+    pub const MAX: u8 = 24;
     pub const COUNT: u8 = Self::MAX - Self::MIN + 1;
 
-    /// All command variants in discriminant order.
+    /// All command variants in discriminant order (0..=24).
     pub const ALL: [Self; Self::COUNT as usize] = [
         Self::Reserved,
         Self::Ping,
@@ -44,7 +62,7 @@ impl Command {
         Self::Commit,
         Self::StartViewChange,
         Self::DoViewChange,
-        Self::StartView,
+        Self::Deprecated12,
         Self::RequestStartView,
         Self::RequestHeaders,
         Self::RequestPrepare,
@@ -53,14 +71,15 @@ impl Command {
         Self::Eviction,
         Self::RequestBlocks,
         Self::Block,
+        Self::Deprecated21,
+        Self::Deprecated22,
+        Self::Deprecated23,
+        Self::StartView,
     ];
 
-    // Compile-time: catches constant drift
     const _RESERVED: () = assert!(Self::Reserved as u8 == Self::MIN);
-    const _BLOCK: () = assert!(Self::Block as u8 == Self::MAX);
-    const _COUNT: () = assert!(Self::COUNT == 21);
-
-    // Compile-time: validates ALL array has correct length and contiguous discriminants
+    const _START_VIEW: () = assert!(Self::StartView as u8 == Self::MAX);
+    const _COUNT: () = assert!(Self::COUNT == 25);
     const _ALL_LEN: () = assert!(Self::ALL.len() == Self::COUNT as usize);
     const _ALL_CONTIGUOUS: () = {
         let mut i = 0u8;
@@ -72,44 +91,27 @@ impl Command {
 
     /// Raw on-the-wire byte for this command.
     #[inline]
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
-    /// Returns the `Command` for a wire byte, or `None` if the byte is unused.
-    ///
-    /// The match table is kept in sync with discriminants via the post-match
-    /// assertion, so newly added variants must be listed here.
+    /// Returns true iff this is a reserved deprecated wire value.
+    #[inline]
+    pub const fn is_deprecated(self) -> bool {
+        matches!(
+            self,
+            Self::Deprecated12 | Self::Deprecated21 | Self::Deprecated22 | Self::Deprecated23
+        )
+    }
+
+    /// Fast decoding from a wire byte.
+    #[inline]
     pub fn try_from_u8(b: u8) -> Option<Self> {
-        let cmd = match b {
-            0 => Self::Reserved,
-            1 => Self::Ping,
-            2 => Self::Pong,
-            3 => Self::PingClient,
-            4 => Self::PongClient,
-            5 => Self::Request,
-            6 => Self::Prepare,
-            7 => Self::PrepareOk,
-            8 => Self::Reply,
-            9 => Self::Commit,
-            10 => Self::StartViewChange,
-            11 => Self::DoViewChange,
-            12 => Self::StartView,
-            13 => Self::RequestStartView,
-            14 => Self::RequestHeaders,
-            15 => Self::RequestPrepare,
-            16 => Self::RequestReply,
-            17 => Self::Headers,
-            18 => Self::Eviction,
-            19 => Self::RequestBlocks,
-            20 => Self::Block,
-            _ => return None,
-        };
-
-        // Pair assertion: match logic agrees with discriminant
-        assert!(cmd.as_u8() == b);
-
-        Some(cmd)
+        if b <= Self::MAX {
+            Some(Self::ALL[b as usize])
+        } else {
+            None
+        }
     }
 }
 
@@ -128,12 +130,14 @@ impl std::error::Error for InvalidCommand {}
 impl TryFrom<u8> for Command {
     type Error = InvalidCommand;
 
+    #[inline]
     fn try_from(b: u8) -> Result<Self, Self::Error> {
         Self::try_from_u8(b).ok_or(InvalidCommand(b))
     }
 }
 
 impl From<Command> for u8 {
+    #[inline]
     fn from(cmd: Command) -> Self {
         cmd.as_u8()
     }
@@ -208,7 +212,6 @@ mod tests {
 
     #[test]
     fn discriminants_are_stable_protocol_values() {
-        // These values are part of the wire protocol and MUST NOT change
         assert_eq!(Command::Reserved.as_u8(), 0);
         assert_eq!(Command::Ping.as_u8(), 1);
         assert_eq!(Command::Pong.as_u8(), 2);
@@ -221,7 +224,7 @@ mod tests {
         assert_eq!(Command::Commit.as_u8(), 9);
         assert_eq!(Command::StartViewChange.as_u8(), 10);
         assert_eq!(Command::DoViewChange.as_u8(), 11);
-        assert_eq!(Command::StartView.as_u8(), 12);
+        assert_eq!(Command::Deprecated12.as_u8(), 12);
         assert_eq!(Command::RequestStartView.as_u8(), 13);
         assert_eq!(Command::RequestHeaders.as_u8(), 14);
         assert_eq!(Command::RequestPrepare.as_u8(), 15);
@@ -230,6 +233,26 @@ mod tests {
         assert_eq!(Command::Eviction.as_u8(), 18);
         assert_eq!(Command::RequestBlocks.as_u8(), 19);
         assert_eq!(Command::Block.as_u8(), 20);
+        assert_eq!(Command::Deprecated21.as_u8(), 21);
+        assert_eq!(Command::Deprecated22.as_u8(), 22);
+        assert_eq!(Command::Deprecated23.as_u8(), 23);
+        assert_eq!(Command::StartView.as_u8(), 24);
+    }
+
+    // ==========================================================================
+    // Unit Tests: Deprecated Commands
+    // ==========================================================================
+
+    #[test]
+    fn deprecated_commands_are_identified() {
+        assert!(Command::Deprecated12.is_deprecated());
+        assert!(Command::Deprecated21.is_deprecated());
+        assert!(Command::Deprecated22.is_deprecated());
+        assert!(Command::Deprecated23.is_deprecated());
+
+        assert!(!Command::Reserved.is_deprecated());
+        assert!(!Command::Ping.is_deprecated());
+        assert!(!Command::StartView.is_deprecated());
     }
 
     // ==========================================================================
@@ -250,7 +273,7 @@ mod tests {
         assert_eq!(Command::try_from_u8(Command::MAX + 1), None);
         assert_eq!(Command::try_from_u8(255), None);
 
-        for byte in [21, 50, 100, 128, 200, 254, 255] {
+        for byte in [25, 50, 100, 128, 200, 254, 255] {
             assert_eq!(Command::try_from_u8(byte), None);
         }
     }
@@ -302,16 +325,14 @@ mod tests {
 
     #[test]
     fn try_from_u8_for_command_works() {
-        // Valid bytes
         for byte in Command::MIN..=Command::MAX {
             let result: Result<Command, InvalidCommand> = byte.try_into();
             assert!(result.is_ok());
             assert_eq!(result.unwrap().as_u8(), byte);
         }
 
-        // Invalid bytes
-        let result: Result<Command, InvalidCommand> = 21u8.try_into();
-        assert_eq!(result, Err(InvalidCommand(21)));
+        let result: Result<Command, InvalidCommand> = 25u8.try_into();
+        assert_eq!(result, Err(InvalidCommand(25)));
     }
 
     #[test]
