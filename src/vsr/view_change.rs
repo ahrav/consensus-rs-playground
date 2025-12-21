@@ -205,6 +205,30 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_verify_panic_empty_slice_direct() {
+        let headers: [HeaderPrepare; 0] = [];
+        let slice = ViewChangeSlice {
+            command: ViewChangeCommand::StartView,
+            slice: &headers,
+        };
+
+        slice.verify();
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_verify_panic_oversized_slice_direct() {
+        let headers = vec![header_prepare(); constants::VIEW_HEADERS_MAX + 1];
+        let slice = ViewChangeSlice {
+            command: ViewChangeCommand::StartView,
+            slice: &headers,
+        };
+
+        slice.verify();
+    }
+
+    #[test]
     fn test_try_from_command() {
         assert_eq!(
             ViewChangeCommand::try_from(Command::StartView),
@@ -218,6 +242,14 @@ mod tests {
         assert!(ViewChangeCommand::try_from(Command::Prepare).is_err());
         assert!(ViewChangeCommand::try_from(Command::Commit).is_err());
         assert!(ViewChangeCommand::try_from(Command::Ping).is_err());
+    }
+
+    #[test]
+    fn test_try_from_command_accepts_only_view_change_commands() {
+        for cmd in Command::ALL {
+            let is_view_change = matches!(cmd, Command::StartView | Command::DoViewChange);
+            assert_eq!(ViewChangeCommand::try_from(cmd).is_ok(), is_view_change);
+        }
     }
 
     #[test]
