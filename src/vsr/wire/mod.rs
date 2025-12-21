@@ -3,7 +3,6 @@ pub mod command;
 pub mod framing;
 pub mod header;
 pub mod message;
-pub mod operation;
 pub mod pool;
 
 pub mod constants {

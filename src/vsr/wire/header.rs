@@ -76,11 +76,12 @@ pub struct Header {
     pub checksum_body: Checksum128,
     /// Reserved; must be zero.
     pub checksum_body_padding: Checksum128,
+
     /// Reserved for nonce; must be zero.
     pub nonce_reserved: Checksum128,
-
     /// Cluster identifier for routing.
     pub cluster: ClusterId,
+
     /// Total message size in bytes (header + body).
     pub size: u32,
     /// Epoch number for reconfiguration.
