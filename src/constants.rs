@@ -242,6 +242,20 @@ pub const fn as_usize(n: u32) -> usize {
     n as usize
 }
 
+/// Align a `u64` value forward to the specified alignment.
+///
+/// # Examples
+/// ```
+/// # use consensus::constants::*;
+/// let aligned = align_forward_u64(1025, 512);
+/// assert_eq!(aligned, 1536);
+/// ```
+#[inline(always)]
+pub const fn align_forward_u64(x: u64, align: u64) -> u64 {
+    let rem = x % align;
+    if rem == 0 { x } else { x + (align - rem) }
+}
+
 // =============================================================================
 // Pre-converted usize constants
 // =============================================================================
@@ -315,5 +329,16 @@ mod tests {
         assert_eq!(HEADER_SIZE_USIZE, HEADER_SIZE as usize);
         assert_eq!(MESSAGE_SIZE_MAX_USIZE, MESSAGE_SIZE_MAX as usize);
         assert_eq!(MESSAGE_BODY_SIZE_MAX_USIZE, MESSAGE_BODY_SIZE_MAX as usize);
+    }
+
+    #[test]
+    fn test_align_forward_u64() {
+        assert_eq!(align_forward_u64(0, 512), 0);
+        assert_eq!(align_forward_u64(1, 512), 512);
+        assert_eq!(align_forward_u64(511, 512), 512);
+        assert_eq!(align_forward_u64(512, 512), 512);
+        assert_eq!(align_forward_u64(513, 512), 1024);
+        assert_eq!(align_forward_u64(1024, 512), 1024);
+        assert_eq!(align_forward_u64(1025, 512), 1536);
     }
 }
