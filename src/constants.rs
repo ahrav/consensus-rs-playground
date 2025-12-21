@@ -85,6 +85,12 @@ pub const QUORUM_REPLICATION_MAX: u64 = 3;
 /// Number of superblock copies stored on disk.
 pub const SUPERBLOCK_COPIES: usize = 4;
 
+/// Superblock format version. Increment for on-disk layout changes.
+pub const SUPERBLOCK_VERSION: u16 = 2;
+
+/// Total size of the superblock zone (all copies) in bytes.
+pub const SUPERBLOCK_ZONE_SIZE: u64 = 1024 * 1024;
+
 /// Maximum number of client ids tracked for reply deduplication.
 pub const CLIENTS_MAX: usize = 64;
 
@@ -111,6 +117,12 @@ pub const CLIENT_REPLIES_SIZE: usize = CLIENTS_MAX * CLIENT_REPLY_SIZE;
 
 /// Upper bound for a configured storage size limit.
 pub const STORAGE_SIZE_LIMIT_MAX: u64 = 1 << 40; // 1 TiB
+
+/// Minimum data file size in bytes, aligned to block boundaries.
+pub const DATA_FILE_SIZE_MIN: u64 = align_forward_u64(
+    SUPERBLOCK_ZONE_SIZE + JOURNAL_SIZE as u64 + CLIENT_REPLIES_SIZE as u64,
+    BLOCK_SIZE,
+);
 
 // =============================================================================
 // LSM constants
@@ -185,6 +197,17 @@ const _: () = {
     assert!(SUPERBLOCK_COPIES >= 4);
     assert!(SUPERBLOCK_COPIES <= 8);
     assert!(SUPERBLOCK_COPIES.is_multiple_of(2));
+
+    assert!(SUPERBLOCK_VERSION > 0);
+    assert!(SUPERBLOCK_ZONE_SIZE > 0);
+    assert!(SUPERBLOCK_ZONE_SIZE.is_power_of_two());
+
+    assert!(DATA_FILE_SIZE_MIN > 0);
+    assert!(
+        DATA_FILE_SIZE_MIN
+            >= SUPERBLOCK_ZONE_SIZE + JOURNAL_SIZE as u64 + CLIENT_REPLIES_SIZE as u64
+    );
+    assert!(DATA_FILE_SIZE_MIN.is_multiple_of(BLOCK_SIZE));
 
     assert!(CLIENTS_MAX > 0);
     assert!(PIPELINE_PREPARE_QUEUE_MAX > 0);

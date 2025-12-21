@@ -5,7 +5,7 @@
 
 use std::mem;
 
-use crate::{constants, vsr::wire::checksum};
+use crate::{constants, util::Pod, vsr::wire::checksum};
 
 const CLUSTER_CONFIG_FIELD_COUNT: usize = 17;
 
@@ -31,6 +31,10 @@ const _: () = {
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Members(pub [u128; constants::MEMBERS_MAX]);
+
+// SAFETY: Members is repr(transparent) over [u128; MEMBERS_MAX], which is Pod.
+// No padding bytes exist; all bytes are initialized for any valid value.
+unsafe impl Pod for Members {}
 
 const _: () = {
     assert!(constants::MEMBERS_MAX > 0);
