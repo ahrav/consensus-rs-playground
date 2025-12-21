@@ -30,7 +30,7 @@ const _: () = {
     assert!(constants::LSM_COMPACTION_OPS > 0);
 
     assert!(HeaderPrepare::SIZE == 256);
-    assert!(HeaderPrepare::SIZE % 8 == 0);
+    assert!(HeaderPrepare::SIZE.is_multiple_of(8));
 };
 
 /// Configuration for initializing a replica in the cluster.
