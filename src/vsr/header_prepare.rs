@@ -1209,13 +1209,16 @@ mod proptests {
             1u32..=u32::MAX,
             1u128..=u128::MAX,
         )
-            .prop_filter_map("op must be greater than commit", |(op, commit, ts, rel, parent)| {
-                if op > commit {
-                    Some((op, commit, ts, rel, parent))
-                } else {
-                    None
-                }
-            })
+            .prop_filter_map(
+                "op must be greater than commit",
+                |(op, commit, ts, rel, parent)| {
+                    if op > commit {
+                        Some((op, commit, ts, rel, parent))
+                    } else {
+                        None
+                    }
+                },
+            )
             .prop_map(|(op, commit, timestamp, release, parent)| {
                 let mut header = HeaderPrepare::new();
                 header.command = Command::Prepare;
