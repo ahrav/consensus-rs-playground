@@ -50,6 +50,7 @@ impl Members {
     }
 
     #[inline]
+    /// Note: Does not validate invariants. Call [`valid_members`] if input may be malformed.
     pub fn is_empty(&self) -> bool {
         self.0[0] == 0
     }
@@ -64,6 +65,7 @@ impl Members {
     }
 
     #[inline]
+    /// Note: Does not validate invariants. Call [`valid_members`] if input may be malformed.
     pub fn get(&self, index: u8) -> Option<u128> {
         let idx = index as usize;
         if idx >= constants::MEMBERS_MAX {
@@ -335,6 +337,28 @@ mod tests {
         m.0[2] = 2;
 
         let _ = m.count();
+    }
+
+    #[test]
+    #[should_panic]
+    fn members_iter_used_invalid() {
+        let mut m = Members::zeroed();
+        m.0[0] = 1;
+        m.0[1] = 0; // hole
+        m.0[2] = 2;
+
+        let _ = m.iter_used().collect::<Vec<u128>>();
+    }
+
+    #[test]
+    #[should_panic]
+    fn member_index_invalid_members() {
+        let mut m = Members::zeroed();
+        m.0[0] = 1;
+        m.0[1] = 0; // hole
+        m.0[2] = 2;
+
+        let _ = member_index(&m, 2);
     }
 
     #[test]
