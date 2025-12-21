@@ -13,6 +13,13 @@ const _: () = assert!(
 );
 
 // =============================================================================
+// System / CPU constants
+// =============================================================================
+
+/// CPU cache line size in bytes.
+pub const CACHE_LINE_SIZE: u64 = 64;
+
+// =============================================================================
 // Disk / storage constants
 // =============================================================================
 
@@ -27,6 +34,9 @@ pub const SECTOR_SIZE_MIN: usize = 512;
 
 /// Maximum supported sector size (64 KiB for large-block devices).
 pub const SECTOR_SIZE_MAX: usize = 65_536;
+
+/// Storage block size.
+pub const BLOCK_SIZE: u64 = 512 * 1024;
 
 /// Default number of concurrent I/O operations for the storage engine.
 pub const IO_ENTRIES_DEFAULT: u32 = 256;
@@ -69,14 +79,17 @@ pub const STANDBYS_MAX: usize = 6;
 /// Maximum total members in a cluster (`replicas + standbys`).
 pub const MEMBERS_MAX: usize = REPLICAS_MAX + STANDBYS_MAX;
 
+/// Maximum number of replicas required for a quorum.
+pub const QUORUM_REPLICATION_MAX: u64 = 3;
+
 /// Number of superblock copies stored on disk.
-pub const SUPERBLOCK_COPIES: usize = 8;
+pub const SUPERBLOCK_COPIES: usize = 4;
 
 /// Maximum number of client ids tracked for reply deduplication.
-pub const CLIENTS_MAX: usize = 65_536;
+pub const CLIENTS_MAX: usize = 64;
 
 /// Max in-flight prepares in the pipeline.
-pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 32;
+pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 8;
 
 /// View-change suffix capacity used to derive view header limits.
 pub const VIEW_CHANGE_HEADERS_SUFFIX_MAX: usize = PIPELINE_PREPARE_QUEUE_MAX + 1;
@@ -85,7 +98,7 @@ pub const VIEW_CHANGE_HEADERS_SUFFIX_MAX: usize = PIPELINE_PREPARE_QUEUE_MAX + 1
 pub const VIEW_HEADERS_MAX: usize = VIEW_CHANGE_HEADERS_SUFFIX_MAX + 2;
 
 /// Number of slots in the journal ring.
-pub const JOURNAL_SLOT_COUNT: usize = 8;
+pub const JOURNAL_SLOT_COUNT: usize = 1024;
 
 /// Total journal size in bytes.
 pub const JOURNAL_SIZE: usize = JOURNAL_SLOT_COUNT * MESSAGE_SIZE_MAX_USIZE;
@@ -98,6 +111,34 @@ pub const CLIENT_REPLIES_SIZE: usize = CLIENTS_MAX * CLIENT_REPLY_SIZE;
 
 /// Upper bound for a configured storage size limit.
 pub const STORAGE_SIZE_LIMIT_MAX: u64 = 1 << 40; // 1 TiB
+
+// =============================================================================
+// LSM constants
+// =============================================================================
+
+/// Number of levels in the LSM tree.
+pub const LSM_LEVELS: u64 = 7;
+
+/// Growth factor for LSM levels.
+pub const LSM_GROWTH_FACTOR: u64 = 8;
+
+/// Number of compaction operations.
+pub const LSM_COMPACTION_OPS: u64 = 32;
+
+/// Maximum number of snapshots.
+pub const LSM_SNAPSHOTS_MAX: u64 = 32;
+
+/// Extra blocks for manifest compaction.
+pub const LSM_MANIFEST_COMPACT_EXTRA_BLOCKS: u64 = 1;
+
+/// Threshold for table coalescing (percent).
+pub const LSM_TABLE_COALESCING_THRESHOLD_PERCENT: u64 = 50;
+
+/// Maximum number of VSR releases.
+pub const VSR_RELEASES_MAX: u64 = 64;
+
+/// Maximum number of scans.
+pub const LSM_SCANS_MAX: u64 = 6;
 
 // =============================================================================
 // Compile-time design integrity assertions
