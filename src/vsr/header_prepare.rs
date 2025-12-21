@@ -757,7 +757,10 @@ mod tests {
 
         let mut header = valid_reserved_header();
         header.checksum_body = 123;
-        assert_eq!(header.invalid(), Some("reserved: checksum_body != expected"));
+        assert_eq!(
+            header.invalid(),
+            Some("reserved: checksum_body != expected")
+        );
 
         let mut header = valid_reserved_header();
         header.replica = 1;
