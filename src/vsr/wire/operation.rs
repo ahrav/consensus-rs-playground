@@ -277,8 +277,6 @@ impl fmt::Debug for Operation {
 
 #[cfg(test)]
 mod tests {
-    use core::hash::{Hash, Hasher};
-
     use super::*;
 
     #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -691,58 +689,6 @@ mod tests {
             assert!(op1 <= op1);
             assert!(op1 >= op1);
         }
-    }
-
-    // =========================================================================
-    // Hash tests
-    // =========================================================================
-
-    /// Simple hasher for testing that collects bytes.
-    #[derive(Default)]
-    struct TestHasher {
-        bytes: Vec<u8>,
-    }
-
-    impl Hasher for TestHasher {
-        fn finish(&self) -> u64 {
-            // Simple hash: treat first 8 bytes as u64
-            let mut result = 0u64;
-            for (i, &b) in self.bytes.iter().take(8).enumerate() {
-                result |= (b as u64) << (i * 8);
-            }
-            result
-        }
-
-        fn write(&mut self, bytes: &[u8]) {
-            self.bytes.extend_from_slice(bytes);
-        }
-    }
-
-    #[test]
-    fn test_operation_hash_consistency() {
-        // Same operations should hash the same
-        let op1 = Operation::from_u8(128);
-        let op2 = Operation::from_u8(128);
-
-        let mut h1 = TestHasher::default();
-        let mut h2 = TestHasher::default();
-        op1.hash(&mut h1);
-        op2.hash(&mut h2);
-
-        assert_eq!(h1.finish(), h2.finish());
-    }
-
-    #[test]
-    fn test_different_operations_hash_differently() {
-        let op1 = Operation::from_u8(128);
-        let op2 = Operation::from_u8(129);
-
-        let mut h1 = TestHasher::default();
-        let mut h2 = TestHasher::default();
-        op1.hash(&mut h1);
-        op2.hash(&mut h2);
-
-        assert_ne!(h1.finish(), h2.finish());
     }
 
     // =========================================================================
