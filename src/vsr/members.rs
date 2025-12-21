@@ -70,11 +70,7 @@ impl Members {
             return None;
         }
         let val = self.0[idx];
-        if val == 0 {
-            None
-        } else {
-            Some(val)
-        }
+        if val == 0 { None } else { Some(val) }
     }
 }
 
@@ -205,7 +201,6 @@ fn cluster_config_checksum() -> u128 {
 mod tests {
     use super::*;
 
-
     #[test]
     fn members_zeroed() {
         let m = Members::zeroed();
@@ -331,7 +326,6 @@ mod tests {
         assert_eq!(m.get(255), None); // out of bounds
     }
 
-
     #[test]
     #[should_panic]
     fn members_count_invalid_panics() {
@@ -339,7 +333,7 @@ mod tests {
         m.0[0] = 1;
         m.0[1] = 0; // hole
         m.0[2] = 2;
-        
+
         let _ = m.count();
     }
 
