@@ -4,7 +4,6 @@
 //! their operation logs. This module provides [`ViewChangeSlice`] as a validated,
 //! borrowed view into these header sequences.
 
-#[allow(unused_imports)]
 use crate::{
     constants,
     stdx::bounded_array::BoundedArray,
@@ -600,6 +599,7 @@ mod tests {
     fn test_array_copy() {
         let array1 = ViewChangeArray::root(0x1234);
         let array2 = array1; // Copy
+        #[allow(clippy::clone_on_copy)]
         let array3 = array1.clone(); // Clone
 
         assert_eq!(array1.command(), array2.command());
@@ -753,6 +753,7 @@ mod proptests {
 
             let s1 = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
             let s2 = s1; // Copy
+            #[allow(clippy::clone_on_copy)]
             let s3 = s1.clone(); // Clone
 
             prop_assert_eq!(s1.command(), s2.command());
@@ -857,15 +858,15 @@ mod proptests {
         }
 
         /// Property: Copy/Clone produces equivalent arrays.
-        #[test]
-        fn prop_array_copy(
-            array in valid_view_change_array_strategy(),
-        ) {
-            let copied = array;
-            let cloned = array.clone();
+                #[test]
+                fn prop_array_copy(
+                    array in valid_view_change_array_strategy(),
+                ) {
+                    let copied = array;
+                    #[allow(clippy::clone_on_copy)]
+                    let cloned = array.clone();
 
-            prop_assert_eq!(array.command(), copied.command());
-            prop_assert_eq!(array.len(), copied.len());
+                    prop_assert_eq!(array.command(), copied.command());            prop_assert_eq!(array.len(), copied.len());
             prop_assert_eq!(array.remaining_capacity(), copied.remaining_capacity());
 
             prop_assert_eq!(array.command(), cloned.command());
