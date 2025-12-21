@@ -53,6 +53,9 @@ pub const VSR_VERSION: u16 = 1;
 /// Cluster identifier type used on the wire.
 pub type ClusterId = u128;
 
+/// Operations reserved for future use.
+pub const VSR_OPERATIONS_RESERVED: u8 = 128;
+
 // =============================================================================
 // VSR / superblock constants
 // =============================================================================
