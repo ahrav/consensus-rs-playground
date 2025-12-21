@@ -265,8 +265,10 @@ mod tests {
         h
     }
 
+    // --- ViewChangeSlice Tests ---
+
     #[test]
-    fn test_init_start_view() {
+    fn test_slice_init_start_view() {
         let headers = [header_prepare()];
         let slice = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
 
@@ -278,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn test_init_do_view_change() {
+    fn test_slice_init_do_view_change() {
         let headers = [header_prepare(), header_prepare()];
         let slice = ViewChangeSlice::init(ViewChangeCommand::DoViewChange, &headers);
 
@@ -288,7 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_clone() {
+    fn test_slice_init_max_capacity() {
+        let headers = [header_prepare(); constants::VIEW_HEADERS_MAX];
+        let slice = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
+        assert_eq!(slice.len(), constants::VIEW_HEADERS_MAX);
+        slice.verify();
+    }
+
+    #[test]
+    fn test_slice_copy() {
         let headers = [header_prepare()];
         let s1 = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
         let s2 = s1; // Copy
@@ -299,30 +309,22 @@ mod tests {
     }
 
     #[test]
-    fn test_bounds_max() {
-        let headers = [header_prepare(); constants::VIEW_HEADERS_MAX];
-        let slice = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
-        assert_eq!(slice.len(), constants::VIEW_HEADERS_MAX);
-        slice.verify();
-    }
-
-    #[test]
     #[should_panic(expected = "assertion")]
-    fn test_init_panic_empty() {
+    fn test_slice_init_empty_panics() {
         let headers: [HeaderPrepare; 0] = [];
         ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
     }
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_init_panic_oversized() {
+    fn test_slice_init_oversized_panics() {
         let headers = [header_prepare(); constants::VIEW_HEADERS_MAX + 1];
         ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
     }
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_verify_panic_inner_cmd() {
+    fn test_slice_verify_invalid_cmd_panics() {
         let mut invalid = header_prepare();
         invalid.command = Command::StartView; // Inner must be Prepare
         let headers = [invalid];
@@ -332,7 +334,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_verify_panic_mixed_cmds() {
+    fn test_slice_verify_mixed_cmds_panics() {
         let valid = header_prepare();
         let mut invalid = header_prepare();
         invalid.command = Command::Ping;
@@ -343,7 +345,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_verify_panic_empty_slice_direct() {
+    fn test_slice_verify_empty_panics() {
         let headers: [HeaderPrepare; 0] = [];
         let slice = ViewChangeSlice {
             command: ViewChangeCommand::StartView,
@@ -355,7 +357,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_verify_panic_oversized_slice_direct() {
+    fn test_slice_verify_oversized_panics() {
         let headers = vec![header_prepare(); constants::VIEW_HEADERS_MAX + 1];
         let slice = ViewChangeSlice {
             command: ViewChangeCommand::StartView,
@@ -366,7 +368,17 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_command() {
+    fn test_slice_verify_idempotent() {
+        let headers = [header_prepare()];
+        let slice = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
+        slice.verify();
+        slice.verify();
+    }
+
+    // --- ViewChangeCommand Tests ---
+
+    #[test]
+    fn test_command_try_from() {
         assert_eq!(
             ViewChangeCommand::try_from(Command::StartView),
             Ok(ViewChangeCommand::StartView)
@@ -382,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_from_command_accepts_only_view_change_commands() {
+    fn test_command_try_from_exhaustiveness() {
         for cmd in Command::ALL {
             let is_view_change = matches!(cmd, Command::StartView | Command::DoViewChange);
             assert_eq!(ViewChangeCommand::try_from(cmd).is_ok(), is_view_change);
@@ -390,33 +402,14 @@ mod tests {
     }
 
     #[test]
-    fn test_into_command() {
+    fn test_command_into() {
         let cmd: Command = ViewChangeCommand::StartView.into();
         assert_eq!(cmd, Command::StartView);
         let cmd: Command = ViewChangeCommand::DoViewChange.into();
         assert_eq!(cmd, Command::DoViewChange);
     }
 
-    #[test]
-    fn test_verify_idempotent() {
-        let headers = [header_prepare()];
-        let slice = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
-        slice.verify();
-        slice.verify();
-    }
-
-    #[test]
-    fn test_sanity_checks() {
-        const {
-            assert!(constants::VIEW_HEADERS_MAX >= 1);
-            assert!(constants::VIEW_HEADERS_MAX <= 1024);
-            assert!(
-                std::mem::size_of::<HeaderPrepare>() * constants::VIEW_HEADERS_MAX <= 1024 * 1024
-            );
-        }
-    }
-
-    // ViewChangeArray Tests
+    // --- ViewChangeArray Tests ---
 
     #[test]
     fn test_array_root() {
@@ -445,8 +438,28 @@ mod tests {
     }
 
     #[test]
+    fn test_array_init_do_view_change() {
+        let headers = [header_prepare(), header_prepare()];
+        let array = ViewChangeArray::init(ViewChangeCommand::DoViewChange, &headers);
+
+        assert_eq!(array.command(), ViewChangeCommand::DoViewChange);
+        assert_eq!(array.len(), 2);
+        array.verify();
+    }
+
+    #[test]
+    fn test_array_init_max_capacity() {
+        let headers = [header_prepare(); constants::VIEW_HEADERS_MAX];
+        let array = ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
+
+        assert_eq!(array.len(), constants::VIEW_HEADERS_MAX);
+        assert_eq!(array.remaining_capacity(), 0);
+        array.verify();
+    }
+
+    #[test]
     #[should_panic(expected = "assertion")]
-    fn test_array_init_panic_invalid_command() {
+    fn test_array_init_invalid_cmd_panics() {
         let mut invalid = header_prepare();
         invalid.command = Command::Ping;
         let headers = [invalid];
@@ -455,14 +468,14 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_array_init_panic_empty() {
+    fn test_array_init_empty_panics() {
         let headers: [HeaderPrepare; 0] = [];
         ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
     }
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_array_init_panic_oversized() {
+    fn test_array_init_oversized_panics() {
         let headers = [header_prepare(); constants::VIEW_HEADERS_MAX + 1];
         ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
     }
@@ -483,8 +496,33 @@ mod tests {
     }
 
     #[test]
+    fn test_array_push_multiple() {
+        let mut array = ViewChangeArray::root(0);
+        let initial_len = array.len();
+
+        for i in 0..5 {
+            array.push(header_prepare());
+            assert_eq!(array.len(), initial_len + i + 1);
+        }
+        array.verify();
+    }
+
+    #[test]
+    fn test_array_push_until_full() {
+        let mut array = ViewChangeArray::root(0);
+
+        while array.remaining_capacity() > 0 {
+            array.push(header_prepare());
+        }
+
+        assert_eq!(array.len(), constants::VIEW_HEADERS_MAX);
+        assert_eq!(array.remaining_capacity(), 0);
+        array.verify();
+    }
+
+    #[test]
     #[should_panic(expected = "assertion")]
-    fn test_array_push_panic_invalid_command() {
+    fn test_array_push_invalid_cmd_panics() {
         let mut array = ViewChangeArray::root(0);
         let mut invalid = header_prepare();
         invalid.command = Command::Ping;
@@ -493,7 +531,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "assertion")]
-    fn test_array_push_panic_full() {
+    fn test_array_push_full_panics() {
         let headers = [header_prepare(); constants::VIEW_HEADERS_MAX];
         let mut array = ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
         array.push(header_prepare());
@@ -507,6 +545,96 @@ mod tests {
 
         assert_eq!(slice.len(), 2);
         assert_eq!(slice.command(), ViewChangeCommand::StartView);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_array_as_slice_panic_empty_direct() {
+        let array = ViewChangeArray {
+            command: ViewChangeCommand::StartView,
+            array: BoundedArray::<HeaderPrepare, { constants::VIEW_HEADERS_MAX }>::new(),
+        };
+
+        let _ = array.as_slice();
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_array_verify_panic_empty_direct() {
+        let array = ViewChangeArray {
+            command: ViewChangeCommand::StartView,
+            array: BoundedArray::<HeaderPrepare, { constants::VIEW_HEADERS_MAX }>::new(),
+        };
+
+        array.verify();
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn test_array_verify_panic_invalid_header_direct() {
+        let mut invalid = header_prepare();
+        invalid.command = Command::Ping;
+
+        let mut inner = BoundedArray::<HeaderPrepare, { constants::VIEW_HEADERS_MAX }>::new();
+        inner.push(invalid);
+
+        let array = ViewChangeArray {
+            command: ViewChangeCommand::StartView,
+            array: inner,
+        };
+
+        array.verify();
+    }
+
+    #[test]
+    fn test_array_as_slice_reflects_pushes() {
+        let mut array = ViewChangeArray::root(0);
+
+        assert_eq!(array.as_slice().len(), 1);
+
+        array.push(header_prepare());
+        assert_eq!(array.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn test_array_copy() {
+        let array1 = ViewChangeArray::root(0x1234);
+        let array2 = array1; // Copy
+        let array3 = array1.clone(); // Clone
+
+        assert_eq!(array1.command(), array2.command());
+        assert_eq!(array1.len(), array2.len());
+        assert_eq!(array1.len(), array3.len());
+    }
+
+    #[test]
+    fn test_array_debug() {
+        let headers = [header_prepare(); 5];
+        let array = ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
+        let debug_str = format!("{:?}", array);
+
+        assert!(debug_str.contains("ViewChangeArray"));
+        assert!(debug_str.contains("command"));
+        assert!(debug_str.contains("len: 5"));
+        assert!(debug_str.contains("capacity"));
+    }
+
+    #[test]
+    fn test_array_verify_idempotent() {
+        let array = ViewChangeArray::root(0x42);
+        array.verify();
+        array.verify();
+    }
+
+    #[test]
+    fn test_sanity_checks() {
+        const {
+            assert!(constants::VIEW_HEADERS_MAX >= 1);
+            assert!(constants::VIEW_HEADERS_MAX <= 1024);
+            assert!(
+                std::mem::size_of::<HeaderPrepare>() * constants::VIEW_HEADERS_MAX <= 1024 * 1024
+            );
+        }
     }
 }
 
@@ -527,9 +655,11 @@ mod proptests {
     }
 
     proptest! {
+        // --- ViewChangeSlice Properties ---
+
         /// Property: init succeeds for valid commands and non-empty slices within bounds.
         #[test]
-        fn prop_init_valid_commands_succeed(
+        fn prop_slice_init_valid(
             cmd in valid_view_change_command_strategy(),
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
@@ -547,7 +677,7 @@ mod proptests {
 
         /// Property: verify passes when all headers are Command::Prepare.
         #[test]
-        fn prop_verify_all_prepare_headers(
+        fn prop_slice_verify_valid(
             cmd in valid_view_change_command_strategy(),
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
@@ -558,12 +688,12 @@ mod proptests {
             }; len];
 
             let slice = ViewChangeSlice::init(cmd, &headers);
-            slice.verify(); // Should not panic
+            slice.verify();
         }
 
         /// Property: len() returns the same value as the input slice length.
         #[test]
-        fn prop_len_matches_input(
+        fn prop_slice_len(
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
             let headers = vec![{
@@ -579,7 +709,7 @@ mod proptests {
 
         /// Property: is_empty() is always false (since empty slices are rejected).
         #[test]
-        fn prop_is_empty_always_false(
+        fn prop_slice_is_empty_false(
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
             let headers = vec![{
@@ -594,7 +724,7 @@ mod proptests {
 
         /// Property: slice() returns a reference to the original data.
         #[test]
-        fn prop_slice_returns_original_reference(
+        fn prop_slice_as_slice_ref(
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
             let headers = vec![{
@@ -612,7 +742,7 @@ mod proptests {
 
         /// Property: Copy and Clone produce equivalent instances.
         #[test]
-        fn prop_copy_clone_equivalent(
+        fn prop_slice_copy(
             len in 1usize..=constants::VIEW_HEADERS_MAX,
         ) {
             let headers = vec![{
@@ -621,34 +751,19 @@ mod proptests {
                 h
             }; len];
 
-            let slice1 = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
-            let slice2 = slice1;
-            let slice3 = slice1;
+            let s1 = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
+            let s2 = s1; // Copy
+            let s3 = s1.clone(); // Clone
 
-            prop_assert_eq!(slice1.command(), slice2.command());
-            prop_assert_eq!(slice1.len(), slice2.len());
-            prop_assert_eq!(slice1.command(), slice3.command());
-            prop_assert_eq!(slice1.len(), slice3.len());
+            prop_assert_eq!(s1.command(), s2.command());
+            prop_assert_eq!(s1.len(), s2.len());
+            prop_assert_eq!(s1.command(), s3.command());
+            prop_assert_eq!(s1.len(), s3.len());
         }
 
-        /// Property: Both valid view change commands are accepted.
+        /// Property: verify is idempotent.
         #[test]
-        fn prop_both_valid_commands_accepted(
-            cmd in valid_view_change_command_strategy(),
-        ) {
-            let headers = vec![{
-                let mut h = HeaderPrepare::new();
-                h.command = Command::Prepare;
-                h
-            }; 5];
-
-            let slice = ViewChangeSlice::init(cmd, &headers);
-            prop_assert_eq!(slice.command(), cmd);
-        }
-
-        /// Property: verify is idempotent - can be called multiple times.
-        #[test]
-        fn prop_verify_idempotent(
+        fn prop_slice_verify_idempotent(
             len in 1usize..=constants::VIEW_HEADERS_MAX,
             call_count in 1usize..10,
         ) {
@@ -665,7 +780,7 @@ mod proptests {
             }
         }
 
-        // ViewChangeArray Properties
+        // --- ViewChangeArray Properties ---
 
         /// Property: root() creates a valid, non-empty array with StartView command.
         #[test]
@@ -675,7 +790,7 @@ mod proptests {
             prop_assert_eq!(array.len(), 1);
             prop_assert!(!array.is_empty());
             prop_assert!(array.remaining_capacity() < constants::VIEW_HEADERS_MAX);
-            array.verify(); // Should not panic
+            array.verify();
         }
 
         /// Property: init() succeeds for valid Prepare headers and view commands.
@@ -696,7 +811,7 @@ mod proptests {
             array.verify();
         }
 
-        /// Property: pushing a valid Prepare header increments length and maintains invariants.
+        /// Property: pushing a valid Prepare header increments length.
         #[test]
         fn prop_array_push_valid(
             mut array in valid_view_change_array_strategy(),
@@ -710,6 +825,105 @@ mod proptests {
                 prop_assert_eq!(array.len(), old_len + 1);
                 array.verify();
             }
+        }
+
+        /// Property: remaining_capacity is always VIEW_HEADERS_MAX - len.
+        #[test]
+        fn prop_array_capacity(
+            array in valid_view_change_array_strategy(),
+        ) {
+            prop_assert_eq!(
+                array.remaining_capacity(),
+                constants::VIEW_HEADERS_MAX - array.len()
+            );
+        }
+
+        /// Property: as_slice returns a slice with matching command and length.
+        #[test]
+        fn prop_array_as_slice(
+            array in valid_view_change_array_strategy(),
+        ) {
+            let slice = array.as_slice();
+            prop_assert_eq!(slice.command(), array.command());
+            prop_assert_eq!(slice.len(), array.len());
+        }
+
+        /// Property: is_empty is always false for arrays constructed via public API.
+        #[test]
+        fn prop_array_is_empty_false(
+            array in valid_view_change_array_strategy(),
+        ) {
+            prop_assert!(!array.is_empty());
+        }
+
+        /// Property: Copy/Clone produces equivalent arrays.
+        #[test]
+        fn prop_array_copy(
+            array in valid_view_change_array_strategy(),
+        ) {
+            let copied = array;
+            let cloned = array.clone();
+
+            prop_assert_eq!(array.command(), copied.command());
+            prop_assert_eq!(array.len(), copied.len());
+            prop_assert_eq!(array.remaining_capacity(), copied.remaining_capacity());
+
+            prop_assert_eq!(array.command(), cloned.command());
+            prop_assert_eq!(array.len(), cloned.len());
+            prop_assert_eq!(array.remaining_capacity(), cloned.remaining_capacity());
+        }
+
+        /// Property: Can push exactly remaining_capacity headers.
+        #[test]
+        fn prop_array_push_to_capacity(
+            initial_len in 1usize..constants::VIEW_HEADERS_MAX,
+        ) {
+            let headers = vec![{
+                let mut h = HeaderPrepare::new();
+                h.command = Command::Prepare;
+                h
+            }; initial_len];
+            let mut array = ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
+
+            let to_push = array.remaining_capacity();
+            for _ in 0..to_push {
+                let mut h = HeaderPrepare::new();
+                h.command = Command::Prepare;
+                array.push(h);
+            }
+
+            prop_assert_eq!(array.len(), constants::VIEW_HEADERS_MAX);
+            prop_assert_eq!(array.remaining_capacity(), 0);
+            array.verify();
+        }
+
+        /// Property: verify is idempotent for arrays.
+        #[test]
+        fn prop_array_verify_idempotent(
+            array in valid_view_change_array_strategy(),
+            call_count in 1usize..10,
+        ) {
+            for _ in 0..call_count {
+                array.verify();
+            }
+        }
+
+        /// Property: Debug output contains current length.
+        #[test]
+        fn prop_array_debug_contains_len(
+            array in valid_view_change_array_strategy(),
+        ) {
+            let debug_str = format!("{:?}", array);
+            let expected = format!("len: {}", array.len());
+            prop_assert!(debug_str.contains(&expected));
+        }
+
+        /// Property: root cluster ID is preserved in the header.
+        #[test]
+        fn prop_array_root_preserves_cluster(cluster in any::<u128>()) {
+            let array = ViewChangeArray::root(cluster);
+            let root_header = &array.as_slice().slice()[0];
+            prop_assert_eq!(root_header.cluster, cluster);
         }
     }
 
