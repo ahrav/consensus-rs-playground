@@ -155,7 +155,7 @@ mod tests {
         let headers = [header_prepare()];
         let s1 = ViewChangeSlice::init(ViewChangeCommand::StartView, &headers);
         let s2 = s1; // Copy
-        let s3 = s1.clone(); // Clone
+        let s3 = s1; // Copy
 
         assert_eq!(s1.command(), s2.command());
         assert_eq!(s1.len(), s3.len());
@@ -238,11 +238,13 @@ mod tests {
 
     #[test]
     fn test_sanity_checks() {
-        assert!(constants::VIEW_HEADERS_MAX >= 1);
-        assert!(constants::VIEW_HEADERS_MAX <= 1024);
-        assert!(
-            std::mem::size_of::<HeaderPrepare>() * constants::VIEW_HEADERS_MAX <= 1024 * 1024
-        );
+        const {
+            assert!(constants::VIEW_HEADERS_MAX >= 1);
+            assert!(constants::VIEW_HEADERS_MAX <= 1024);
+            assert!(
+                std::mem::size_of::<HeaderPrepare>() * constants::VIEW_HEADERS_MAX <= 1024 * 1024
+            );
+        }
     }
 }
 
