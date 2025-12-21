@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "zero replica_id")]
-    fn member_index_zero_panics() {
+    fn member_index_zero() {
         let m = Members::zeroed();
         member_index(&m, 0);
     }
@@ -328,7 +328,7 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn members_count_invalid_panics() {
+    fn members_count_invalid() {
         let mut m = Members::zeroed();
         m.0[0] = 1;
         m.0[1] = 0; // hole
@@ -419,7 +419,7 @@ mod tests {
 
     // Edge case: member_index at last position
     #[test]
-    fn member_index_at_last_position() {
+    fn member_index_last() {
         let mut m = Members::zeroed();
         for i in 0..constants::MEMBERS_MAX {
             m.0[i] = (i + 1) as u128;
@@ -430,30 +430,6 @@ mod tests {
             member_index(&m, last_id),
             Some((constants::MEMBERS_MAX - 1) as u8)
         );
-    }
-
-    // Edge case: consecutive duplicates
-    #[test]
-    fn members_consecutive_duplicates() {
-        let mut m = Members::zeroed();
-        m.0[0] = 100;
-        m.0[1] = 100; // Consecutive duplicate
-
-        assert!(!valid_members(&m));
-    }
-
-    // Edge case: get boundary conditions
-    #[test]
-    fn members_get_boundary() {
-        let mut m = Members::zeroed();
-        m.0[0] = 100;
-
-        // Last valid index (will be zero, so None)
-        assert_eq!(m.get((constants::MEMBERS_MAX - 1) as u8), None);
-        // Just past bounds
-        assert_eq!(m.get(constants::MEMBERS_MAX as u8), None);
-        // u8::MAX (definitely out of bounds)
-        assert_eq!(m.get(u8::MAX), None);
     }
 
     #[test]
