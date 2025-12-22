@@ -301,6 +301,7 @@ impl VsrState {
         assert!(state.commit_max == 0);
         assert!(state.view == 0);
         assert!(state.replica_count == 0);
+        assert!(state.reserved == [0u8; 779]);
 
         state
     }
