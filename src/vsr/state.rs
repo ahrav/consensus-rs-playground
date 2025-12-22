@@ -200,6 +200,8 @@ impl CheckpointState {
         assert!(state.manifest_oldest_checksum_padding == 0);
         assert!(state.manifest_newest_checksum_padding == 0);
         assert!(state.snapshots_block_checksum_padding == 0);
+        assert!(state.reserved_manifest == [0u8; 4]);
+        assert!(state.reserved == [0u8; 388]);
 
         state
     }
