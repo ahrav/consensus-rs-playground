@@ -207,7 +207,7 @@ impl CheckpointState {
     /// Asserts all padding fields are zero.
     ///
     /// Call after deserializing from storage or network to detect corruption
-    /// or protocol violations. Non-zero padding or reserved fields indicates invalid state.
+    /// or protocol violations. Non-zero padding or reserved fields indicate invalid state.
     #[inline]
     pub fn assert_padding_zeroed(&self) {
         assert!(
@@ -238,10 +238,7 @@ impl CheckpointState {
             self.reserved_manifest == [0u8; 4],
             "reserved_manifest non-zero"
         );
-        assert!(
-            self.reserved == [0u8; 388],
-            "checkpoint reserved non-zero"
-        );
+        assert!(self.reserved == [0u8; 388], "checkpoint reserved non-zero");
     }
 }
 
@@ -253,11 +250,11 @@ impl CheckpointState {
 ///
 /// # Invariants
 ///
-    /// - `replica_id` must exist in `members`
-    /// - `commit_max >= checkpoint.header.op`
-    /// - `view >= log_view`
-    /// - `sync_op_max >= sync_op_min`
-    /// - `members.count() >= replica_count`
+/// - `replica_id` must exist in `members`
+/// - `commit_max >= checkpoint.header.op`
+/// - `view >= log_view`
+/// - `sync_op_max >= sync_op_min`
+/// - `members.count() >= replica_count`
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VsrState {
