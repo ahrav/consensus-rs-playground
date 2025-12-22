@@ -158,10 +158,11 @@ impl SuperBlockHeader {
     /// # Safety
     ///
     /// Relies on the invariant that headers are created via [`zeroed()`](Self::zeroed)
-    /// or read from storage with all bytes initialized.
+    /// or read from storage with all bytes initialized. `ViewChangeArray` constructors
+    /// zero-fill unused slots and padding to keep the header byte-initialized.
     pub fn calculate_checksum(&self) -> Checksum128 {
         // SAFETY: SuperBlockHeader instances are created via `zeroed()` or read from
-        // storage, ensuring all bytes are initialized.
+        // storage, and ViewChangeArray constructors zero-fill unused slots/padding.
         let bytes = unsafe { as_bytes_unchecked(self) };
         assert!(bytes.len() > Self::CHECKSUM_EXCLUDE_SIZE);
 
@@ -198,7 +199,7 @@ impl SuperBlockHeader {
             && self.cluster == other.cluster
             && self.sequence == other.sequence
             && self.parent == other.parent
-            // SAFETY: VsrState and ViewChangeArray are repr(C) with initialized bytes.
+            // SAFETY: VsrState is Pod, and ViewChangeArray constructors zero-fill bytes.
             && unsafe {
                 as_bytes_unchecked(&self.vsr_state) == as_bytes_unchecked(&other.vsr_state)
             }

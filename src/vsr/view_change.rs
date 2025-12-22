@@ -21,11 +21,16 @@ const _: () = {
 /// Commands valid in view change context.
 ///
 /// Only [`Command::StartView`] and [`Command::DoViewChange`] are permitted.
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewChangeCommand {
     StartView,
     DoViewChange,
 }
+
+const _: () = {
+    assert!(ViewChangeCommand::StartView as u8 == 0);
+};
 
 impl TryFrom<Command> for ViewChangeCommand {
     type Error = ();
@@ -133,6 +138,13 @@ pub struct ViewChangeArray {
 }
 
 impl ViewChangeArray {
+    #[inline]
+    fn zeroed() -> Self {
+        // SAFETY: ViewChangeCommand is repr(u8) with StartView == 0, and BoundedArray
+        // can be all-zero. Zeroing keeps padding/unused slots initialized for hashing.
+        unsafe { core::mem::zeroed() }
+    }
+
     /// Creates a new array containing only the root prepare header for `cluster`.
     ///
     /// The root header represents op 0 and serves as the initial state for a new view.
@@ -142,15 +154,12 @@ impl ViewChangeArray {
         let root_header = HeaderPrepare::root(cluster);
         assert!(root_header.command == Command::Prepare);
 
-        let mut array = BoundedArray::<HeaderPrepare, { constants::VIEW_HEADERS_MAX }>::new();
-        assert!(array.len() <= constants::VIEW_HEADERS_MAX);
-        array.push(root_header);
-        assert!(array.len() == 1);
+        let mut result = Self::zeroed();
+        assert!(result.array.len() <= constants::VIEW_HEADERS_MAX);
+        result.command = ViewChangeCommand::StartView;
+        result.array.push(root_header);
+        assert!(result.array.len() == 1);
 
-        let result = Self {
-            command: ViewChangeCommand::StartView,
-            array,
-        };
         result.verify();
         result
     }
@@ -167,11 +176,12 @@ impl ViewChangeArray {
         assert!(slice.len() <= constants::VIEW_HEADERS_MAX);
         assert!(slice.iter().all(|h| h.command == Command::Prepare));
 
-        let mut array = BoundedArray::<HeaderPrepare, { constants::VIEW_HEADERS_MAX }>::new();
-        array.extend_from_slice(slice);
-        assert!(array.len() == slice.len());
+        let mut result = Self::zeroed();
+        result.command = command;
+        result.array.extend_from_slice(slice);
+        assert!(result.array.len() == slice.len());
 
-        Self { command, array }
+        result
     }
 
     /// Appends a prepare header to the array.
