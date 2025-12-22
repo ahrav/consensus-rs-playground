@@ -78,6 +78,34 @@ pub unsafe fn as_bytes<T: Pod>(v: &T) -> &[u8] {
     result
 }
 
+/// Reinterprets a reference as a byte slice without requiring `Pod`.
+///
+/// # Safety
+///
+/// Caller must ensure all bytes of `v` are initialized (e.g., via `mem::zeroed()`
+/// or by reading from storage). Reading uninitialized bytes is undefined behavior.
+///
+/// # Panics
+///
+/// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
+#[inline]
+pub unsafe fn as_bytes_unchecked<T>(v: &T) -> &[u8] {
+    const { assert!(size_of::<T>() > 0) };
+    assert!(size_of::<T>() <= isize::MAX as usize);
+
+    let ptr = v as *const T;
+    assert!(ptr.is_aligned());
+
+    let byte_ptr = ptr.cast::<u8>();
+    let len = size_of::<T>();
+    let result = unsafe { slice::from_raw_parts(byte_ptr, len) };
+
+    assert_eq!(result.len(), size_of::<T>());
+    assert_eq!(result.as_ptr() as usize, ptr as usize);
+
+    result
+}
+
 /// Mutable version of [`as_bytes`].
 ///
 /// # Safety
@@ -142,7 +170,7 @@ pub unsafe fn equal_bytes<T: Pod>(a: &T, b: &T) -> bool {
 ///
 /// Panics if `alignment` is not a power of two or if the result overflows.
 #[inline]
-pub fn align_up(value: usize, alignment: usize) -> usize {
+pub const fn align_up(value: usize, alignment: usize) -> usize {
     assert!(alignment > 0);
     assert!(alignment.is_power_of_two());
     assert!(alignment <= isize::MAX as usize);
@@ -156,10 +184,6 @@ pub fn align_up(value: usize, alignment: usize) -> usize {
     assert!(result >= value);
     assert!(result.is_multiple_of(alignment));
     assert!(result - value < alignment);
-
-    if value.is_multiple_of(alignment) {
-        assert_eq!(result, value);
-    }
 
     result
 }
