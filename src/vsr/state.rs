@@ -57,6 +57,7 @@ impl RootOptions {
     /// - `replica_count` is zero or exceeds [`constants::REPLICAS_MAX`]
     /// - `replica_index` is out of bounds
     /// - `members` contains invalid entries
+    /// - `members` has fewer entries than `replica_count`
     /// - This replica's member ID is zero (unassigned)
     #[inline]
     pub fn validate(&self) {
@@ -64,6 +65,10 @@ impl RootOptions {
         assert!((self.replica_count as usize) <= constants::REPLICAS_MAX);
         assert!((self.replica_index as usize) < (self.replica_count as usize));
         assert!(valid_members(&self.members));
+        assert!(
+            self.members.count() >= self.replica_count,
+            "members.count() < replica_count"
+        );
 
         let replica_id = self.members.0[self.replica_index as usize];
         assert!(replica_id != 0);
@@ -202,7 +207,7 @@ impl CheckpointState {
     /// Asserts all padding fields are zero.
     ///
     /// Call after deserializing from storage or network to detect corruption
-    /// or protocol violations. Non-zero padding indicates invalid state.
+    /// or protocol violations. Non-zero padding or reserved fields indicates invalid state.
     #[inline]
     pub fn assert_padding_zeroed(&self) {
         assert!(
@@ -229,6 +234,14 @@ impl CheckpointState {
             self.snapshots_block_checksum_padding == 0,
             "snapshots_block padding non-zero"
         );
+        assert!(
+            self.reserved_manifest == [0u8; 4],
+            "reserved_manifest non-zero"
+        );
+        assert!(
+            self.reserved == [0u8; 388],
+            "checkpoint reserved non-zero"
+        );
     }
 }
 
@@ -240,10 +253,11 @@ impl CheckpointState {
 ///
 /// # Invariants
 ///
-/// - `replica_id` must exist in `members`
-/// - `commit_max >= checkpoint.header.op`
-/// - `view >= log_view`
-/// - `sync_op_max >= sync_op_min`
+    /// - `replica_id` must exist in `members`
+    /// - `commit_max >= checkpoint.header.op`
+    /// - `view >= log_view`
+    /// - `sync_op_max >= sync_op_min`
+    /// - `members.count() >= replica_count`
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct VsrState {
@@ -387,9 +401,13 @@ impl VsrState {
     /// Panics if any internal invariants are violated.
     ///
     /// Validates replica membership, field ordering constraints, checkpoint
-    /// padding, and consistency of free set, client sessions, and manifest state.
+    /// padding/reserved bytes, and consistency of free set, client sessions, and manifest state.
     pub fn assert_internally_consistent(&self) {
         assert!(member_index(&self.members, self.replica_id).is_some());
+        assert!(
+            self.members.count() >= self.replica_count,
+            "members.count() < replica_count"
+        );
         assert!(self.commit_max >= self.checkpoint.header.op);
         assert!(self.sync_op_max >= self.sync_op_min);
         assert!(self.view >= self.log_view);
@@ -401,6 +419,7 @@ impl VsrState {
         assert!(self.checkpoint.snapshots_block_address == 0);
 
         assert!(self.checkpoint.storage_size >= constants::DATA_FILE_SIZE_MIN);
+        assert!(self.reserved == [0u8; 779], "state reserved non-zero");
 
         let checksum_empty = checksum(&[]);
         self.assert_free_set_acquired_consistent(checksum_empty);
@@ -577,7 +596,7 @@ impl VsrState {
     /// Returns `true` if `new` represents valid forward progress from `old`.
     ///
     /// Monotonicity ensures state never regresses: checkpoint op, commit_max,
-    /// sync bounds, and view numbers must all be non-decreasing. States with
+    /// sync bounds, sync_view, and view numbers must all be non-decreasing. States with
     /// the same checkpoint op must be byte-identical (no silent overwrites).
     ///
     /// # Panics
@@ -619,6 +638,9 @@ impl VsrState {
             return false;
         }
         if old.sync_op_max > new.sync_op_max {
+            return false;
+        }
+        if old.sync_view > new.sync_view {
             return false;
         }
         if old.log_view > new.log_view {
@@ -825,6 +847,59 @@ mod tests {
         options.validate();
     }
 
+    #[test]
+    #[should_panic]
+    fn test_root_invalid_members_shorter_than_replica_count() {
+        let mut members = Members([0; constants::MEMBERS_MAX]);
+        members.0[0] = 1;
+
+        let options = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 2,
+            members,
+            release: Release::ZERO,
+            view: 0,
+        };
+        options.validate();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_root_invalid_members_duplicate() {
+        let mut members = Members([0; constants::MEMBERS_MAX]);
+        members.0[0] = 1;
+        members.0[1] = 1;
+
+        let options = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 2,
+            members,
+            release: Release::ZERO,
+            view: 0,
+        };
+        options.validate();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_root_invalid_members_non_contiguous() {
+        let mut members = Members([0; constants::MEMBERS_MAX]);
+        members.0[0] = 1;
+        members.0[2] = 2;
+
+        let options = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 2,
+            members,
+            release: Release::ZERO,
+            view: 0,
+        };
+        options.validate();
+    }
+
     // =========================================================================
     // CheckpointState Tests
     // =========================================================================
@@ -888,6 +963,22 @@ mod tests {
     fn test_padding_snapshots() {
         let mut state = CheckpointState::zeroed();
         state.snapshots_block_checksum_padding = 1;
+        state.assert_padding_zeroed();
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved_manifest non-zero")]
+    fn test_padding_reserved_manifest() {
+        let mut state = CheckpointState::zeroed();
+        state.reserved_manifest[0] = 1;
+        state.assert_padding_zeroed();
+    }
+
+    #[test]
+    #[should_panic(expected = "checkpoint reserved non-zero")]
+    fn test_padding_reserved_checkpoint() {
+        let mut state = CheckpointState::zeroed();
+        state.reserved[0] = 1;
         state.assert_padding_zeroed();
     }
 
@@ -995,6 +1086,15 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "members.count() < replica_count")]
+    fn test_consistent_members_shorter_than_replica_count() {
+        let options = make_valid_root_options(2, 0);
+        let mut state = VsrState::root(&options);
+        state.members.0[1] = 0;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
     #[should_panic]
     fn test_consistent_commit_max() {
         let options = make_valid_root_options(1, 0);
@@ -1069,6 +1169,15 @@ mod tests {
         state.assert_internally_consistent();
     }
 
+    #[test]
+    #[should_panic(expected = "state reserved non-zero")]
+    fn test_consistent_state_reserved_nonzero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.reserved[0] = 1;
+        state.assert_internally_consistent();
+    }
+
     // =========================================================================
     // Free Set Consistency Tests
     // =========================================================================
@@ -1094,6 +1203,25 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "free_set_acquired: addr=0 but checksum != empty")]
+    fn test_free_set_acquired_checksum_empty() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.free_set_blocks_acquired_checksum = 0;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
+    #[should_panic(expected = "free_set_acquired: addr=")]
+    fn test_free_set_acquired_addr_nonzero_size_zero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.free_set_blocks_acquired_last_block_address = constants::BLOCK_SIZE;
+        state.checkpoint.free_set_blocks_acquired_size = 0;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
     #[should_panic(expected = "free_set_released: addr=0 but size=")]
     fn test_free_set_released_addr_zero() {
         let options = make_valid_root_options(1, 0);
@@ -1113,6 +1241,25 @@ mod tests {
         state.assert_internally_consistent();
     }
 
+    #[test]
+    #[should_panic(expected = "free_set_released: addr=0 but checksum != empty")]
+    fn test_free_set_released_checksum_empty() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.free_set_blocks_released_checksum = 0;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
+    #[should_panic(expected = "free_set_released: addr=")]
+    fn test_free_set_released_addr_nonzero_size_zero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.free_set_blocks_released_last_block_address = constants::BLOCK_SIZE;
+        state.checkpoint.free_set_blocks_released_size = 0;
+        state.assert_internally_consistent();
+    }
+
     // =========================================================================
     // Client Sessions Consistency Tests
     // =========================================================================
@@ -1127,11 +1274,30 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "client_sessions: addr=0 but checksum != empty")]
+    fn test_client_sessions_checksum_empty() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.client_sessions_checksum = 0;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
     #[should_panic(expected = "client_sessions: addr=0 but size=")]
     fn test_client_sessions_size() {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
         state.checkpoint.client_sessions_size = 100;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
+    #[should_panic(expected = "client_sessions: size")]
+    fn test_client_sessions_size_mismatch_when_addr_nonzero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.client_sessions_last_block_address = constants::BLOCK_SIZE;
+        state.checkpoint.client_sessions_size = client_sessions_encode_size() + 8;
         state.assert_internally_consistent();
     }
 
@@ -1172,6 +1338,30 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
         state.checkpoint.manifest_newest_checksum = 1;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
+    #[should_panic(expected = "manifest: count=1 but oldest_checksum=0")]
+    fn test_manifest_nonzero_oldest_checksum_zero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.manifest_block_count = 1;
+        state.checkpoint.manifest_oldest_address = constants::BLOCK_SIZE;
+        state.checkpoint.manifest_newest_address = constants::BLOCK_SIZE;
+        state.checkpoint.manifest_newest_checksum = 1;
+        state.assert_internally_consistent();
+    }
+
+    #[test]
+    #[should_panic(expected = "manifest: count=1 but newest_checksum=0")]
+    fn test_manifest_nonzero_newest_checksum_zero() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.manifest_block_count = 1;
+        state.checkpoint.manifest_oldest_address = constants::BLOCK_SIZE;
+        state.checkpoint.manifest_oldest_checksum = 1;
+        state.checkpoint.manifest_newest_address = constants::BLOCK_SIZE;
         state.assert_internally_consistent();
     }
 
@@ -1249,11 +1439,34 @@ mod tests {
     }
 
     #[test]
+    fn test_monotonic_sync_view_increase() {
+        let options = make_valid_root_options(1, 0);
+        let old = VsrState::root(&options);
+        let mut new = old;
+        new.sync_view = 5;
+        new.view = 5;
+        assert!(VsrState::monotonic(&old, &new));
+        assert!(VsrState::would_be_updated_by(&old, &new));
+    }
+
+    #[test]
     fn test_monotonic_view_regression() {
         let options = make_valid_root_options(1, 0);
         let mut old = VsrState::root(&options);
         let new = old;
         old.view = 10;
+        assert!(!VsrState::monotonic(&old, &new));
+    }
+
+    #[test]
+    fn test_monotonic_sync_view_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut old = VsrState::root(&options);
+        let mut new = old;
+        old.sync_view = 10;
+        old.view = 10;
+        new.sync_view = 0;
+        new.view = 10;
         assert!(!VsrState::monotonic(&old, &new));
     }
 
@@ -1343,6 +1556,48 @@ mod tests {
         new.checkpoint.parent_checkpoint_id = 1; // Different parent
         new.commit_max = 100; // Must satisfy commit_max >= checkpoint.header.op
         assert!(VsrState::monotonic(&old, &new));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_monotonic_checkpoint_same_op_changes_panics() {
+        let options = make_valid_root_options(1, 0);
+        let old = VsrState::root(&options);
+        let mut new = old;
+        new.checkpoint.storage_size = constants::DATA_FILE_SIZE_MIN + constants::BLOCK_SIZE;
+        VsrState::monotonic(&old, &new);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_monotonic_members_mismatch_panics() {
+        let mut members_old = Members([0; constants::MEMBERS_MAX]);
+        members_old.0[0] = 1;
+        members_old.0[1] = 2;
+        let options_old = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 2,
+            members: members_old,
+            release: Release::ZERO,
+            view: 0,
+        };
+
+        let mut members_new = Members([0; constants::MEMBERS_MAX]);
+        members_new.0[0] = 1;
+        members_new.0[1] = 3;
+        let options_new = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 2,
+            members: members_new,
+            release: Release::ZERO,
+            view: 0,
+        };
+
+        let old = VsrState::root(&options_old);
+        let new = VsrState::root(&options_new);
+        VsrState::monotonic(&old, &new);
     }
 
     #[test]
