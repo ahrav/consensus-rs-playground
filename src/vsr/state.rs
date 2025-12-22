@@ -4,13 +4,11 @@
 //! - Initializing a new replica with [`RootOptions`]
 //! - Persisting checkpoint state to durable storage with [`CheckpointState`]
 
-#[allow(unused_imports)]
-use core::{mem, slice};
+use core::mem;
 
-#[allow(unused_imports)]
 use crate::{
     constants,
-    util::{Pod, as_bytes, equal_bytes},
+    util::{Pod, equal_bytes},
     vsr::{
         HeaderPrepare, Members, member_index, valid_members,
         wire::{Checksum128, checksum, header::Release},
