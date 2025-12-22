@@ -698,12 +698,7 @@ fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
     if checkpoint == 0 {
         return None;
     }
-
-    let trigger = checkpoint
-        .checked_add(constants::LSM_COMPACTION_OPS)
-        .expect("trigger_for_checkpoint overflow");
-    assert!(trigger > checkpoint);
-    Some(trigger)
+    Some(checkpoint)
 }
 
 #[cfg(test)]
@@ -1388,6 +1383,21 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn test_op_compacted_correctness_check() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // Checkpoint at op 100
+        state.checkpoint.header.op = 100;
+
+        // Op 100 is in the checkpoint -> compacted
+        assert!(state.op_compacted(100));
+
+        // Op 101 is NOT in the checkpoint -> NOT compacted
+        assert!(!state.op_compacted(101));
+    }
+
+    #[test]
     fn test_op_compacted_checkpoint_zero() {
         let options = make_valid_root_options(1, 0);
         let state = VsrState::root(&options);
@@ -1404,7 +1414,7 @@ mod tests {
         let mut state = VsrState::root(&options);
 
         state.checkpoint.header.op = 100;
-        let trigger = 100 + constants::LSM_COMPACTION_OPS;
+        let trigger = 100;
 
         // Ops at or before trigger are compacted
         assert!(state.op_compacted(0));
@@ -1424,7 +1434,7 @@ mod tests {
 
         // Use a small checkpoint op to test boundary precisely
         state.checkpoint.header.op = 1;
-        let trigger = 1 + constants::LSM_COMPACTION_OPS;
+        let trigger = 1;
 
         assert!(state.op_compacted(trigger));
         assert!(!state.op_compacted(trigger + 1));
@@ -1444,14 +1454,14 @@ mod tests {
         let checkpoint = 100;
         let trigger = trigger_for_checkpoint(checkpoint);
         assert!(trigger.is_some());
-        assert_eq!(trigger.unwrap(), checkpoint + constants::LSM_COMPACTION_OPS);
+        assert_eq!(trigger.unwrap(), checkpoint);
     }
 
     #[test]
     fn test_trigger_for_checkpoint_one() {
         let trigger = trigger_for_checkpoint(1);
         assert!(trigger.is_some());
-        assert_eq!(trigger.unwrap(), 1 + constants::LSM_COMPACTION_OPS);
+        assert_eq!(trigger.unwrap(), 1);
     }
 
     #[test]
@@ -1582,8 +1592,7 @@ mod proptests {
         fn prop_trigger_for_checkpoint_nonzero_returns_some(checkpoint in 1u64..u64::MAX / 2) {
             let trigger = trigger_for_checkpoint(checkpoint);
             prop_assert!(trigger.is_some());
-            prop_assert!(trigger.unwrap() > checkpoint);
-            prop_assert_eq!(trigger.unwrap(), checkpoint + constants::LSM_COMPACTION_OPS);
+            prop_assert_eq!(trigger.unwrap(), checkpoint);
         }
 
         #[test]
