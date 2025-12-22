@@ -12,7 +12,6 @@
 #![allow(dead_code)]
 #[allow(unused_imports)]
 use core::mem::size_of;
-use core::ptr::NonNull;
 
 use crate::vsr::wire::checksum;
 #[allow(unused_imports)]
@@ -48,6 +47,7 @@ const MAX_QUEUE_DEPTH: usize = 16;
 const MAX_REPAIR_ITERATIONS: usize = constants::SUPERBLOCK_COPIES * 2;
 
 // Compile-time invariant checks.
+#[allow(clippy::manual_is_multiple_of)]
 const _: () = {
     assert!(SUPERBLOCK_VERSION > 0);
 
@@ -85,8 +85,8 @@ pub fn assert_bounds(offset: u64, len: usize) {
     assert!(offset < constants::SUPERBLOCK_ZONE_SIZE);
     assert!(offset.checked_add(len as u64).is_some());
     assert!(offset + (len as u64) <= constants::SUPERBLOCK_ZONE_SIZE);
-    assert!(offset % constants::SECTOR_SIZE as u64 == 0);
-    assert!(len % constants::SECTOR_SIZE == 0);
+    assert!(offset.is_multiple_of(constants::SECTOR_SIZE as u64));
+    assert!(len.is_multiple_of(constants::SECTOR_SIZE));
 }
 
 /// Persistent header written to each superblock copy.
@@ -254,9 +254,10 @@ mod tests {
     // =========================================================================
 
     #[test]
+    #[allow(clippy::manual_is_multiple_of)]
     fn test_superblock_copy_size_aligned() {
-        assert!(SUPERBLOCK_COPY_SIZE > 0);
-        assert!(SUPERBLOCK_COPY_SIZE % constants::SECTOR_SIZE == 0);
+        const { assert!(SUPERBLOCK_COPY_SIZE > 0) };
+        const { assert!(SUPERBLOCK_COPY_SIZE % constants::SECTOR_SIZE == 0) };
     }
 
     #[test]
