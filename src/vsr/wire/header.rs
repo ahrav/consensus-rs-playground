@@ -26,7 +26,7 @@
 
 use super::constants::{ClusterId, HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX, VSR_VERSION};
 use super::{Checksum128, Command, checksum};
-use crate::util::zero::is_all_zeros;
+use crate::util::{Pod, zero::is_all_zeros};
 
 /// Byte offset where checksummed content begins (after the checksum field itself).
 const CHECKSUM_SIZE: u32 = 16;
@@ -39,6 +39,10 @@ const _: () = assert!(HEADER_SIZE > CHECKSUM_SIZE);
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct Release(pub u32);
+
+// SAFETY: Release is repr(transparent) over u32, which is Pod.
+// No padding bytes exist; all bytes are initialized for any valid value.
+unsafe impl Pod for Release {}
 
 impl Release {
     /// Zero release indicates no specific version requirement.
