@@ -9,3 +9,6 @@ pub mod wire;
 
 pub use header_prepare::HeaderPrepare;
 pub use members::{Members, member_index, valid_members};
+pub use state::VsrState;
+pub use view_change::{ViewChangeArray, ViewChangeCommand, ViewChangeSlice};
+pub use wire::Header;
