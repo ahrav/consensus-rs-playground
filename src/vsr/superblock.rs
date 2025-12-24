@@ -221,6 +221,37 @@ impl SuperBlockHeader {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Caller {
+    None,
+    Open,
+    Format,
+    Checkpoint,
+    ViewChange,
+}
+
+impl Caller {
+    fn expects_write(&self) -> bool {
+        matches!(
+            self,
+            Caller::Format | Caller::Checkpoint | Caller::ViewChange
+        )
+    }
+
+    fn expects_read(&self) -> bool {
+        matches!(self, Caller::Open)
+    }
+}
+
+pub type Callback<S> = fn(&mut Context<S>);
+
+pub struct Context<S: Storage> {
+    pub(super) caller: Caller,
+    pub(super) callback: Option<Callback<S>>,
+    pub(super) copy: Option<u8>,
+    pub(super) read: Option<S::Read>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
