@@ -718,12 +718,10 @@ impl VsrState {
 
     /// Returns `true` if `new` represents valid forward progress from `old`.
     ///
-    /// Monotonicity ensures state never regresses: checkpoint op, commit_max,
-    /// log_view, and view numbers must all be non-decreasing. States with
-    /// the same checkpoint op must be byte-identical (no silent overwrites).
-    ///
-    /// Note: `sync_op_min`, `sync_op_max`, and `sync_view` are NOT checked for
-    /// monotonicity. These fields can legitimately reset when state sync completes.
+    /// Monotonicity rules:
+    /// - checkpoint.op, commit_max, log_view, view must be non-decreasing
+    /// - if checkpoint.op is unchanged, the *checkpoint bytes* must be identical
+    /// - sync_op_* and sync_view are NOT part of the monotonic comparisons
     ///
     /// # Panics
     ///
@@ -739,17 +737,18 @@ impl VsrState {
 
         if old.checkpoint.header.op == new.checkpoint.header.op {
             if old.checkpoint.header.checksum == 0 && old.checkpoint.header.op == 0 {
+                // Root baseline constraints.
                 assert!(old.commit_max == 0);
                 assert!(old.sync_op_min == 0);
                 assert!(old.sync_op_max == 0);
                 assert!(old.log_view == 0);
                 assert!(old.view == 0);
             } else {
-                // SAFETY: CheckpointState implements Pod, guaranteeing no padding bytes
-                // and all bytes initialized. The references are distinct (old != new).
+                // SAFETY: CheckpointState implements Pod, so byte-compare is valid.
                 assert!(unsafe { equal_bytes(&old.checkpoint, &new.checkpoint) });
             }
         } else {
+            // If checkpoint op advanced, the header checksum and parent checkpoint id must differ.
             assert!(old.checkpoint.header.checksum != new.checkpoint.header.checksum);
             assert!(old.checkpoint.parent_checkpoint_id != new.checkpoint.parent_checkpoint_id);
         }
@@ -757,15 +756,13 @@ impl VsrState {
         if old.checkpoint.header.op > new.checkpoint.header.op {
             return false;
         }
-        if old.commit_max > new.commit_max {
+        if old.view > new.view {
             return false;
         }
-        // Note: sync_op_min, sync_op_max, and sync_view are intentionally NOT checked
-        // for monotonicity. These fields can reset when state sync completes.
         if old.log_view > new.log_view {
             return false;
         }
-        if old.view > new.view {
+        if old.commit_max > new.commit_max {
             return false;
         }
 
@@ -812,90 +809,61 @@ impl VsrState {
     /// entire `CheckpointState`) becomes the new `parent_checkpoint_id`, and
     /// the old parent becomes `grandparent_checkpoint_id`.
     ///
-    /// # Fields Updated
-    ///
-    /// **Checkpoint chain:**
-    /// - `parent_checkpoint_id` ← current `checkpoint.checkpoint_id()`
-    /// - `grandparent_checkpoint_id` ← current `parent_checkpoint_id`
-    ///
-    /// **From options:**
-    /// - `checkpoint.header` ← `opts.header`
-    /// - Manifest, free set, and client sessions references
-    /// - `storage_size`, `release`
-    /// - `commit_max`, `sync_op_min`, `sync_op_max`
-    /// - `view`, `log_view` (if `view_attributes` provided)
-    ///
     /// # Panics
     ///
     /// Panics if:
     /// - `opts.header.op <= self.checkpoint.header.op` (checkpoint must advance)
     /// - `opts.commit_max < opts.header.op` (commit must cover checkpoint)
     /// - `opts.storage_size < DATA_FILE_SIZE_MIN`
-    /// - `opts.sync_op_max < opts.sync_op_min`
+    /// - `opts.sync_op_min > opts.sync_op_max`
+    /// - `opts.release < self.checkpoint.release`
     /// - the update would violate monotonic state progression
     pub fn update_for_checkpoint(&mut self, opts: &CheckpointOptions<'_>) {
         let old = *self;
 
-        // Validate: checkpoint must advance
+        assert!(
+            opts.header.op <= opts.commit_max,
+            "commit_max {} must be >= checkpoint op {}",
+            opts.commit_max,
+            opts.header.op
+        );
         assert!(
             opts.header.op > self.checkpoint.header.op,
             "checkpoint op must advance: new {} <= current {}",
             opts.header.op,
             self.checkpoint.header.op
         );
-
-        // Validate: header checksum must differ (we're creating a new checkpoint, not re-applying)
         assert!(
             opts.header.checksum != self.checkpoint.header.checksum,
-            "checkpoint header checksum must differ from current"
+            "checkpoint header checksum must change when op advances"
         );
-
-        // Validate: commit_max must be at least checkpoint op
         assert!(
-            opts.commit_max >= opts.header.op,
-            "commit_max {} must be >= checkpoint op {}",
-            opts.commit_max,
-            opts.header.op
+            opts.sync_op_min <= opts.sync_op_max,
+            "sync_op_min {} must be <= sync_op_max {}",
+            opts.sync_op_min,
+            opts.sync_op_max
         );
-
-        // Validate: sync bounds are ordered
-        assert!(
-            opts.sync_op_max >= opts.sync_op_min,
-            "sync_op_max {} must be >= sync_op_min {}",
-            opts.sync_op_max,
-            opts.sync_op_min
-        );
-
-        // Validate: storage size meets minimum
         assert!(
             opts.storage_size >= constants::DATA_FILE_SIZE_MIN,
             "storage_size {} must be >= DATA_FILE_SIZE_MIN {}",
             opts.storage_size,
             constants::DATA_FILE_SIZE_MIN
         );
-
-        // Validate: release must be non-decreasing
         assert!(
             opts.release.value() >= self.checkpoint.release.value(),
-            "release must be non-decreasing: new {} < current {}",
-            opts.release.value(),
-            self.checkpoint.release.value()
+            "release must be non-decreasing"
         );
 
         // Advance checkpoint chain: current ID becomes parent, parent becomes grandparent.
-        // The checkpoint ID is the checksum of the entire CheckpointState, not just
-        // the header checksum.
-        //
-        // IMPORTANT: Compute checkpoint_id() BEFORE modifying any fields, since it
-        // checksums the entire CheckpointState including parent/grandparent fields.
-        let current_checkpoint_id = self.checkpoint.checkpoint_id();
-        self.checkpoint.grandparent_checkpoint_id = self.checkpoint.parent_checkpoint_id;
-        self.checkpoint.parent_checkpoint_id = current_checkpoint_id;
+        let old_checkpoint_id = self.checkpoint.checkpoint_id();
+        let old_parent_checkpoint_id = self.checkpoint.parent_checkpoint_id;
 
-        // Update checkpoint header
+        self.checkpoint.parent_checkpoint_id = old_checkpoint_id;
+        self.checkpoint.grandparent_checkpoint_id = old_parent_checkpoint_id;
+
+        // Update checkpoint header and references.
         self.checkpoint.header = opts.header;
 
-        // Update manifest references
         let (oldest_cs, oldest_addr, newest_cs, newest_addr, block_count) =
             opts.manifest_references;
         self.checkpoint.manifest_oldest_checksum = oldest_cs;
@@ -904,7 +872,6 @@ impl VsrState {
         self.checkpoint.manifest_newest_address = newest_addr;
         self.checkpoint.manifest_block_count = block_count as u32;
 
-        // Update free set references
         let (acq_cs, acq_size, acq_last_cs, acq_last_addr) = opts.free_set_acquired_references;
         self.checkpoint.free_set_blocks_acquired_checksum = acq_cs;
         self.checkpoint.free_set_blocks_acquired_size = acq_size;
@@ -917,24 +884,26 @@ impl VsrState {
         self.checkpoint.free_set_blocks_released_last_block_checksum = rel_last_cs;
         self.checkpoint.free_set_blocks_released_last_block_address = rel_last_addr;
 
-        // Update client sessions references
         let (cs_checksum, cs_size, cs_last_cs, cs_last_addr) = opts.client_sessions_references;
         self.checkpoint.client_sessions_checksum = cs_checksum;
         self.checkpoint.client_sessions_size = cs_size;
         self.checkpoint.client_sessions_last_block_checksum = cs_last_cs;
         self.checkpoint.client_sessions_last_block_address = cs_last_addr;
 
-        // Update storage and release
         self.checkpoint.storage_size = opts.storage_size;
         self.checkpoint.release = opts.release;
 
-        // Update VSR-level fields
+        // Update VSR-level fields.
         self.commit_max = opts.commit_max;
         self.sync_op_min = opts.sync_op_min;
         self.sync_op_max = opts.sync_op_max;
 
-        // Update view attributes if provided
+        // Reset sync_view at checkpoint time.
+        self.sync_view = 0;
+
+        // Optional: update view/log_view if checkpointing during/after view change.
         if let Some(view_attrs) = &opts.view_attributes {
+            assert!(view_attrs.view >= view_attrs.log_view);
             self.view = view_attrs.view;
             self.log_view = view_attrs.log_view;
         }
@@ -943,6 +912,74 @@ impl VsrState {
             Self::monotonic(&old, self),
             "checkpoint update must be monotonic"
         );
+    }
+
+    /// Updates this state for a view change.
+    ///
+    /// This is called to persist view/log_view changes or to update the
+    /// checkpoint during state sync. The update must either advance
+    /// view/log_view or include a sync_checkpoint.
+    ///
+    /// # Invariants
+    ///
+    /// - `commit_max` must be non-decreasing
+    /// - `view` must be non-decreasing
+    /// - `log_view` must be non-decreasing
+    /// - `view >= log_view`
+    /// - At least one of: `log_view` advances, `view` advances, or `sync_checkpoint` is provided
+    /// - If `sync_checkpoint` is provided, the checkpoint op must advance
+    ///
+    /// # Panics
+    ///
+    /// Panics if any invariants are violated or if the update would not
+    /// result in monotonic state progression.
+    pub fn update_for_view_change(&mut self, opts: &ViewChangeOptions<'_>) {
+        let old = *self;
+
+        assert!(old.commit_max <= opts.commit_max);
+        assert!(old.view <= opts.view);
+        assert!(old.log_view <= opts.log_view);
+
+        assert!(
+            old.log_view < opts.log_view || old.view < opts.view || opts.sync_checkpoint.is_some()
+        );
+        assert!(opts.view >= opts.log_view);
+        assert!(!opts.view_headers.is_empty());
+        assert!(old.checkpoint.header.op <= opts.view_headers[0].op);
+
+        // Apply view/commit durability.
+        self.commit_max = opts.commit_max;
+        self.log_view = opts.log_view;
+        self.view = opts.view;
+
+        if let Some(sync) = opts.sync_checkpoint {
+            assert!(sync.sync_op_max >= sync.sync_op_min);
+
+            assert!(old.checkpoint.header.op < sync.checkpoint.header.op);
+            assert!(self.commit_max >= sync.checkpoint.header.op);
+
+            // Validate checkpoint chain: the new checkpoint must be either the next or next-next
+            // checkpoint, and must reference our current checkpoint_id as parent/grandparent.
+            let checkpoint_next = checkpoint_after(old.checkpoint.header.op);
+            let checkpoint_next_next = checkpoint_after(checkpoint_next);
+
+            let current_checkpoint_id = self.checkpoint.checkpoint_id();
+
+            if sync.checkpoint.header.op == checkpoint_next {
+                assert!(sync.checkpoint.parent_checkpoint_id == current_checkpoint_id);
+            } else {
+                assert!(sync.checkpoint.header.op == checkpoint_next_next);
+                assert!(sync.checkpoint.grandparent_checkpoint_id == current_checkpoint_id);
+            }
+
+            self.checkpoint = sync.checkpoint;
+            self.sync_op_min = sync.sync_op_min;
+            self.sync_op_max = sync.sync_op_max;
+
+            self.sync_view = 0;
+        }
+
+        assert!(Self::would_be_updated_by(&old, self));
     }
 }
 
