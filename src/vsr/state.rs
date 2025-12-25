@@ -259,6 +259,34 @@ impl CheckpointState {
     }
 }
 
+#[inline]
+fn checkpoint_valid(op: u64) -> bool {
+    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+    op == 0 || (op + 1) % lsm_compaction_ops == 0
+}
+
+#[inline]
+fn checkpoint_after(checkpoint: u64) -> u64 {
+    assert!(checkpoint_valid(checkpoint));
+
+    let vsr_checkpoint_op = constants::VSR_CHECKPOINT_OPS as u64;
+    assert!(vsr_checkpoint_op > 0);
+
+    let result = if checkpoint == 0 {
+        vsr_checkpoint_op - 1
+    } else {
+        checkpoint
+            .checked_add(vsr_checkpoint_op)
+            .expect("checkpoint_after overflow")
+    };
+
+    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+    assert!((result + 1) % lsm_compaction_ops == 0);
+    assert!(checkpoint_valid(result));
+
+    result
+}
+
 /// Durable replica state persisted to the superblock.
 ///
 /// Combines [`CheckpointState`] with replica identity and protocol progress fields.
@@ -868,10 +896,26 @@ fn client_sessions_encode_size() -> u64 {
 /// Returns `None` for checkpoint 0 (the root checkpoint has no trigger).
 #[inline]
 fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
+    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+    assert!(lsm_compaction_ops > 0);
+
+    let valid = if checkpoint == 0 {
+        true
+    } else if let Some(next) = checkpoint.checked_add(1) {
+        next % lsm_compaction_ops == 0
+    } else {
+        false
+    };
+    assert!(valid);
+
     if checkpoint == 0 {
         return None;
     }
-    Some(checkpoint)
+    Some(
+        checkpoint
+            .checked_add(lsm_compaction_ops)
+            .expect("checkpoint trigger overflow"),
+    )
 }
 
 #[cfg(test)]
