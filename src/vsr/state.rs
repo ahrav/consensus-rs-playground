@@ -728,7 +728,7 @@ impl VsrState {
 
         // Validate: checkpoint must advance
         assert!(
-            "new checkpoint op ({}) must be greater than current ({})",
+            opts.header.op > self.checkpoint.header.op,
             "checkpoint op must advance: new {} <= current {}",
             opts.header.op,
             self.checkpoint.header.op
