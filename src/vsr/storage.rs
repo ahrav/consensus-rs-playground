@@ -4,10 +4,10 @@
 //! This trait captures those requirements, allowing mock backends for testing
 //! and fault injection without modifying protocol logic.
 
+use crate::container_of;
 use crate::storage;
 use crate::storage::iocb;
 use crate::vsr::superblock;
-use crate::container_of;
 
 /// Backend-agnostic storage interface for sector-aligned async I/O.
 ///

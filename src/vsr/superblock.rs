@@ -1059,7 +1059,8 @@ mod tests {
             _buf: &mut [u8],
             _zone: Self::Zone,
             _offset: u64,
-        ) {}
+        ) {
+        }
 
         fn write_sectors(
             &mut self,
@@ -1068,7 +1069,8 @@ mod tests {
             _buf: &[u8],
             _zone: Self::Zone,
             _offset: u64,
-        ) {}
+        ) {
+        }
 
         unsafe fn context_from_read(_read: &mut Self::Read) -> &mut Context<Self> {
             unimplemented!("Not needed for current tests")
@@ -1087,7 +1089,7 @@ mod tests {
 
         // Open expects read
         assert!(Caller::Open.expects_read());
-        // Open does not "expect" write (in the sense of being a write op), 
+        // Open does not "expect" write (in the sense of being a write op),
         // but can write (repair).
         assert!(!Caller::Open.expects_write());
 
@@ -1124,7 +1126,7 @@ mod tests {
         // Copy bounds
         ctx.copy = Some(0);
         ctx.assert_valid_copy();
-        
+
         ctx.copy = Some((constants::SUPERBLOCK_COPIES - 1) as u8);
         ctx.assert_valid_copy();
     }
