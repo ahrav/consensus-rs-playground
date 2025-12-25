@@ -12,15 +12,16 @@
 #![allow(dead_code)]
 #[allow(unused_imports)]
 use core::mem::size_of;
+use std::ptr::NonNull;
 
 use crate::vsr::wire::checksum;
 #[allow(unused_imports)]
 use crate::{
-    constants::{self, SUPERBLOCK_VERSION},
-    storage::Storage,
+    constants,
     util::{AlignedBox, align_up, as_bytes_unchecked},
     vsr::{
-        Header, ViewChangeArray, ViewChangeCommand, ViewChangeSlice, VsrState, wire::Checksum128,
+        Header, ViewChangeArray, ViewChangeCommand, ViewChangeSlice, VsrState, storage,
+        wire::Checksum128,
     },
 };
 // use crate::vsr::superblock_quorums::{Quorums, RepairIterator, Threshold};
@@ -49,7 +50,7 @@ const MAX_REPAIR_ITERATIONS: usize = constants::SUPERBLOCK_COPIES * 2;
 // Compile-time invariant checks.
 #[allow(clippy::manual_is_multiple_of)]
 const _: () = {
-    assert!(SUPERBLOCK_VERSION > 0);
+    assert!(constants::SUPERBLOCK_VERSION > 0);
 
     assert!(constants::SUPERBLOCK_ZONE_SIZE > 0);
     assert!(
@@ -216,21 +217,31 @@ impl SuperBlockHeader {
     fn assert_invariants(&self) {
         assert_eq!(self.checksum_padding, 0);
         assert_eq!(self.parent_padding, 0);
-        assert!(self.version == 0 || self.version == SUPERBLOCK_VERSION);
+        assert!(self.version == 0 || self.version == constants::SUPERBLOCK_VERSION);
         assert!((self.copy as usize) < constants::SUPERBLOCK_COPIES || self.copy == 0);
     }
 }
 
+/// Identifies which superblock operation initiated a context.
+///
+/// Used for state machine validation: each caller has specific I/O expectations
+/// (read-only, write-only, or read-then-write) that are checked at runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Caller {
+    /// Context is idle and available for reuse.
     None,
+    /// Reading superblock copies during replica startup.
     Open,
+    /// Writing initial superblock state for a new replica.
     Format,
+    /// Persisting state after committing a batch of operations.
     Checkpoint,
+    /// Persisting state after a view change completes.
     ViewChange,
 }
 
 impl Caller {
+    /// Returns `true` if this operation writes superblock copies.
     fn expects_write(&self) -> bool {
         matches!(
             self,
@@ -238,18 +249,94 @@ impl Caller {
         )
     }
 
+    /// Returns `true` if this operation reads superblock copies.
     fn expects_read(&self) -> bool {
         matches!(self, Caller::Open)
     }
 }
 
+/// Completion callback invoked when a superblock operation finishes.
 pub type Callback<S> = fn(&mut Context<S>);
 
-pub struct Context<S: Storage> {
+/// State for an in-flight superblock operation.
+///
+/// Tracks which copy is being accessed, the completion callback, and any
+/// state updates to persist. Contexts are pooled and reused to avoid allocation.
+///
+/// # Layout
+///
+/// `#[repr(C)]` with `read`/`write` embedded by value enables `container_of!`-style
+/// pointer recovery: when the storage engine completes an I/O and hands back
+/// `&mut Read`, we can compute the containing `Context` address. This avoids
+/// heap allocation for the callback context.
+#[repr(C)]
+pub struct Context<S: storage::Storage> {
+    /// Which operation owns this context, or `None` if idle.
     pub(super) caller: Caller,
+    /// Invoked when the operation completes (success or failure).
     pub(super) callback: Option<Callback<S>>,
+    /// Which superblock copy (0..SUPERBLOCK_COPIES) is being accessed.
     pub(super) copy: Option<u8>,
-    pub(super) read: Option<S::Read>,
+
+    /// Embedded read iocb for `container_of!` recovery.
+    pub(super) read: S::Read,
+    /// Embedded write iocb for `container_of!` recovery.
+    pub(super) write: S::Write,
+
+    /// Updated VSR state to persist (for write operations).
+    pub(super) vsr_state: Option<VsrState>,
+    /// View change headers to persist (for view change operations).
+    pub(super) view_headers: Option<ViewChangeArray>,
+    // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
+    /// Intrusive linked list pointer for context pooling.
+    pub(super) next: Option<NonNull<Context<S>>>,
+    // pub(super) sb: *mut SuperBlock<S>,
+}
+
+impl<S: storage::Storage> Context<S> {
+    /// Creates an idle context with the given I/O control blocks.
+    pub fn new(read: S::Read, write: S::Write) -> Self {
+        Self {
+            caller: Caller::None,
+            callback: None,
+            copy: None,
+            read,
+            write,
+            vsr_state: None,
+            view_headers: None,
+            next: None,
+            // sb: core::ptr::null_mut(),
+        }
+    }
+
+    /// Panics if context is already linked into a queue.
+    fn assert_valid_for_enqueue(&self) {
+        assert!(self.next.is_none());
+    }
+
+    /// Panics if context is not ready to issue a read.
+    fn assert_ready_for_read(&self) {
+        assert!(self.caller != Caller::None);
+        assert!(self.caller.expects_read() || self.caller.expects_write());
+    }
+
+    /// Panics if context is not ready to issue a write.
+    fn assert_ready_for_write(&self) {
+        assert!(self.caller != Caller::None);
+        assert!(self.caller.expects_write() || self.caller == Caller::Open);
+    }
+
+    /// Panics if `copy` is out of bounds.
+    fn assert_valid_copy(&self) {
+        if let Some(copy) = self.copy {
+            assert!((copy as usize) < constants::SUPERBLOCK_COPIES)
+        }
+    }
+
+    /// Returns `true` if this context is in use by an operation.
+    pub fn is_active(&self) -> bool {
+        self.caller != Caller::None
+    }
 }
 
 #[cfg(test)]
@@ -266,7 +353,7 @@ mod tests {
     /// Creates a minimal valid SuperBlockHeader for testing.
     fn make_header() -> SuperBlockHeader {
         let mut header = SuperBlockHeader::zeroed();
-        header.version = SUPERBLOCK_VERSION;
+        header.version = constants::SUPERBLOCK_VERSION;
         header.cluster = 1;
         header.sequence = 1;
         header.view_headers_count = 1;
@@ -682,7 +769,7 @@ mod tests {
     #[test]
     fn test_invariants_version_current_allowed() {
         let mut header = make_header();
-        header.version = SUPERBLOCK_VERSION;
+        header.version = constants::SUPERBLOCK_VERSION;
         header.assert_invariants();
     }
 
@@ -728,7 +815,7 @@ mod tests {
         fn prop_equal_is_reflexive(
             sequence in any::<u64>(),
             cluster in any::<u128>(),
-            version in prop::option::of(Just(SUPERBLOCK_VERSION)),
+            version in prop::option::of(Just(constants::SUPERBLOCK_VERSION)),
         ) {
             let mut header = make_header();
             header.sequence = sequence;
