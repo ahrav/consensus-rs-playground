@@ -597,7 +597,61 @@ impl<S: storage::Storage> SuperBlock<S> {
         assert!(self.staging.valid_checksum());
         self.assert_staging_for_write(Caller::Format);
 
-        self.write_headers(ctx);
+        self.write_headers(ctx)
+    }
+
+    /// Persists a checkpoint by writing a new superblock with incremented sequence.
+    ///
+    /// Queues the operation if another is in progress; executes immediately if at queue head.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active (reentrant use).
+    pub fn checkpoint(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: CheckpointOptions) {
+        assert!(!ctx.is_active());
+
+        ctx.caller = Caller::Checkpoint;
+        ctx.callback = Some(cb);
+        // ctx.repairs = None;
+        ctx.copy = Some(0);
+
+        self.enqueue(ctx);
+
+        if self.is_queue_head(ctx) {
+            self.prepare_checkpoint(ctx, opts);
+        }
+    }
+
+    /// Prepares staging header for checkpoint write.
+    ///
+    /// Chains from working header: copies state, increments sequence, updates parent checksum.
+    fn prepare_checkpoint(&mut self, ctx: &mut Context<S>, opts: CheckpointOptions) {
+        // Chain from current working header.
+        *self.staging = *self.working;
+        self.staging.sequence = self
+            .working
+            .sequence
+            .checked_add(1)
+            .expect("sequence overflow");
+        self.staging.parent = self.working.checksum;
+
+        // Apply checkpoint-specific VSR state updates.
+        let mut current = self.working.vsr_state;
+        current.update_for_checkpoint(&opts);
+        self.staging.vsr_state = current;
+
+        // Snapshot view headers if provided (required for view change recovery).
+        if let Some(view_attrs) = &opts.view_attributes {
+            assert!(!view_attrs.headers.is_empty());
+            self.staging.view_headers_count = view_attrs.headers.len() as u32;
+            self.staging.view_headers_all = *view_attrs.headers;
+        }
+
+        self.staging.set_checksum();
+
+        assert!(self.staging.valid_checksum());
+        self.assert_staging_for_write(Caller::Checkpoint);
+
+        self.write_headers(ctx)
     }
 
     /// Reads the next superblock copy into `self.reading[ctx.copy]`.
@@ -742,6 +796,55 @@ pub struct FormatOptions {
     /// Initial view number.
     pub view: u32,
     /// Software release version for compatibility checks.
+    pub release: Release,
+}
+
+/// View state captured during checkpoint for view change recovery.
+///
+/// When a replica checkpoints during a view change, it must persist the current
+/// view headers to enable recovery. Without this, a restarted replica cannot
+/// determine which operations were committed in the new view.
+pub struct ViewAttributes<'a> {
+    /// Prepare headers from the current view (used to reconstruct commit state).
+    pub headers: &'a ViewChangeArray,
+    /// Current view number.
+    pub view: u32,
+    /// View in which the last log entry was created.
+    pub log_view: u32,
+}
+
+/// Configuration for persisting a checkpoint to the superblock.
+///
+/// Captures all state needed to resume from this checkpoint after crash recovery:
+/// block references, commit bounds, and optionally view change state.
+///
+/// # Tuple Field Layout
+/// Reference tuples follow consistent patterns:
+/// - `manifest_references`: (oldest_checksum, oldest_addr, newest_checksum, newest_addr, block_count)
+/// - `free_set_*_references`: (checksum, size, last_block_checksum, last_block_addr)
+/// - `client_sessions_references`: (checksum, size, last_block_checksum, last_block_addr)
+pub struct CheckpointOptions<'a> {
+    /// Prepare header that triggered this checkpoint.
+    pub header: HeaderPrepare,
+    /// View state if checkpointing during/after a view change.
+    pub view_attributes: Option<ViewAttributes<'a>>,
+    /// Highest committed operation number.
+    pub commit_max: u64,
+    /// Sync target range: minimum operation to sync from.
+    pub sync_op_min: u64,
+    /// Sync target range: maximum operation to sync to.
+    pub sync_op_max: u64,
+    /// LSM manifest block chain: (oldest_cs, oldest_addr, newest_cs, newest_addr, count).
+    pub manifest_references: (u128, u64, u128, u64, u64),
+    /// Acquired free set blocks: (checksum, size, last_block_cs, last_block_addr).
+    pub free_set_acquired_references: (u128, u64, u128, u64),
+    /// Released free set blocks: (checksum, size, last_block_cs, last_block_addr).
+    pub free_set_released_references: (u128, u64, u128, u64),
+    /// Client session state: (checksum, size, last_block_cs, last_block_addr).
+    pub client_sessions_references: (u128, u64, u128, u64),
+    /// Total data file size in bytes.
+    pub storage_size: u64,
+    /// Software release for compatibility validation on recovery.
     pub release: Release,
 }
 
@@ -2325,6 +2428,438 @@ mod tests {
             prop_assert_eq!(sb.queue_depth, 0);
             prop_assert!(sb.queue_head.is_none());
             prop_assert!(sb.queue_tail.is_none());
+        }
+    }
+
+    // =========================================================================
+    // Checkpoint Tests
+    // =========================================================================
+
+    use crate::vsr::{HeaderPrepare, Members, ViewChangeArray, wire::checksum};
+
+    fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
+        use crate::vsr::wire::{Command, Operation};
+
+        assert!(op > 0);
+
+        let mut header = HeaderPrepare::new();
+        header.cluster = cluster;
+        header.command = Command::Prepare;
+        header.operation = Operation::NOOP;
+        header.op = op;
+        header.commit = op - 1;
+        header.timestamp = 1;
+        header.parent = 1;
+        header.client = 1;
+        header.request = 1;
+        header.release = Release(1);
+
+        header.set_checksum_body(&[]);
+        header.set_checksum();
+
+        debug_assert!(header.invalid().is_none());
+
+        header
+    }
+
+    /// Creates a minimal valid CheckpointOptions for testing.
+    ///
+    /// `op` must be > 0 to pass VsrState::update_for_checkpoint validation.
+    fn make_checkpoint_options(op: u64, commit_max: u64) -> CheckpointOptions<'static> {
+        let header = make_prepare_header(1, op);
+
+        CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        }
+    }
+
+    /// Initializes a SuperBlock with a formatted working header for checkpoint testing.
+    fn setup_formatted_superblock() -> SuperBlock<MockStorage> {
+        use crate::vsr::wire::header::Release;
+
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        // Initialize working header to simulate post-format state.
+        sb.working.version = constants::SUPERBLOCK_VERSION;
+        sb.working.cluster = 1;
+        sb.working.sequence = 1;
+        sb.working.view_headers_count = 1;
+        sb.working.view_headers_all = ViewChangeArray::root(1);
+
+        // Initialize VsrState with valid replica config.
+        let members = Members([1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let root_opts = RootOptions {
+            cluster: 1,
+            replica_index: 0,
+            replica_count: 3,
+            members,
+            release: Release::ZERO,
+            view: 0,
+        };
+        sb.working.vsr_state = VsrState::root(&root_opts);
+
+        sb.working.set_checksum();
+        sb
+    }
+
+    #[test]
+    fn test_checkpoint_sets_context_caller() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.checkpoint(cb, &mut ctx, opts);
+
+        assert_eq!(ctx.caller, Caller::Checkpoint);
+    }
+
+    #[test]
+    fn test_checkpoint_sets_callback() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.checkpoint(cb, &mut ctx, opts);
+
+        assert!(ctx.callback.is_some());
+    }
+
+    #[test]
+    fn test_checkpoint_initializes_copy_to_zero() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        let cb: Callback<MockStorage> = |_| {};
+
+        // First checkpoint takes the head position.
+        let opts1 = make_checkpoint_options(1, 1);
+        sb.checkpoint(cb, &mut ctx1, opts1);
+
+        // Second checkpoint queues behind first - prepare_checkpoint not called.
+        let opts2 = make_checkpoint_options(2, 2);
+        sb.checkpoint(cb, &mut ctx2, opts2);
+
+        // ctx2.copy should still be Some(0) since it hasn't started writing.
+        assert_eq!(ctx2.copy, Some(0));
+    }
+
+    #[test]
+    fn test_checkpoint_enqueues_context() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.checkpoint(cb, &mut ctx, opts);
+
+        assert_eq!(sb.queue_depth, 1);
+        assert!(sb.is_queue_head(&ctx));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_checkpoint_panics_on_active_context() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Simulate active context by setting caller.
+        ctx.caller = Caller::Open;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = make_checkpoint_options(1, 1);
+
+        // Should panic: context already active.
+        sb.checkpoint(cb, &mut ctx, opts);
+    }
+
+    #[test]
+    fn test_checkpoint_queues_when_not_head() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        // First checkpoint becomes head.
+        let cb: Callback<MockStorage> = |_| {};
+        let opts1 = make_checkpoint_options(1, 1);
+        sb.checkpoint(cb, &mut ctx1, opts1);
+
+        // Second checkpoint queued but not executed.
+        let opts2 = make_checkpoint_options(2, 2);
+        sb.checkpoint(cb, &mut ctx2, opts2);
+
+        assert_eq!(sb.queue_depth, 2);
+        assert!(sb.is_queue_head(&ctx1));
+        assert!(!sb.is_queue_head(&ctx2));
+    }
+
+    /// Sets up context for prepare_checkpoint tests (mimics what checkpoint() does).
+    fn setup_checkpoint_context(sb: &mut SuperBlock<MockStorage>, ctx: &mut Context<MockStorage>) {
+        ctx.caller = Caller::Checkpoint;
+        ctx.copy = Some(0);
+        sb.enqueue(ctx);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_increments_sequence() {
+        let mut sb = setup_formatted_superblock();
+        let original_sequence = sb.working.sequence;
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        assert_eq!(sb.staging.sequence, original_sequence + 1);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_chains_parent_checksum() {
+        let mut sb = setup_formatted_superblock();
+        let working_checksum = sb.working.checksum;
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        assert_eq!(sb.staging.parent, working_checksum);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_copies_working_state() {
+        let mut sb = setup_formatted_superblock();
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        // Core fields should be inherited from working.
+        assert_eq!(sb.staging.cluster, sb.working.cluster);
+        assert_eq!(sb.staging.version, sb.working.version);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_updates_vsr_state() {
+        let mut sb = setup_formatted_superblock();
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(100, 100);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        // VsrState should reflect checkpoint options.
+        assert_eq!(sb.staging.vsr_state.checkpoint.header.op, 100);
+        assert_eq!(sb.staging.vsr_state.commit_max, 100);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_with_view_attributes() {
+        let mut sb = setup_formatted_superblock();
+
+        let view_headers = ViewChangeArray::root(1);
+        let view_attrs = ViewAttributes {
+            headers: &view_headers,
+            view: 42,
+            log_view: 40,
+        };
+
+        let header = make_prepare_header(1, 1);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: Some(view_attrs),
+            commit_max: 1,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: crate::vsr::wire::header::Release::ZERO,
+        };
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        assert_eq!(sb.staging.view_headers_count, 1);
+        assert_eq!(sb.staging.vsr_state.view, 42);
+        assert_eq!(sb.staging.vsr_state.log_view, 40);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_without_view_attributes_preserves_headers() {
+        let mut sb = setup_formatted_superblock();
+        let original_count = sb.working.view_headers_count;
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        // View headers should remain unchanged when view_attributes is None.
+        assert_eq!(sb.staging.view_headers_count, original_count);
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_sets_valid_checksum() {
+        let mut sb = setup_formatted_superblock();
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        assert!(sb.staging.valid_checksum());
+    }
+
+    #[test]
+    fn test_prepare_checkpoint_staging_differs_from_working() {
+        let mut sb = setup_formatted_superblock();
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        sb.prepare_checkpoint(&mut ctx, opts);
+
+        // Staging should have advanced sequence and different checksum.
+        assert!(sb.staging.sequence > sb.working.sequence);
+        assert_ne!(sb.staging.checksum, sb.working.checksum);
+    }
+
+    #[test]
+    #[should_panic(expected = "sequence overflow")]
+    fn test_prepare_checkpoint_panics_on_sequence_overflow() {
+        let mut sb = setup_formatted_superblock();
+        sb.working.sequence = u64::MAX;
+        sb.working.set_checksum();
+
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        setup_checkpoint_context(&mut sb, &mut ctx);
+        let opts = make_checkpoint_options(1, 1);
+
+        // Should panic on sequence overflow.
+        sb.prepare_checkpoint(&mut ctx, opts);
+    }
+
+    // NOTE: test_prepare_checkpoint_panics_on_empty_view_headers is not implemented
+    // because ViewChangeArray cannot be constructed with zero length through safe APIs.
+    // The assertion `view_attrs.headers.len() > 0` is a defensive check against invariant
+    // violations that cannot occur through normal usage.
+
+    proptest! {
+        #[test]
+        fn prop_checkpoint_sequence_always_advances(
+            initial_seq in 1u64..u64::MAX - 1
+        ) {
+            let mut sb = setup_formatted_superblock();
+            sb.working.sequence = initial_seq;
+            sb.working.set_checksum();
+
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            setup_checkpoint_context(&mut sb, &mut ctx);
+            let opts = make_checkpoint_options(1, 1);
+
+            sb.prepare_checkpoint(&mut ctx, opts);
+
+            prop_assert_eq!(sb.staging.sequence, initial_seq + 1);
+        }
+
+        #[test]
+        fn prop_checkpoint_parent_chain_integrity(
+            initial_seq in 1u64..1000u64
+        ) {
+            let mut sb = setup_formatted_superblock();
+            sb.working.sequence = initial_seq;
+            sb.working.set_checksum();
+            let expected_parent = sb.working.checksum;
+
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            setup_checkpoint_context(&mut sb, &mut ctx);
+            let opts = make_checkpoint_options(1, 1);
+
+            sb.prepare_checkpoint(&mut ctx, opts);
+
+            prop_assert_eq!(sb.staging.parent, expected_parent);
+            prop_assert!(sb.staging.valid_checksum());
+        }
+
+        #[test]
+        fn prop_checkpoint_preserves_cluster(
+            cluster in any::<u128>()
+        ) {
+            let mut sb = setup_formatted_superblock();
+            sb.working.cluster = cluster;
+            sb.working.view_headers_all = ViewChangeArray::root(cluster);
+            sb.working.set_checksum();
+
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            setup_checkpoint_context(&mut sb, &mut ctx);
+            let opts = make_checkpoint_options(1, 1);
+
+            sb.prepare_checkpoint(&mut ctx, opts);
+
+            prop_assert_eq!(sb.staging.cluster, cluster);
+        }
+
+        #[test]
+        fn prop_checkpoint_staging_checksum_valid(
+            op in 1u64..10000u64
+        ) {
+            let mut sb = setup_formatted_superblock();
+
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            setup_checkpoint_context(&mut sb, &mut ctx);
+            let opts = make_checkpoint_options(op, op);
+
+            sb.prepare_checkpoint(&mut ctx, opts);
+
+            prop_assert!(sb.staging.valid_checksum());
+            prop_assert!(sb.staging.checksum != 0);
+        }
+
+        #[test]
+        fn prop_checkpoint_staging_inherits_version(
+            version in Just(constants::SUPERBLOCK_VERSION)
+        ) {
+            let mut sb = setup_formatted_superblock();
+            sb.working.version = version;
+            sb.working.set_checksum();
+
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            setup_checkpoint_context(&mut sb, &mut ctx);
+            let opts = make_checkpoint_options(1, 1);
+
+            sb.prepare_checkpoint(&mut ctx, opts);
+
+            prop_assert_eq!(sb.staging.version, version);
         }
     }
 }
