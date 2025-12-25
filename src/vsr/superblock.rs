@@ -3279,8 +3279,6 @@ mod tests {
         assert_eq!(sb.queue_depth, 1);
     }
 
-
-
     proptest! {
         #[test]
         fn prop_release_always_deactivates_context(
@@ -3336,7 +3334,11 @@ mod tests {
         }
     }
 
-    fn prepare_checkpoint_helper(sb: &mut SuperBlock<MockStorage>, ctx: &mut Context<MockStorage>, opts: &CheckpointOptions) {
+    fn prepare_checkpoint_helper(
+        sb: &mut SuperBlock<MockStorage>,
+        ctx: &mut Context<MockStorage>,
+        opts: &CheckpointOptions,
+    ) {
         let mut vsr_state = sb.working.vsr_state;
         vsr_state.update_for_checkpoint(opts);
         ctx.vsr_state = Some(vsr_state);
@@ -3369,8 +3371,15 @@ mod tests {
         assert!(!sb.is_queue_head(&ctx2));
 
         // This assertion ensures state is captured correctly
-        assert!(ctx2.vsr_state.is_some(), "Context should have captured vsr_state");
-        assert_eq!(ctx2.vsr_state.unwrap().commit_max, 999, "Context should have captured commit_max");
+        assert!(
+            ctx2.vsr_state.is_some(),
+            "Context should have captured vsr_state"
+        );
+        assert_eq!(
+            ctx2.vsr_state.unwrap().commit_max,
+            999,
+            "Context should have captured commit_max"
+        );
 
         // 3. Complete first checkpoint.
         sb.release(&mut ctx1);
@@ -3383,7 +3392,10 @@ mod tests {
         // So staging.sequence might be 2 (if it based on working=1).
         // But vsr_state should be from ctx2.
 
-        assert_eq!(sb.staging.vsr_state.commit_max, 999, "Staging should reflect ctx2 state");
+        assert_eq!(
+            sb.staging.vsr_state.commit_max, 999,
+            "Staging should reflect ctx2 state"
+        );
     }
 
     #[test]
