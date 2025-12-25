@@ -7,6 +7,7 @@
 use crate::storage;
 use crate::storage::iocb;
 use crate::vsr::superblock;
+use crate::container_of;
 
 /// Backend-agnostic storage interface for sector-aligned async I/O.
 ///
@@ -104,11 +105,13 @@ impl Storage for storage::Storage {
 
     #[inline]
     unsafe fn context_from_read(read: &mut Self::Read) -> &mut superblock::Context<Self> {
-        unsafe { storage::Storage::context_from_read(read) }
+        let ptr = read as *mut Self::Read;
+        unsafe { &mut *container_of!(ptr, superblock::Context<Self>, read) }
     }
 
     #[inline]
     unsafe fn context_from_write(write: &mut Self::Write) -> &mut superblock::Context<Self> {
-        unsafe { storage::Storage::context_from_write(write) }
+        let ptr = write as *mut Self::Write;
+        unsafe { &mut *container_of!(ptr, superblock::Context<Self>, write) }
     }
 }

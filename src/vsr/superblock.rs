@@ -242,7 +242,7 @@ pub enum Caller {
 
 impl Caller {
     /// Returns `true` if this operation writes superblock copies.
-    fn expects_write(&self) -> bool {
+    pub(super) fn expects_write(&self) -> bool {
         matches!(
             self,
             Caller::Format | Caller::Checkpoint | Caller::ViewChange
@@ -250,7 +250,7 @@ impl Caller {
     }
 
     /// Returns `true` if this operation reads superblock copies.
-    fn expects_read(&self) -> bool {
+    pub(super) fn expects_read(&self) -> bool {
         matches!(self, Caller::Open)
     }
 }
@@ -310,24 +310,24 @@ impl<S: storage::Storage> Context<S> {
     }
 
     /// Panics if context is already linked into a queue.
-    fn assert_valid_for_enqueue(&self) {
+    pub(super) fn assert_valid_for_enqueue(&self) {
         assert!(self.next.is_none());
     }
 
     /// Panics if context is not ready to issue a read.
-    fn assert_ready_for_read(&self) {
+    pub(super) fn assert_ready_for_read(&self) {
         assert!(self.caller != Caller::None);
         assert!(self.caller.expects_read() || self.caller.expects_write());
     }
 
     /// Panics if context is not ready to issue a write.
-    fn assert_ready_for_write(&self) {
+    pub(super) fn assert_ready_for_write(&self) {
         assert!(self.caller != Caller::None);
         assert!(self.caller.expects_write() || self.caller == Caller::Open);
     }
 
     /// Panics if `copy` is out of bounds.
-    fn assert_valid_copy(&self) {
+    pub(super) fn assert_valid_copy(&self) {
         if let Some(copy) = self.copy {
             assert!((copy as usize) < constants::SUPERBLOCK_COPIES)
         }
@@ -1027,5 +1027,127 @@ mod tests {
             "SuperBlockHeader size {} not multiple of 16",
             mem::size_of::<SuperBlockHeader>()
         );
+    }
+
+    // =========================================================================
+    // Context & Caller Tests
+    // =========================================================================
+
+    struct MockStorage;
+
+    impl crate::vsr::storage::Storage for MockStorage {
+        type Read = u64;
+        type Write = u64;
+        type Zone = u8;
+        const SUPERBLOCK_ZONE: Self::Zone = 0;
+
+        fn read_sectors(
+            &mut self,
+            _cb: fn(&mut Self::Read),
+            _read: &mut Self::Read,
+            _buf: &mut [u8],
+            _zone: Self::Zone,
+            _offset: u64,
+        ) {}
+
+        fn write_sectors(
+            &mut self,
+            _cb: fn(&mut Self::Write),
+            _write: &mut Self::Write,
+            _buf: &[u8],
+            _zone: Self::Zone,
+            _offset: u64,
+        ) {}
+
+        unsafe fn context_from_read(_read: &mut Self::Read) -> &mut Context<Self> {
+            unimplemented!("Not needed for current tests")
+        }
+
+        unsafe fn context_from_write(_write: &mut Self::Write) -> &mut Context<Self> {
+            unimplemented!("Not needed for current tests")
+        }
+    }
+
+    #[test]
+    fn test_caller_expectations() {
+        // None expects nothing
+        assert!(!Caller::None.expects_read());
+        assert!(!Caller::None.expects_write());
+
+        // Open expects read
+        assert!(Caller::Open.expects_read());
+        // Open does not "expect" write (in the sense of being a write op), 
+        // but can write (repair).
+        assert!(!Caller::Open.expects_write());
+
+        // Write operations
+        for caller in [Caller::Format, Caller::Checkpoint, Caller::ViewChange] {
+            assert!(!caller.expects_read());
+            assert!(caller.expects_write());
+        }
+    }
+
+    #[test]
+    fn test_context_lifecycle_and_invariants() {
+        let mut ctx = Context::<MockStorage>::new(100, 200);
+
+        // Initial state
+        assert_eq!(ctx.caller, Caller::None);
+        assert!(ctx.callback.is_none());
+        assert!(ctx.copy.is_none());
+        assert_eq!(ctx.read, 100);
+        assert_eq!(ctx.write, 200);
+        assert!(!ctx.is_active());
+
+        // Enqueue check
+        ctx.assert_valid_for_enqueue();
+
+        // Activation
+        ctx.caller = Caller::Open;
+        assert!(ctx.is_active());
+
+        // IO Readiness
+        ctx.assert_ready_for_read();
+        ctx.assert_ready_for_write();
+
+        // Copy bounds
+        ctx.copy = Some(0);
+        ctx.assert_valid_copy();
+        
+        ctx.copy = Some((constants::SUPERBLOCK_COPIES - 1) as u8);
+        ctx.assert_valid_copy();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_panic_on_invalid_read_state() {
+        let ctx = Context::<MockStorage>::new(0, 0);
+        // Caller is None
+        ctx.assert_ready_for_read();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_panic_on_invalid_write_state() {
+        let ctx = Context::<MockStorage>::new(0, 0);
+        // Caller is None
+        ctx.assert_ready_for_write();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_panic_on_invalid_enqueue() {
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        // Simulate already linked
+        ctx.next = NonNull::new(&mut ctx as *mut _);
+        ctx.assert_valid_for_enqueue();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_panic_on_invalid_copy() {
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.copy = Some(constants::SUPERBLOCK_COPIES as u8);
+        ctx.assert_valid_copy();
     }
 }
