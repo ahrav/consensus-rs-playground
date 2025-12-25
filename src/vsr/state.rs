@@ -10,9 +10,7 @@ use crate::{
     constants,
     util::{Pod, as_bytes, equal_bytes},
     vsr::{
-        HeaderPrepare, Members, member_index,
-        superblock::CheckpointOptions,
-        valid_members,
+        HeaderPrepare, Members, ViewChangeArray, member_index, valid_members,
         wire::{Checksum128, checksum, header::Release},
     },
 };
@@ -36,17 +34,98 @@ const _: () = {
     assert!(HeaderPrepare::SIZE.is_multiple_of(8));
 };
 
-/// Configuration for initializing a replica in the cluster.
+/// View state captured during checkpoint for view change recovery.
 ///
-/// Validated via [`validate`](Self::validate) to ensure the replica can
-/// participate correctly in the consensus protocol.
+/// When a replica checkpoints during a view change, it must persist the current
+/// view headers to enable recovery. Without this, a restarted replica cannot
+/// determine which operations were committed in the new view.
+pub struct ViewAttributes<'a> {
+    /// Prepare headers from the current view (used to reconstruct commit state).
+    pub headers: &'a ViewChangeArray,
+    /// Current view number.
+    pub view: u32,
+    /// View in which the last log entry was created.
+    pub log_view: u32,
+}
+
+/// Configuration for persisting a checkpoint to the superblock.
+///
+/// Captures all state needed to resume from this checkpoint after crash recovery:
+/// block references, commit bounds, and optionally view change state.
+///
+/// # Tuple Field Layout
+/// Reference tuples follow consistent patterns:
+/// - `manifest_references`: (oldest_checksum, oldest_addr, newest_checksum, newest_addr, block_count)
+/// - `free_set_*_references`: (checksum, size, last_block_checksum, last_block_addr)
+/// - `client_sessions_references`: (checksum, size, last_block_checksum, last_block_addr)
+pub struct CheckpointOptions<'a> {
+    /// Prepare header that triggered this checkpoint.
+    pub header: HeaderPrepare,
+    /// View state if checkpointing during/after a view change.
+    pub view_attributes: Option<ViewAttributes<'a>>,
+    /// Highest committed operation number.
+    pub commit_max: u64,
+    /// Sync target range: minimum operation to sync from.
+    pub sync_op_min: u64,
+    /// Sync target range: maximum operation to sync to.
+    pub sync_op_max: u64,
+    /// LSM manifest block chain: (oldest_cs, oldest_addr, newest_cs, newest_addr, count).
+    pub manifest_references: (u128, u64, u128, u64, u64),
+    /// Acquired free set blocks: (checksum, size, last_block_cs, last_block_addr).
+    pub free_set_acquired_references: (u128, u64, u128, u64),
+    /// Released free set blocks: (checksum, size, last_block_cs, last_block_addr).
+    pub free_set_released_references: (u128, u64, u128, u64),
+    /// Client session state: (checksum, size, last_block_cs, last_block_addr).
+    pub client_sessions_references: (u128, u64, u128, u64),
+    /// Total data file size in bytes.
+    pub storage_size: u64,
+    /// Software release for compatibility validation on recovery.
+    pub release: Release,
+}
+
+/// Checkpoint received during state sync, with the skipped operation range.
+#[derive(Clone, Copy)]
+pub struct SyncCheckpointOptions {
+    /// The checkpoint state to adopt.
+    pub checkpoint: CheckpointState,
+    /// First op in the skipped range (inclusive).
+    pub sync_op_min: u64,
+    /// Last op in the skipped range (inclusive).
+    pub sync_op_max: u64,
+}
+
+/// Persists view/log_view before advertising them (prevents backtracking)
+/// or updates checkpoint during sync.
+///
+/// Must advance view/log_view monotonically or update checkpoint.
+#[derive(Clone)]
+pub struct ViewChangeOptions<'a> {
+    /// Highest committed operation known to the replica.
+    pub commit_max: u64,
+    /// View in which the replica last participated in the log.
+    pub log_view: u32,
+    /// Current view number.
+    pub view: u32,
+    /// Prepare headers from the new view's leader.
+    pub view_headers: &'a [HeaderPrepare],
+    /// Checkpoint update if syncing state from another replica.
+    pub sync_checkpoint: Option<SyncCheckpointOptions>,
+}
+
+/// Replica initialization configuration. See [`Self::validate`] for invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootOptions {
+    /// Unique cluster identifier.
     pub cluster: u128,
+    /// This replica's index within the cluster.
     pub replica_index: u8,
+    /// Total number of replicas in the cluster.
     pub replica_count: u8,
+    /// Cluster membership configuration.
     pub members: Members,
+    /// Software release for compatibility checks.
     pub release: Release,
+    /// Initial view number.
     pub view: u32,
 }
 

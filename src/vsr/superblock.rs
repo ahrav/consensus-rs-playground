@@ -28,7 +28,7 @@ use crate::{
     vsr::{
         HeaderPrepare,
         members::{Members, member_index},
-        state::RootOptions,
+        state::{CheckpointOptions, RootOptions, ViewAttributes},
         superblock_quorum::Threshold,
         wire::{checksum, header::Release},
     },
@@ -870,55 +870,6 @@ pub struct FormatOptions {
     /// Initial view number.
     pub view: u32,
     /// Software release version for compatibility checks.
-    pub release: Release,
-}
-
-/// View state captured during checkpoint for view change recovery.
-///
-/// When a replica checkpoints during a view change, it must persist the current
-/// view headers to enable recovery. Without this, a restarted replica cannot
-/// determine which operations were committed in the new view.
-pub struct ViewAttributes<'a> {
-    /// Prepare headers from the current view (used to reconstruct commit state).
-    pub headers: &'a ViewChangeArray,
-    /// Current view number.
-    pub view: u32,
-    /// View in which the last log entry was created.
-    pub log_view: u32,
-}
-
-/// Configuration for persisting a checkpoint to the superblock.
-///
-/// Captures all state needed to resume from this checkpoint after crash recovery:
-/// block references, commit bounds, and optionally view change state.
-///
-/// # Tuple Field Layout
-/// Reference tuples follow consistent patterns:
-/// - `manifest_references`: (oldest_checksum, oldest_addr, newest_checksum, newest_addr, block_count)
-/// - `free_set_*_references`: (checksum, size, last_block_checksum, last_block_addr)
-/// - `client_sessions_references`: (checksum, size, last_block_checksum, last_block_addr)
-pub struct CheckpointOptions<'a> {
-    /// Prepare header that triggered this checkpoint.
-    pub header: HeaderPrepare,
-    /// View state if checkpointing during/after a view change.
-    pub view_attributes: Option<ViewAttributes<'a>>,
-    /// Highest committed operation number.
-    pub commit_max: u64,
-    /// Sync target range: minimum operation to sync from.
-    pub sync_op_min: u64,
-    /// Sync target range: maximum operation to sync to.
-    pub sync_op_max: u64,
-    /// LSM manifest block chain: (oldest_cs, oldest_addr, newest_cs, newest_addr, count).
-    pub manifest_references: (u128, u64, u128, u64, u64),
-    /// Acquired free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_acquired_references: (u128, u64, u128, u64),
-    /// Released free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_released_references: (u128, u64, u128, u64),
-    /// Client session state: (checksum, size, last_block_cs, last_block_addr).
-    pub client_sessions_references: (u128, u64, u128, u64),
-    /// Total data file size in bytes.
-    pub storage_size: u64,
-    /// Software release for compatibility validation on recovery.
     pub release: Release,
 }
 
