@@ -8,7 +8,7 @@ use core::mem;
 
 use crate::{
     constants,
-    util::{Pod, equal_bytes},
+    util::{Pod, as_bytes, equal_bytes},
     vsr::{
         HeaderPrepare, Members, member_index,
         superblock::CheckpointOptions,
@@ -241,6 +241,21 @@ impl CheckpointState {
             "reserved_manifest non-zero"
         );
         assert!(self.reserved == [0u8; 388], "checkpoint reserved non-zero");
+    }
+
+    /// Computes the checkpoint ID as the checksum of the entire CheckpointState.
+    ///
+    /// This forms a unique identifier for this checkpoint that is used in the
+    /// parent/grandparent chain for crash recovery.
+    ///
+    /// # Safety
+    ///
+    /// Safe because `CheckpointState` implements `Pod`, guaranteeing no padding bytes
+    /// and all bytes initialized.
+    #[inline]
+    pub fn checkpoint_id(&self) -> u128 {
+        // SAFETY: CheckpointState implements Pod, so as_bytes is safe.
+        checksum(unsafe { as_bytes(self) })
     }
 }
 
@@ -596,8 +611,11 @@ impl VsrState {
     /// Returns `true` if `new` represents valid forward progress from `old`.
     ///
     /// Monotonicity ensures state never regresses: checkpoint op, commit_max,
-    /// sync bounds, sync_view, and view numbers must all be non-decreasing. States with
+    /// log_view, and view numbers must all be non-decreasing. States with
     /// the same checkpoint op must be byte-identical (no silent overwrites).
+    ///
+    /// Note: `sync_op_min`, `sync_op_max`, and `sync_view` are NOT checked for
+    /// monotonicity. These fields can legitimately reset when state sync completes.
     ///
     /// # Panics
     ///
@@ -634,15 +652,8 @@ impl VsrState {
         if old.commit_max > new.commit_max {
             return false;
         }
-        if old.sync_op_min > new.sync_op_min {
-            return false;
-        }
-        if old.sync_op_max > new.sync_op_max {
-            return false;
-        }
-        if old.sync_view > new.sync_view {
-            return false;
-        }
+        // Note: sync_op_min, sync_op_max, and sync_view are intentionally NOT checked
+        // for monotonicity. These fields can reset when state sync completes.
         if old.log_view > new.log_view {
             return false;
         }
@@ -687,14 +698,14 @@ impl VsrState {
     /// Updates this state for a new checkpoint.
     ///
     /// Advances the checkpoint chain and updates all checkpoint-related fields
-    /// from the provided options. The current checkpoint ID (header checksum)
-    /// becomes the new `parent_checkpoint_id`, and the old parent becomes
-    /// `grandparent_checkpoint_id`.
+    /// from the provided options. The current checkpoint ID (checksum of the
+    /// entire `CheckpointState`) becomes the new `parent_checkpoint_id`, and
+    /// the old parent becomes `grandparent_checkpoint_id`.
     ///
     /// # Fields Updated
     ///
     /// **Checkpoint chain:**
-    /// - `parent_checkpoint_id` ← current `header.checksum`
+    /// - `parent_checkpoint_id` ← current `checkpoint.checkpoint_id()`
     /// - `grandparent_checkpoint_id` ← current `parent_checkpoint_id`
     ///
     /// **From options:**
@@ -723,6 +734,12 @@ impl VsrState {
             self.checkpoint.header.op
         );
 
+        // Validate: header checksum must differ (we're creating a new checkpoint, not re-applying)
+        assert!(
+            opts.header.checksum != self.checkpoint.header.checksum,
+            "checkpoint header checksum must differ from current"
+        );
+
         // Validate: commit_max must be at least checkpoint op
         assert!(
             opts.commit_max >= opts.header.op,
@@ -747,9 +764,23 @@ impl VsrState {
             constants::DATA_FILE_SIZE_MIN
         );
 
-        // Advance checkpoint chain: current ID becomes parent, parent becomes grandparent
+        // Validate: release must be non-decreasing
+        assert!(
+            opts.release.value() >= self.checkpoint.release.value(),
+            "release must be non-decreasing: new {} < current {}",
+            opts.release.value(),
+            self.checkpoint.release.value()
+        );
+
+        // Advance checkpoint chain: current ID becomes parent, parent becomes grandparent.
+        // The checkpoint ID is the checksum of the entire CheckpointState, not just
+        // the header checksum.
+        //
+        // IMPORTANT: Compute checkpoint_id() BEFORE modifying any fields, since it
+        // checksums the entire CheckpointState including parent/grandparent fields.
+        let current_checkpoint_id = self.checkpoint.checkpoint_id();
         self.checkpoint.grandparent_checkpoint_id = self.checkpoint.parent_checkpoint_id;
-        self.checkpoint.parent_checkpoint_id = self.checkpoint.header.checksum;
+        self.checkpoint.parent_checkpoint_id = current_checkpoint_id;
 
         // Update checkpoint header
         self.checkpoint.header = opts.header;
@@ -1606,6 +1637,8 @@ mod tests {
 
     #[test]
     fn test_monotonic_sync_view_regression() {
+        // Sync fields are NOT checked for monotonicity.
+        // They can legitimately reset when state sync completes.
         let options = make_valid_root_options(1, 0);
         let mut old = VsrState::root(&options);
         let mut new = old;
@@ -1613,7 +1646,7 @@ mod tests {
         old.view = 10;
         new.sync_view = 0;
         new.view = 10;
-        assert!(!VsrState::monotonic(&old, &new));
+        assert!(VsrState::monotonic(&old, &new)); // Regression is allowed
     }
 
     #[test]
@@ -1646,12 +1679,14 @@ mod tests {
 
     #[test]
     fn test_monotonic_sync_op_min_regression() {
+        // Sync fields are NOT checked for monotonicity.
+        // They can legitimately reset when state sync completes.
         let options = make_valid_root_options(1, 0);
         let mut old = VsrState::root(&options);
         old.sync_op_min = 50;
         old.sync_op_max = 50;
         let new = VsrState::root(&options);
-        assert!(!VsrState::monotonic(&old, &new));
+        assert!(VsrState::monotonic(&old, &new)); // Regression is allowed
     }
 
     #[test]
@@ -1665,11 +1700,13 @@ mod tests {
 
     #[test]
     fn test_monotonic_sync_op_max_regression() {
+        // Sync fields are NOT checked for monotonicity.
+        // They can legitimately reset when state sync completes.
         let options = make_valid_root_options(1, 0);
         let mut old = VsrState::root(&options);
         old.sync_op_max = 100;
         let new = VsrState::root(&options);
-        assert!(!VsrState::monotonic(&old, &new));
+        assert!(VsrState::monotonic(&old, &new)); // Regression is allowed
     }
 
     #[test]
@@ -1931,13 +1968,14 @@ mod tests {
         let options = make_valid_root_options(3, 0);
         let mut state = VsrState::root(&options);
 
-        let old_header_checksum = state.checkpoint.header.checksum;
+        // checkpoint_id() is the checksum of the entire CheckpointState, not just header.checksum
+        let old_checkpoint_id = state.checkpoint.checkpoint_id();
 
         let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
         state.update_for_checkpoint(&opts);
 
-        // Checkpoint chain advanced
-        assert_eq!(state.checkpoint.parent_checkpoint_id, old_header_checksum);
+        // Checkpoint chain advanced using checkpoint_id()
+        assert_eq!(state.checkpoint.parent_checkpoint_id, old_checkpoint_id);
         assert_eq!(state.checkpoint.grandparent_checkpoint_id, 0);
 
         // Header updated
@@ -1952,29 +1990,35 @@ mod tests {
         let options = make_valid_root_options(3, 0);
         let mut state = VsrState::root(&options);
 
-        // First checkpoint
-        let first_checksum = state.checkpoint.header.checksum;
+        // First checkpoint - use checkpoint_id() (checksum of entire CheckpointState)
+        let first_checkpoint_id = state.checkpoint.checkpoint_id();
         let opts1 = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
         state.update_for_checkpoint(&opts1);
 
-        assert_eq!(state.checkpoint.parent_checkpoint_id, first_checksum);
+        assert_eq!(state.checkpoint.parent_checkpoint_id, first_checkpoint_id);
         assert_eq!(state.checkpoint.grandparent_checkpoint_id, 0);
 
         // Second checkpoint
-        let second_checksum = state.checkpoint.header.checksum;
+        let second_checkpoint_id = state.checkpoint.checkpoint_id();
         let opts2 = make_checkpoint_options(200, 200, constants::DATA_FILE_SIZE_MIN);
         state.update_for_checkpoint(&opts2);
 
-        assert_eq!(state.checkpoint.parent_checkpoint_id, second_checksum);
-        assert_eq!(state.checkpoint.grandparent_checkpoint_id, first_checksum);
+        assert_eq!(state.checkpoint.parent_checkpoint_id, second_checkpoint_id);
+        assert_eq!(
+            state.checkpoint.grandparent_checkpoint_id,
+            first_checkpoint_id
+        );
 
         // Third checkpoint
-        let third_checksum = state.checkpoint.header.checksum;
+        let third_checkpoint_id = state.checkpoint.checkpoint_id();
         let opts3 = make_checkpoint_options(300, 300, constants::DATA_FILE_SIZE_MIN);
         state.update_for_checkpoint(&opts3);
 
-        assert_eq!(state.checkpoint.parent_checkpoint_id, third_checksum);
-        assert_eq!(state.checkpoint.grandparent_checkpoint_id, second_checksum);
+        assert_eq!(state.checkpoint.parent_checkpoint_id, third_checkpoint_id);
+        assert_eq!(
+            state.checkpoint.grandparent_checkpoint_id,
+            second_checkpoint_id
+        );
     }
 
     #[test]
@@ -2219,6 +2263,7 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
         state.checkpoint.header.op = 100;
+        state.commit_max = 100;
 
         // Try to checkpoint at same op
         let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
@@ -2231,6 +2276,7 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
         state.checkpoint.header.op = 100;
+        state.commit_max = 100;
 
         // Try to checkpoint at earlier op
         let opts = make_checkpoint_options(50, 50, constants::DATA_FILE_SIZE_MIN);
@@ -2355,8 +2401,9 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn test_update_for_checkpoint_panics_sync_bounds_regression() {
+    fn test_update_for_checkpoint_allows_sync_bounds_regression() {
+        // Sync fields are NOT checked for monotonicity.
+        // They can legitimately reset when state sync completes.
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
         state.sync_op_min = 50;
@@ -2368,8 +2415,8 @@ mod tests {
             header,
             view_attributes: None,
             commit_max: 100,
-            sync_op_min: 25,
-            sync_op_max: 25,
+            sync_op_min: 25, // Regression from 50 - this is allowed
+            sync_op_max: 25, // Regression from 75 - this is allowed
             manifest_references: (0, 0, 0, 0, 0),
             free_set_acquired_references: (checksum(&[]), 0, 0, 0),
             free_set_released_references: (checksum(&[]), 0, 0, 0),
@@ -2378,7 +2425,10 @@ mod tests {
             release: Release::ZERO,
         };
 
+        // Should succeed - sync regression is allowed
         state.update_for_checkpoint(&opts);
+        assert_eq!(state.sync_op_min, 25);
+        assert_eq!(state.sync_op_max, 25);
     }
 
     #[test]
@@ -2454,6 +2504,7 @@ mod tests {
         state
             .checkpoint
             .free_set_blocks_acquired_last_block_checksum = 123;
+        state.checkpoint.free_set_blocks_acquired_size = 1;
 
         let header = super::make_prepare_header(1, 100);
 
@@ -2598,7 +2649,8 @@ mod proptests {
             new_op in 1u64..10000u64
         ) {
             let mut state = VsrState::root(&opts);
-            let original_checksum = state.checkpoint.header.checksum;
+            // checkpoint_id() is the checksum of the entire CheckpointState
+            let original_checkpoint_id = state.checkpoint.checkpoint_id();
             let original_parent = state.checkpoint.parent_checkpoint_id;
 
             let header = make_prepare_header(opts.cluster, new_op);
@@ -2619,8 +2671,8 @@ mod proptests {
 
             state.update_for_checkpoint(&checkpoint_opts);
 
-            // Parent should be the old checksum
-            prop_assert_eq!(state.checkpoint.parent_checkpoint_id, original_checksum);
+            // Parent should be the old checkpoint_id (checksum of entire CheckpointState)
+            prop_assert_eq!(state.checkpoint.parent_checkpoint_id, original_checkpoint_id);
             // Grandparent should be the old parent
             prop_assert_eq!(state.checkpoint.grandparent_checkpoint_id, original_parent);
         }
