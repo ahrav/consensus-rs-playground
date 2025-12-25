@@ -106,6 +106,17 @@ pub const VIEW_HEADERS_MAX: usize = VIEW_CHANGE_HEADERS_SUFFIX_MAX + 2;
 /// Number of slots in the journal ring.
 pub const JOURNAL_SLOT_COUNT: usize = 1024;
 
+/// Maximum operations between checkpoints. Derived from journal size minus:
+/// - One full LSM compaction cycle (32 ops)
+/// - Space for in-flight pipeline prepares (doubled for view-change safety, rounded to compaction boundary)
+///
+/// This ensures the journal never wraps around uncommitted entries and LSM compaction
+/// completes before each checkpoint.
+pub const VSR_CHECKPOINT_OPS: usize = JOURNAL_SLOT_COUNT
+    - LSM_COMPACTION_OPS as usize
+    - LSM_COMPACTION_OPS as usize
+        * (PIPELINE_PREPARE_QUEUE_MAX * 2).div_ceil(LSM_COMPACTION_OPS as usize);
+
 /// Total journal size in bytes.
 pub const JOURNAL_SIZE: usize = JOURNAL_SLOT_COUNT * MESSAGE_SIZE_MAX_USIZE;
 

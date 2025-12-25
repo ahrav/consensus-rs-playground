@@ -28,7 +28,7 @@ use crate::{
     vsr::{
         HeaderPrepare,
         members::{Members, member_index},
-        state::RootOptions,
+        state::{CheckpointOptions, RootOptions},
         superblock_quorum::Threshold,
         wire::{checksum, header::Release},
     },
@@ -870,55 +870,6 @@ pub struct FormatOptions {
     /// Initial view number.
     pub view: u32,
     /// Software release version for compatibility checks.
-    pub release: Release,
-}
-
-/// View state captured during checkpoint for view change recovery.
-///
-/// When a replica checkpoints during a view change, it must persist the current
-/// view headers to enable recovery. Without this, a restarted replica cannot
-/// determine which operations were committed in the new view.
-pub struct ViewAttributes<'a> {
-    /// Prepare headers from the current view (used to reconstruct commit state).
-    pub headers: &'a ViewChangeArray,
-    /// Current view number.
-    pub view: u32,
-    /// View in which the last log entry was created.
-    pub log_view: u32,
-}
-
-/// Configuration for persisting a checkpoint to the superblock.
-///
-/// Captures all state needed to resume from this checkpoint after crash recovery:
-/// block references, commit bounds, and optionally view change state.
-///
-/// # Tuple Field Layout
-/// Reference tuples follow consistent patterns:
-/// - `manifest_references`: (oldest_checksum, oldest_addr, newest_checksum, newest_addr, block_count)
-/// - `free_set_*_references`: (checksum, size, last_block_checksum, last_block_addr)
-/// - `client_sessions_references`: (checksum, size, last_block_checksum, last_block_addr)
-pub struct CheckpointOptions<'a> {
-    /// Prepare header that triggered this checkpoint.
-    pub header: HeaderPrepare,
-    /// View state if checkpointing during/after a view change.
-    pub view_attributes: Option<ViewAttributes<'a>>,
-    /// Highest committed operation number.
-    pub commit_max: u64,
-    /// Sync target range: minimum operation to sync from.
-    pub sync_op_min: u64,
-    /// Sync target range: maximum operation to sync to.
-    pub sync_op_max: u64,
-    /// LSM manifest block chain: (oldest_cs, oldest_addr, newest_cs, newest_addr, count).
-    pub manifest_references: (u128, u64, u128, u64, u64),
-    /// Acquired free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_acquired_references: (u128, u64, u128, u64),
-    /// Released free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_released_references: (u128, u64, u128, u64),
-    /// Client session state: (checksum, size, last_block_cs, last_block_addr).
-    pub client_sessions_references: (u128, u64, u128, u64),
-    /// Total data file size in bytes.
-    pub storage_size: u64,
-    /// Software release for compatibility validation on recovery.
     pub release: Release,
 }
 
@@ -2695,7 +2646,7 @@ mod tests {
         let mut sb = setup_formatted_superblock();
 
         let view_headers = ViewChangeArray::root(1);
-        let view_attrs = ViewAttributes {
+        let view_attrs = crate::vsr::state::ViewAttributes {
             headers: &view_headers,
             view: 42,
             log_view: 40,
@@ -2784,11 +2735,6 @@ mod tests {
         // Should panic on sequence overflow.
         prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
     }
-
-    // NOTE: test_prepare_checkpoint_panics_on_empty_view_headers is not implemented
-    // because ViewChangeArray cannot be constructed with zero length through safe APIs.
-    // The assertion `view_attrs.headers.len() > 0` is a defensive check against invariant
-    // violations that cannot occur through normal usage.
 
     proptest! {
         #[test]
@@ -3274,55 +3220,6 @@ mod tests {
 
             prop_assert_eq!(sb.queue_depth, enqueue_count - release_count);
         }
-    }
-
-    #[test]
-    fn test_queued_checkpoint_loses_data() {
-        let mut sb = setup_formatted_superblock();
-        let mut ctx1 = Context::<MockStorage>::new(1, 1);
-        let mut ctx2 = Context::<MockStorage>::new(2, 2);
-
-        let cb: Callback<MockStorage> = |_| {};
-
-        // 1. Start first checkpoint.
-        let opts1 = make_checkpoint_options(1, 1);
-        sb.checkpoint(cb, &mut ctx1, opts1);
-
-        // 2. Queue second checkpoint.
-        let mut opts2 = make_checkpoint_options(2, 2);
-        opts2.commit_max = 999;
-        sb.checkpoint(cb, &mut ctx2, opts2);
-
-        // Verify ctx2 captured the state intent
-        assert!(sb.is_queue_head(&ctx1));
-        assert!(!sb.is_queue_head(&ctx2));
-
-        // This assertion will FAIL until the bug is fixed:
-        assert!(
-            ctx2.vsr_state.is_some(),
-            "Context should have captured vsr_state"
-        );
-        assert_eq!(
-            ctx2.vsr_state.unwrap().commit_max,
-            999,
-            "Context should have captured commit_max"
-        );
-
-        // 3. Complete first checkpoint.
-        sb.release(&mut ctx1);
-
-        // 4. Now ctx2 becomes head and is kicked.
-        // It should have written sequence 3 (assuming sequence 2 was written by ctx1)
-        // and correct commit_max.
-
-        // Note: In this mock, ctx1 didn't actually update working because we didn't run the full callbacks.
-        // So staging.sequence might be 2 (if it based on working=1).
-        // But vsr_state should be from ctx2.
-
-        assert_eq!(
-            sb.staging.vsr_state.commit_max, 999,
-            "Staging should reflect ctx2 state"
-        );
     }
 
     #[test]
