@@ -106,12 +106,14 @@ impl Storage for storage::Storage {
     #[inline]
     unsafe fn context_from_read(read: &mut Self::Read) -> &mut superblock::Context<Self> {
         let ptr = read as *mut Self::Read;
-        unsafe { &mut *container_of!(ptr, superblock::Context<Self>, read) }
+        let ctx_ptr = container_of!(ptr, superblock::Context<Self>, read);
+        unsafe { &mut *ctx_ptr }
     }
 
     #[inline]
     unsafe fn context_from_write(write: &mut Self::Write) -> &mut superblock::Context<Self> {
         let ptr = write as *mut Self::Write;
-        unsafe { &mut *container_of!(ptr, superblock::Context<Self>, write) }
+        let ctx_ptr = container_of!(ptr, superblock::Context<Self>, write);
+        unsafe { &mut *ctx_ptr }
     }
 }
