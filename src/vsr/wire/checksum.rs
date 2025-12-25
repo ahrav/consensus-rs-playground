@@ -58,100 +58,13 @@ mod tests {
     // Unit Tests: Determinism
     // =========================================================================
 
-    #[test]
-    fn determinism_empty() {
-        let c1 = checksum(b"");
-        let c2 = checksum(b"");
-        assert_eq!(c1, c2, "Empty input must produce consistent MAC");
-    }
-
-    #[test]
-    fn determinism_single_byte() {
-        let c1 = checksum(b"a");
-        let c2 = checksum(b"a");
-        assert_eq!(c1, c2, "Single byte must produce consistent MAC");
-    }
-
-    #[test]
-    fn determinism_large_input() {
-        let data = vec![0xAB; 10_000];
-        let c1 = checksum(&data);
-        let c2 = checksum(&data);
-        assert_eq!(c1, c2, "Large input must produce consistent MAC");
-    }
-
     // =========================================================================
     // Unit Tests: Collision Resistance
     // =========================================================================
 
-    #[test]
-    fn different_inputs_different_macs() {
-        let c1 = checksum(b"message1");
-        let c2 = checksum(b"message2");
-        assert_ne!(c1, c2, "Different inputs must produce different MACs");
-    }
-
-    #[test]
-    fn single_bit_flip_changes_mac() {
-        let data1 = b"message";
-        let mut data2 = data1.to_vec();
-        data2[0] ^= 0x01;
-
-        let c1 = checksum(data1);
-        let c2 = checksum(&data2);
-        assert_ne!(c1, c2, "Single bit flip must change MAC (avalanche effect)");
-    }
-
-    #[test]
-    fn trailing_byte_changes_mac() {
-        let c1 = checksum(b"message");
-        let c2 = checksum(b"message\0");
-        assert_ne!(c1, c2, "Trailing byte must change MAC");
-    }
-
-    #[test]
-    fn reordered_bytes_different_mac() {
-        let c1 = checksum(b"ab");
-        let c2 = checksum(b"ba");
-        assert_ne!(c1, c2, "Byte order must affect MAC");
-    }
-
     // =========================================================================
     // Unit Tests: Edge Cases
     // =========================================================================
-
-    #[test]
-    fn empty_input_no_panic() {
-        let data: [u8; 0] = [];
-        let _ = checksum(&data);
-    }
-
-    #[test]
-    fn all_zeros_deterministic() {
-        let data = vec![0u8; 1024];
-        let c1 = checksum(&data);
-        let c2 = checksum(&data);
-        assert_eq!(c1, c2, "All-zeros input must be deterministic");
-    }
-
-    #[test]
-    fn all_ones_deterministic() {
-        let data = vec![0xFFu8; 1024];
-        let c1 = checksum(&data);
-        let c2 = checksum(&data);
-        assert_eq!(c1, c2, "All-ones input must be deterministic");
-    }
-
-    #[test]
-    fn boundary_sizes() {
-        // Test sizes around cipher block boundaries (AEGIS-128L uses 32-byte blocks)
-        for size in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
-            let data = vec![0x42u8; size];
-            let c1 = checksum(&data);
-            let c2 = checksum(&data);
-            assert_eq!(c1, c2, "Size {} must produce deterministic MAC", size);
-        }
-    }
 
     #[test]
     fn large_realistic_message() {

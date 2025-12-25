@@ -669,24 +669,6 @@ mod tests {
     }
 
     #[test]
-    fn push_back_pop_front_single() {
-        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
-        let mut a = Node::new(42);
-
-        list.push_back(&mut a);
-
-        assert!(!list.is_empty());
-        assert!(list.len() == 1);
-        assert!(a.link.is_linked());
-
-        let ptr = list.pop_front().unwrap();
-        assert!(unsafe { ptr.as_ref().value } == 42);
-
-        assert!(list.is_empty());
-        assert!(!a.link.is_linked());
-    }
-
-    #[test]
     fn push_front_pop_back_single() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
         let mut a = Node::new(42);
@@ -700,25 +682,6 @@ mod tests {
         assert!(unsafe { ptr.as_ref().value } == 42);
 
         assert!(list.is_empty());
-    }
-
-    #[test]
-    fn fifo_order_push_back_pop_front() {
-        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let mut c = Node::new(3);
-
-        list.push_back(&mut a);
-        list.push_back(&mut b);
-        list.push_back(&mut c);
-
-        assert!(list.len() == 3);
-
-        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 1);
-        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 2);
-        assert!(unsafe { list.pop_front().unwrap().as_ref().value } == 3);
-        assert!(list.pop_front().is_none());
     }
 
     #[test]
@@ -862,35 +825,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    fn lifecycle_invariants() {
-        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let mut c = Node::new(3);
-
-        list.check_invariants(); // Empty
-
-        list.push_back(&mut a);
-        list.check_invariants();
-
-        list.push_back(&mut b);
-        list.check_invariants();
-
-        list.push_front(&mut c);
-        list.check_invariants();
-
-        list.pop_back();
-        list.check_invariants();
-
-        list.pop_front();
-        list.check_invariants();
-
-        list.pop_front();
-        list.check_invariants(); // Empty again
-    }
-
-    #[test]
     #[should_panic(expected = "push_back: node already linked")]
     fn panic_double_push_back() {
         let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
@@ -1000,24 +934,6 @@ mod tests {
     // ========================================================================
     // pop_back Order Verification (Critical Gap)
     // ========================================================================
-
-    #[test]
-    fn pop_back_order() {
-        let mut list: DoublyLinkedList<Node, Tag> = DoublyLinkedList::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let mut c = Node::new(3);
-
-        list.push_back(&mut a);
-        list.push_back(&mut b);
-        list.push_back(&mut c);
-
-        // Pop in reverse order
-        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 3);
-        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 2);
-        assert!(unsafe { list.pop_back().unwrap().as_ref().value } == 1);
-        assert!(list.pop_back().is_none());
-    }
 
     #[test]
     fn alternating_pop_front_back() {

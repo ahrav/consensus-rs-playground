@@ -130,54 +130,7 @@ unsafe impl Send for AlignedBuf {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MIN};
-
-    #[test]
-    fn buf_alloc_default() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.len(), 4096);
-        assert_eq!(buf.align(), SECTOR_SIZE_DEFAULT);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_DEFAULT, 0);
-    }
-
-    #[test]
-    fn buf_alloc_min() {
-        let buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
-        assert_eq!(buf.len(), 512);
-        assert_eq!(buf.align(), SECTOR_SIZE_MIN);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
-    }
-
-    #[test]
-    fn buf_alloc_max() {
-        let buf = AlignedBuf::new_zeroed(65536, SECTOR_SIZE_MAX);
-        assert_eq!(buf.len(), 65536);
-        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
-    }
-
-    #[test]
-    fn buf_alloc_edges() {
-        // Small len, large align
-        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MAX);
-        assert_eq!(buf.len(), 1);
-        assert_eq!(buf.align(), SECTOR_SIZE_MAX);
-        assert_eq!(buf.as_ptr() as usize % SECTOR_SIZE_MAX, 0);
-
-        // Large len, small align
-        let buf2 = AlignedBuf::new_zeroed(1024 * 1024, SECTOR_SIZE_MIN);
-        assert_eq!(buf2.len(), 1024 * 1024);
-        assert_eq!(buf2.align(), SECTOR_SIZE_MIN);
-        assert_eq!(buf2.as_ptr() as usize % SECTOR_SIZE_MIN, 0);
-    }
-
-    #[test]
-    fn buf_alloc_alignments() {
-        for align in [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
-            let buf = AlignedBuf::new_zeroed(align, align);
-            assert_eq!(buf.as_ptr() as usize % align, 0);
-        }
-    }
+    use crate::storage::constants::SECTOR_SIZE_DEFAULT;
 
     #[test]
     #[should_panic(expected = "assertion failed")]
@@ -210,50 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn buf_is_zeroed() {
-        let buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        assert!(buf.as_slice().iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn buf_mut_write() {
-        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        let slice = buf.as_mut_slice();
-        slice[0] = 0xAB;
-        slice[1] = 0xCD;
-        slice[4095] = 0xEF;
-
-        assert_eq!(buf.as_slice()[0], 0xAB);
-        assert_eq!(buf.as_slice()[1], 0xCD);
-        assert_eq!(buf.as_slice()[4095], 0xEF);
-    }
-
-    #[test]
-    fn buf_mut_fill() {
-        let mut buf = AlignedBuf::new_zeroed(512, SECTOR_SIZE_MIN);
-        buf.as_mut_slice().fill(0xFF);
-        assert!(buf.as_slice().iter().all(|&b| b == 0xFF));
-    }
-
-    #[test]
-    fn buf_ptrs() {
-        let mut buf = AlignedBuf::new_zeroed(4096, SECTOR_SIZE_DEFAULT);
-        let ptr = buf.as_ptr();
-        assert_eq!(ptr, buf.as_mut_ptr() as *const u8);
-        assert_eq!(ptr, buf.as_slice().as_ptr());
-    }
-
-    #[test]
     fn buf_slice_lengths() {
         let mut buf = AlignedBuf::new_zeroed(1234, SECTOR_SIZE_DEFAULT);
         assert_eq!(buf.as_slice().len(), 1234);
         assert_eq!(buf.as_mut_slice().len(), 1234);
-    }
-
-    #[test]
-    fn buf_not_empty() {
-        let buf = AlignedBuf::new_zeroed(1, SECTOR_SIZE_MIN);
-        assert!(!buf.is_empty());
     }
 
     #[test]

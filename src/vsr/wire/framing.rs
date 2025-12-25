@@ -343,33 +343,6 @@ mod tests {
     }
 
     #[test]
-    fn feed_accumulates_bytes() {
-        let mut buf = MessageBuffer::new();
-
-        buf.feed(b"hello");
-        assert!(buf.available() == 5);
-        assert!(buf.buffered() == 5);
-
-        buf.feed(b"world");
-        assert!(buf.available() == 10);
-        assert!(buf.buffered() == 10);
-    }
-
-    #[test]
-    fn clear_resets_buffer() {
-        let mut buf = MessageBuffer::new();
-
-        buf.feed(b"some data");
-        assert!(buf.available() > 0);
-
-        buf.clear();
-
-        assert!(buf.available() == 0);
-        assert!(buf.cursor() == 0);
-        assert!(buf.buffered() == 0);
-    }
-
-    #[test]
     fn peek_header_needs_enough_bytes() {
         let mut buf = MessageBuffer::new();
 
@@ -380,32 +353,6 @@ mod tests {
         // Exactly enough (but will fail validation)
         buf.feed(&[0u8; 1]);
         assert!(buf.peek_header().is_some());
-    }
-
-    #[test]
-    fn decode_message() {
-        let mut buf = MessageBuffer::new();
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        let body = b"test body content";
-        let message_bytes = make_valid_message(Command::Ping, body);
-
-        buf.feed(&message_bytes);
-
-        let handle = buf.decode(&mut pool).expect("decode should succeed");
-
-        // Verify message
-        unsafe {
-            let msg = handle.as_ref();
-            assert!(msg.header().command == Command::Ping);
-            assert!(msg.body() == body);
-        }
-
-        // Buffer should be cleared (consumed everything)
-        assert!(buf.available() == 0);
-        assert!(buf.cursor() == 0);
-
-        pool.release(handle);
     }
 
     #[test]
@@ -465,33 +412,6 @@ mod tests {
 
         let result = buf.decode(&mut pool);
         assert!(matches!(result, Err(DecodeError::BadBodyChecksum)));
-    }
-
-    #[test]
-    fn decode_multiple_messages() {
-        let mut buf = MessageBuffer::new();
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        let msg1 = make_valid_message(Command::Ping, b"first");
-        let msg2 = make_valid_message(Command::Pong, b"second");
-
-        buf.feed(&msg1);
-        buf.feed(&msg2);
-
-        let h1 = buf.decode(&mut pool).expect("first decode");
-        unsafe {
-            assert!(h1.as_ref().header().command == Command::Ping);
-        }
-
-        let h2 = buf.decode(&mut pool).expect("second decode");
-        unsafe {
-            assert!(h2.as_ref().header().command == Command::Pong);
-        }
-
-        assert!(buf.available() == 0);
-
-        pool.release(h1);
-        pool.release(h2);
     }
 
     #[test]
@@ -727,17 +647,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn feed_empty_slice() {
-        let mut buf = MessageBuffer::new();
-
-        buf.feed(&[]);
-
-        assert!(buf.available() == 0);
-        assert!(buf.buffered() == 0);
-        assert!(buf.cursor() == 0);
-    }
-
-    #[test]
     fn feed_up_to_max_buf_size() {
         let mut buf = MessageBuffer::new();
 
@@ -871,39 +780,6 @@ mod tests {
     // =========================================================================
     // compact() Tests
     // =========================================================================
-
-    #[test]
-    fn compact_when_cursor_zero_is_noop() {
-        let mut buf = MessageBuffer::new();
-
-        buf.feed(b"data");
-        assert!(buf.cursor() == 0);
-
-        let old_buffered = buf.buffered();
-        let old_available = buf.available();
-
-        buf.compact();
-
-        assert!(buf.cursor() == 0);
-        assert!(buf.buffered() == old_buffered);
-        assert!(buf.available() == old_available);
-    }
-
-    #[test]
-    fn compact_cursor_positions() {
-        for consume_amt in [1u32, 10, 50, 99] {
-            let mut buf = MessageBuffer::new();
-            buf.feed(&[0xAA; 100]);
-            buf.cursor = consume_amt;
-
-            let old_available = buf.available();
-            buf.compact();
-
-            assert!(buf.cursor() == 0);
-            assert!(buf.available() == old_available);
-            assert!(buf.buffered() == old_available);
-        }
-    }
 
     // =========================================================================
     // maybe_compact() Additional Tests

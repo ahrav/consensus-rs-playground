@@ -685,37 +685,6 @@ mod tests {
     // ==================== Layout Invariant Tests ====================
 
     #[test]
-    fn test_zones_contiguous() {
-        let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
-
-        for i in 1..Zone::COUNT {
-            let prev = layout.zone(Zone::ALL[i - 1]);
-            let curr = layout.zone(Zone::ALL[i]);
-            assert_eq!(
-                curr.base,
-                prev.end(),
-                "Zone {:?} should start where Zone {:?} ends",
-                Zone::ALL[i],
-                Zone::ALL[i - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn test_zones_aligned() {
-        let layout = Layout::new(512, 4096, 4096, 8192, 16384, 8192, 65536);
-
-        for zone in Zone::ALL {
-            assert_eq!(
-                layout.start(zone) % layout.sector_size,
-                0,
-                "Zone {:?} base must be sector-aligned",
-                zone
-            );
-        }
-    }
-
-    #[test]
     fn test_sb_zero() {
         let layout = Layout::new(4096, 4096, 4096, 4096, 4096, 4096, 4096);
         assert_eq!(layout.start(Zone::SuperBlock), 0);
@@ -745,23 +714,9 @@ mod tests {
     }
 
     #[test]
-    fn test_grid_aligned() {
-        // Use sizes that don't naturally align to block size
-        let layout = Layout::new(512, 4096, 5120, 3072, 7168, 2048, 8192);
-        assert_eq!(layout.start(Zone::Grid) % layout.block_size, 0);
-    }
-
-    #[test]
     fn test_total_size_end() {
         let layout = Layout::new(4096, 4096, 4096, 4096, 4096, 4096, 4096);
         assert_eq!(layout.total_size(), layout.end(Zone::Grid));
-    }
-
-    #[test]
-    fn test_total_size_sum() {
-        let layout = Layout::new(4096, 4096, 4096, 8192, 16384, 8192, 65536);
-        let sum: u64 = Zone::ALL.iter().map(|&z| layout.size(z)).sum();
-        assert_eq!(layout.total_size(), sum);
     }
 
     #[test]

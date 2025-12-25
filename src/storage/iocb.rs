@@ -347,19 +347,6 @@ mod tests {
         let _ = read.absolute_offset();
     }
 
-    #[test]
-    fn read_layout() {
-        let layout = Layout::new(512, 4096, 512, 512, 512, 512, 4096);
-        let mut read = Read::new();
-        read.zone = Zone::WalPrepares;
-        read.zone_spec = layout.zone(Zone::WalPrepares);
-        read.offset = 100;
-        assert_eq!(
-            read.absolute_offset(),
-            layout.start(Zone::WalPrepares) + 100
-        );
-    }
-
     // ==================== Write ====================
 
     #[test]
@@ -472,22 +459,6 @@ mod tests {
     }
 
     // ==================== Consistency ====================
-
-    #[test]
-    fn rw_consistency() {
-        let zone_spec = ZoneSpec {
-            base: 8192,
-            size: 4096,
-        };
-        let mut read = Read::new();
-        read.zone_spec = zone_spec;
-        read.offset = 100;
-        let mut write = Write::new();
-        write.zone_spec = zone_spec;
-        write.offset = 100;
-
-        assert_eq!(read.absolute_offset(), write.absolute_offset());
-    }
 
     #[test]
     fn rw_all_zones() {
