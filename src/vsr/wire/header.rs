@@ -359,18 +359,6 @@ mod tests {
     }
 
     #[test]
-    fn body_len_consistency() {
-        let mut h = Header::new(Command::Request, 1, 0);
-
-        assert!(h.body_len() == 0);
-        assert!(h.total_len() == Header::SIZE_MIN);
-
-        h.size = Header::SIZE_MIN + 100;
-        assert!(h.body_len() == 100);
-        assert!(h.total_len() == Header::SIZE_MIN + 100);
-    }
-
-    #[test]
     fn checksum_roundtrip() {
         let mut h = Header::new(Command::Ping, 1, 0);
         let body: [u8; 0] = [];

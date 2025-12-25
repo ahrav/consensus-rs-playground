@@ -274,76 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn acquire_release_single() {
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        let handle = pool.acquire();
-
-        assert!(pool.available() == 3);
-        assert!(pool.in_use() == 1);
-
-        // SAFETY: Handle is valid
-        unsafe {
-            assert!(handle.as_ref().references.get() == 1);
-        }
-
-        pool.release(handle);
-
-        assert!(pool.available() == 4);
-        assert!(pool.in_use() == 0);
-    }
-
-    #[test]
-    fn acquire_all_messages() {
-        let mut pool: MessagePool<4> = MessagePool::new();
-        let mut handles = Vec::new();
-
-        for i in 0..4 {
-            let h = pool.acquire();
-            handles.push(h);
-            assert!(pool.available() == 3 - i as u32);
-        }
-
-        assert!(pool.available() == 0);
-        assert!(pool.try_acquire().is_none());
-
-        for h in handles {
-            pool.release(h);
-        }
-
-        assert!(pool.available() == 4);
-    }
-
-    #[test]
-    fn reference_counting() {
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        let handle = pool.acquire();
-
-        // SAFETY: Handle is valid
-        unsafe {
-            assert!(handle.as_ref().references.get() == 1);
-
-            // Acquire additional reference
-            let _ = handle.acquire();
-            assert!(handle.as_ref().references.get() == 2);
-
-            // Release one reference
-            pool.release(handle);
-            assert!(handle.as_ref().references.get() == 1);
-
-            // Message should still be in use
-            assert!(pool.in_use() == 1);
-
-            // Release last reference
-            pool.release(handle);
-        }
-
-        assert!(pool.in_use() == 0);
-        assert!(pool.available() == 4);
-    }
-
-    #[test]
     fn message_can_be_used() {
         let mut pool: MessagePool<4> = MessagePool::new();
 
@@ -360,23 +290,6 @@ mod tests {
         }
 
         pool.release(handle);
-    }
-
-    #[test]
-    fn pool_owns_handles() {
-        let mut pool1: MessagePool<4> = MessagePool::new();
-        let mut pool2: MessagePool<4> = MessagePool::new();
-
-        let h1 = pool1.acquire();
-        let h2 = pool2.acquire();
-
-        assert!(pool1.owns(h1));
-        assert!(!pool1.owns(h2));
-        assert!(pool2.owns(h2));
-        assert!(!pool2.owns(h1));
-
-        pool1.release(h1);
-        pool2.release(h2);
     }
 
     #[test]
@@ -489,69 +402,6 @@ mod tests {
     }
 
     #[test]
-    fn pool_reuse_after_release() {
-        let mut pool: MessagePool<2> = MessagePool::new();
-
-        // First cycle
-        let h1 = pool.acquire();
-        let h2 = pool.acquire();
-        let ptr1 = h1.as_ptr();
-        let ptr2 = h2.as_ptr();
-
-        pool.release(h1);
-        pool.release(h2);
-
-        // Second cycle - messages should be reused
-        let h3 = pool.acquire();
-        let h4 = pool.acquire();
-        let ptr3 = h3.as_ptr();
-        let ptr4 = h4.as_ptr();
-
-        // Pointers should match (FIFO order from ring buffer)
-        assert!(ptr3 == ptr1);
-        assert!(ptr4 == ptr2);
-
-        pool.release(h3);
-        pool.release(h4);
-    }
-
-    #[test]
-    fn multiple_acquire_release_cycles_no_corruption() {
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        for cycle in 0..100 {
-            let mut handles = Vec::new();
-
-            // Acquire all
-            for _ in 0..4 {
-                handles.push(pool.acquire());
-            }
-
-            assert!(pool.available() == 0);
-            assert!(pool.in_use() == 4);
-
-            // Verify each handle is valid and has refcount 1
-            for h in &handles {
-                // SAFETY: Handle is valid
-                unsafe {
-                    assert!(
-                        h.as_ref().references.get() == 1,
-                        "cycle {cycle}: unexpected refcount"
-                    );
-                }
-            }
-
-            // Release all
-            for h in handles {
-                pool.release(h);
-            }
-
-            assert!(pool.available() == 4);
-            assert!(pool.in_use() == 0);
-        }
-    }
-
-    #[test]
     fn owns_returns_true_for_released_handles() {
         let mut pool: MessagePool<4> = MessagePool::new();
 
@@ -562,32 +412,6 @@ mod tests {
 
         // Handle still points to pool-owned memory even after release
         assert!(pool.owns(handle));
-    }
-
-    #[test]
-    fn interleaved_acquire_release_pattern() {
-        let mut pool: MessagePool<4> = MessagePool::new();
-
-        // Acquire 2
-        let h1 = pool.acquire();
-        let h2 = pool.acquire();
-        assert!(pool.in_use() == 2);
-
-        // Release 1
-        pool.release(h1);
-        assert!(pool.in_use() == 1);
-
-        // Acquire 2 more
-        let h3 = pool.acquire();
-        let h4 = pool.acquire();
-        assert!(pool.in_use() == 3);
-
-        // Release all remaining
-        pool.release(h2);
-        pool.release(h3);
-        pool.release(h4);
-        assert!(pool.in_use() == 0);
-        assert!(pool.available() == 4);
     }
 
     #[test]

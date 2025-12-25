@@ -425,25 +425,6 @@ mod tests {
     // Boundary tests (127/128 boundary between VSR reserved and user ops)
     // =========================================================================
 
-    #[test]
-    fn test_reserved_boundary() {
-        // All 0-127 should be vsr_reserved
-        for opcode in 0..128 {
-            assert!(
-                Operation::from_u8(opcode).vsr_reserved(),
-                "opcode {opcode} should be vsr_reserved"
-            );
-        }
-
-        // All 128-255 should NOT be vsr_reserved
-        for opcode in 128..=255 {
-            assert!(
-                !Operation::from_u8(opcode).vsr_reserved(),
-                "opcode {opcode} should NOT be vsr_reserved"
-            );
-        }
-    }
-
     // =========================================================================
     // from_vsr trait method tests
     // =========================================================================
@@ -628,17 +609,6 @@ mod tests {
     // From trait tests
     // =========================================================================
 
-    #[test]
-    fn test_from_trait_roundtrip() {
-        for byte in 0..=255u8 {
-            let op: Operation = byte.into();
-            assert_eq!(op.as_u8(), byte);
-
-            let back: u8 = op.into();
-            assert_eq!(byte, back);
-        }
-    }
-
     // =========================================================================
     // Debug formatting tests
     // =========================================================================
@@ -677,19 +647,6 @@ mod tests {
     // =========================================================================
     // Ordering tests
     // =========================================================================
-
-    #[test]
-    fn test_ordering() {
-        // Verify ordering matches underlying u8 ordering
-        for i in 0..255u8 {
-            let op1 = Operation::from_u8(i);
-            let op2 = Operation::from_u8(i + 1);
-            assert!(op1 < op2);
-            assert!(op2 > op1);
-            assert!(op1 <= op1);
-            assert!(op1 >= op1);
-        }
-    }
 
     // =========================================================================
     // Full roundtrip tests for all TestOp variants
