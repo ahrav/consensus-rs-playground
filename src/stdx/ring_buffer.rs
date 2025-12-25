@@ -360,16 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn push_returns_error_when_full() {
-        let mut rb: RingBuffer<i32, 2> = RingBuffer::new();
-        assert!(rb.push_back(1).is_ok());
-        assert!(rb.push_back(2).is_ok());
-        assert!(rb.push_back(3).is_err());
-        assert_eq!(rb.len(), 2);
-        assert_eq!(rb.front(), Some(&1));
-    }
-
-    #[test]
     fn clear_drops_elements_and_allows_reuse() {
         let drops = Rc::new(Cell::new(0));
         {

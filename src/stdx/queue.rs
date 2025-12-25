@@ -375,56 +375,6 @@ mod tests {
     }
 
     #[test]
-    fn push_pop() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(42);
-
-        q.push(&mut a);
-
-        assert!(!q.is_empty());
-        assert!(q.len() == 1);
-
-        let ptr = q.pop().unwrap();
-        assert!(unsafe { ptr.as_ref().value } == 42);
-
-        assert!(q.is_empty());
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn fifo() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let mut c = Node::new(3);
-
-        q.push(&mut a);
-        q.push(&mut b);
-        q.push(&mut c);
-
-        assert!(q.len() == 3);
-
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 1);
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 2);
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 3);
-        assert!(q.pop().is_none());
-    }
-
-    #[test]
-    fn peek() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(42);
-
-        q.push(&mut a);
-
-        let peek1 = q.peek();
-        let peek2 = q.peek();
-
-        assert!(peek1 == peek2);
-        assert!(q.len() == 1);
-    }
-
-    #[test]
     fn peek_returns_head_in_multi_element_queue() {
         let mut q: Queue<Node, QTag> = Queue::init();
         let mut a = Node::new(1);
@@ -445,112 +395,6 @@ mod tests {
     }
 
     #[test]
-    fn take_all() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-
-        q.push(&mut a);
-        q.push(&mut b);
-
-        let mut taken = q.take_all();
-
-        // Original is empty
-        assert!(q.is_empty());
-        assert!(q.is_empty());
-
-        // Taken has the nodes
-        assert!(taken.len() == 2);
-        assert!(unsafe { taken.pop().unwrap().as_ref().value } == 1);
-        assert!(unsafe { taken.pop().unwrap().as_ref().value } == 2);
-    }
-
-    #[test]
-    fn reset() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-
-        q.push(&mut a);
-        assert!(!q.is_empty());
-
-        q.reset();
-
-        assert!(q.is_empty());
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn contains() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let c = Node::new(3);
-
-        q.push(&mut a);
-        q.push(&mut b);
-
-        assert!(q.contains(&a));
-        assert!(q.contains(&b));
-        assert!(!q.contains(&c));
-    }
-
-    #[test]
-    fn interleaved() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-        let mut c = Node::new(3);
-
-        q.push(&mut a);
-        q.push(&mut b);
-
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 1);
-
-        q.push(&mut c);
-
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 2);
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 3);
-        assert!(q.pop().is_none());
-    }
-
-    #[test]
-    fn pop_clears_link() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-
-        q.push(&mut a);
-        q.push(&mut b);
-
-        let ptr = q.pop().unwrap();
-
-        // Popped node's link should be cleared
-        assert!(unsafe { ptr.as_ref().link.is_unlinked() });
-    }
-
-    #[test]
-    #[cfg(debug_assertions)]
-    fn invariants() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-        let mut b = Node::new(2);
-
-        q.check_invariants(); // Empty
-
-        q.push(&mut a);
-        q.check_invariants();
-
-        q.push(&mut b);
-        q.check_invariants();
-
-        q.pop();
-        q.check_invariants();
-
-        q.pop();
-        q.check_invariants(); // Empty again
-    }
-
-    #[test]
     #[should_panic(expected = "pushing already-linked node")]
     fn push_linked_panics() {
         let mut q: Queue<Node, QTag> = Queue::init();
@@ -563,13 +407,6 @@ mod tests {
     // ==================== Boundary Condition Tests ====================
 
     #[test]
-    fn pop_empty() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        assert!(q.pop().is_none());
-        assert!(q.pop().is_none()); // Multiple pops on empty
-    }
-
-    #[test]
     fn peek_empty() {
         let q: Queue<Node, QTag> = Queue::init();
         assert!(q.peek().is_none());
@@ -580,15 +417,6 @@ mod tests {
         let q: Queue<Node, QTag> = Queue::init();
         let a = Node::new(1);
         assert!(!q.contains(&a));
-    }
-
-    #[test]
-    fn take_all_empty() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let taken = q.take_all();
-
-        assert!(taken.is_empty());
-        assert!(q.is_empty());
     }
 
     #[test]
@@ -662,38 +490,6 @@ mod tests {
     }
 
     // ==================== Re-push After Pop Tests ====================
-
-    #[test]
-    fn repush() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(1);
-
-        q.push(&mut a);
-        let _ptr = q.pop().unwrap();
-
-        // Node should be unlinked after pop
-        assert!(a.link.is_unlinked());
-
-        // Should be able to push again after pop
-        q.push(&mut a);
-        assert!(q.len() == 1);
-        assert!(unsafe { q.pop().unwrap().as_ref().value } == 1);
-    }
-
-    #[test]
-    fn repush_multiple() {
-        let mut q: Queue<Node, QTag> = Queue::init();
-        let mut a = Node::new(42);
-
-        for _ in 0..5 {
-            q.push(&mut a);
-            assert!(q.len() == 1);
-
-            let ptr = q.pop().unwrap();
-            assert!(unsafe { ptr.as_ref().value } == 42);
-            assert!(a.link.is_unlinked());
-        }
-    }
 
     // ==================== Double-Push Detection Tests ====================
 

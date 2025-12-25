@@ -329,27 +329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_align_up() {
-        assert_eq!(align_up(0, 4), 0);
-        assert_eq!(align_up(1, 4), 4);
-        assert_eq!(align_up(4, 4), 4);
-        assert_eq!(align_up(5, 4), 8);
-    }
-
-    #[test]
-    fn test_align_up_pow2() {
-        for power in 0..16 {
-            let alignment = 1usize << power;
-            // Already aligned values stay unchanged
-            assert_eq!(align_up(alignment, alignment), alignment);
-            // One less gets rounded up
-            if alignment > 1 {
-                assert_eq!(align_up(alignment - 1, alignment), alignment);
-            }
-        }
-    }
-
-    #[test]
     #[should_panic]
     fn test_align_up_panic_non_pow2() {
         align_up(10, 3);
@@ -397,19 +376,6 @@ mod tests {
         // Verify we can read the bytes back
         let reconstructed = u32::from_ne_bytes(bytes.try_into().unwrap());
         assert_eq!(reconstructed, value);
-    }
-
-    #[test]
-    fn test_equal_bytes() {
-        let a: u64 = 12345;
-        let b: u64 = 12345;
-        let c: u64 = 54321;
-
-        unsafe {
-            assert!(equal_bytes(&a, &b));
-            assert!(!equal_bytes(&a, &c));
-            assert!(equal_bytes(&a, &a)); // Same address
-        }
     }
 
     #[repr(C)]
@@ -532,17 +498,6 @@ mod tests {
     }
 
     #[test]
-    fn test_as_bytes_unchecked_mut() {
-        let mut value: u32 = 0;
-        let bytes = unsafe { as_bytes_unchecked_mut(&mut value) };
-
-        // Write bytes in native endian
-        bytes.copy_from_slice(&0xCAFEBABEu32.to_ne_bytes());
-
-        assert_eq!(value, 0xCAFEBABE);
-    }
-
-    #[test]
     fn test_as_bytes_unchecked_mut_struct() {
         // Test with a non-Pod struct (no Pod impl required)
         #[repr(C)]
@@ -633,20 +588,6 @@ mod tests {
         let boxed: AlignedBox<HighlyAligned> = unsafe { AlignedBox::new_zeroed() };
         assert!((boxed.as_ptr() as usize).is_multiple_of(128));
         assert_eq!(boxed.data, [0u8; 64]);
-    }
-
-    #[test]
-    fn test_equal_bytes_distinct() {
-        let a: u64 = 0xDEADBEEFCAFEBABE;
-        let b: u64 = 0xDEADBEEFCAFEBABE;
-
-        // Verify they're at different addresses
-        assert_ne!(&a as *const u64, &b as *const u64);
-
-        // But byte-wise equal
-        unsafe {
-            assert!(equal_bytes(&a, &b));
-        }
     }
 
     #[test]

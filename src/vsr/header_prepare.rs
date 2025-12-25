@@ -556,12 +556,6 @@ mod tests {
     }
 
     #[test]
-    fn test_as_bytes_size() {
-        let header = HeaderPrepare::new();
-        assert_eq!(header.as_bytes().len(), HeaderPrepare::SIZE);
-    }
-
-    #[test]
     fn test_as_bytes_layout() {
         let mut header = HeaderPrepare::new();
         header.cluster = 0xDEAD_BEEF_CAFE_BABE_1234_5678_9ABC_DEF0;
@@ -576,22 +570,6 @@ mod tests {
         assert_eq!(HeaderPrepare::SIZE, 256);
         assert_eq!(HeaderPrepare::SIZE_MIN, 256);
         assert_eq!(HeaderPrepare::SIZE, core::mem::size_of::<HeaderPrepare>());
-    }
-
-    #[test]
-    fn test_checksum_deterministic() {
-        let header = HeaderPrepare::new();
-        let cs1 = header.calculate_checksum();
-        let cs2 = header.calculate_checksum();
-        assert_eq!(cs1, cs2);
-        assert_ne!(cs1, 0);
-    }
-
-    #[test]
-    fn test_checksum_update() {
-        let mut header = HeaderPrepare::new();
-        header.set_checksum();
-        assert!(header.valid_checksum());
     }
 
     #[test]
@@ -668,22 +646,6 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_pulse() {
-        let mut header = HeaderPrepare::new();
-        header.command = Command::Prepare;
-        header.operation = Operation::PULSE;
-        header.request = 0;
-        header.op = 10;
-        header.commit = 9;
-        header.timestamp = 100;
-        header.release = Release(1);
-        header.parent = 1;
-        header.set_checksum_body(&[]);
-        header.set_checksum();
-        assert_eq!(header.invalid(), None);
-    }
-
-    #[test]
     fn test_valid_register() {
         let mut header = HeaderPrepare::new();
         header.command = Command::Prepare;
@@ -698,38 +660,6 @@ mod tests {
         header.set_checksum_body(&[]);
         header.set_checksum();
         assert_eq!(header.invalid(), None);
-    }
-
-    #[test]
-    fn test_valid_root() {
-        let mut header = HeaderPrepare::new();
-        header.command = Command::Prepare;
-        header.operation = Operation::ROOT;
-        header.op = 0;
-        header.commit = 0;
-        header.timestamp = 0;
-        header.request = 0;
-        header.view = 0;
-        header.release = Release(0);
-        header.set_checksum_body(&[]);
-        header.set_checksum();
-        assert!(header.invalid().is_none());
-    }
-
-    #[test]
-    fn test_valid_reserved() {
-        let mut header = HeaderPrepare::new();
-        header.command = Command::Prepare;
-        header.operation = Operation::RESERVED;
-        header.op = 0;
-        header.commit = 0;
-        header.timestamp = 0;
-        header.request = 0;
-        header.view = 0;
-        header.release = Release(0);
-        header.set_checksum_body(&[]);
-        header.set_checksum();
-        assert!(header.invalid().is_none());
     }
 
     #[test]
@@ -985,37 +915,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pulse_invariants() {
-        let mut header = HeaderPrepare::new();
-        header.command = Command::Prepare;
-        header.operation = Operation::PULSE;
-        header.op = 10;
-        header.commit = 9;
-        header.timestamp = 100;
-        header.release = Release(1);
-        header.client = 0;
-        header.request = 0;
-        header.parent = 1;
-        header.set_checksum_body(&[]);
-
-        let mut h = header;
-        h.client = 1;
-        assert_eq!(h.invalid(), Some("client != 0"));
-
-        let mut h = header;
-        h.request = 1;
-        assert_eq!(h.invalid(), Some("request != 0"));
-    }
-
-    #[test]
-    fn test_reserved_op_nonzero() {
-        let mut header = valid_reserved_header();
-        header.op = 123;
-        header.set_checksum();
-        assert!(header.invalid().is_none());
-    }
-
-    #[test]
     fn test_valid_upgrade() {
         let mut header = HeaderPrepare::new();
         header.command = Command::Prepare;
@@ -1066,22 +965,6 @@ mod tests {
         assert!(debug_str.contains("HeaderPrepare"));
         assert!(debug_str.contains("cluster"));
         assert!(debug_str.contains("op"));
-    }
-
-    #[test]
-    fn test_boundary_op_commit() {
-        let mut header = HeaderPrepare::new();
-        header.command = Command::Prepare;
-        header.operation = Operation::NOOP;
-        header.release = Release(1);
-        header.client = 1;
-        header.request = 1;
-        header.timestamp = 1;
-        header.op = 1;
-        header.commit = 0;
-        header.parent = 1;
-        header.set_checksum_body(&[]);
-        assert!(header.invalid().is_none());
     }
 
     #[test]

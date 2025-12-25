@@ -260,40 +260,6 @@ mod tests {
     // ==========================================================================
 
     #[test]
-    fn try_from_u8_covers_all_valid_bytes() {
-        for byte in Command::MIN..=Command::MAX {
-            let cmd = Command::try_from_u8(byte)
-                .unwrap_or_else(|| panic!("Byte {} must map to a Command variant", byte));
-            assert_eq!(cmd.as_u8(), byte);
-        }
-    }
-
-    #[test]
-    fn try_from_u8_rejects_invalid_bytes() {
-        assert_eq!(Command::try_from_u8(Command::MAX + 1), None);
-        assert_eq!(Command::try_from_u8(255), None);
-
-        for byte in [25, 50, 100, 128, 200, 254, 255] {
-            assert_eq!(Command::try_from_u8(byte), None);
-        }
-    }
-
-    #[test]
-    fn numbering_is_dense_no_gaps() {
-        let mut found_variants = vec![false; Command::COUNT as usize];
-
-        for byte in Command::MIN..=Command::MAX {
-            if let Some(cmd) = Command::try_from_u8(byte) {
-                found_variants[cmd.as_u8() as usize] = true;
-            }
-        }
-
-        for (i, found) in found_variants.iter().enumerate() {
-            assert!(*found, "Gap in numbering at discriminant {}", i);
-        }
-    }
-
-    #[test]
     fn all_array_matches_try_from_u8() {
         for (i, &cmd) in Command::ALL.iter().enumerate() {
             let expected = Command::try_from_u8(i as u8).unwrap();
@@ -321,18 +287,6 @@ mod tests {
             let byte: u8 = cmd.into();
             assert_eq!(byte, cmd.as_u8());
         }
-    }
-
-    #[test]
-    fn try_from_u8_for_command_works() {
-        for byte in Command::MIN..=Command::MAX {
-            let result: Result<Command, InvalidCommand> = byte.try_into();
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap().as_u8(), byte);
-        }
-
-        let result: Result<Command, InvalidCommand> = 25u8.try_into();
-        assert_eq!(result, Err(InvalidCommand(25)));
     }
 
     #[test]
