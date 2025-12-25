@@ -901,7 +901,7 @@ fn client_sessions_encode_size() -> u64 {
 /// Returns `None` for checkpoint 0 (the root checkpoint has no trigger).
 #[inline]
 fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
-    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
     assert!(lsm_compaction_ops > 0);
 
     let valid = if checkpoint == 0 {
@@ -1875,7 +1875,7 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
         let checkpoint = lsm_compaction_ops - 1;
         state.checkpoint.header.op = checkpoint;
         let trigger = checkpoint + lsm_compaction_ops;
@@ -1906,7 +1906,7 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
         let checkpoint = (lsm_compaction_ops * 3) - 1;
         state.checkpoint.header.op = checkpoint;
         let trigger = checkpoint + lsm_compaction_ops;
@@ -1928,7 +1928,7 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
         let checkpoint = lsm_compaction_ops - 1;
         state.checkpoint.header.op = checkpoint;
         let trigger = checkpoint + lsm_compaction_ops;
@@ -1948,7 +1948,7 @@ mod tests {
 
     #[test]
     fn test_trigger_for_checkpoint_valid_boundary() {
-        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
         let checkpoint = lsm_compaction_ops - 1;
         let trigger = trigger_for_checkpoint(checkpoint);
         assert!(trigger.is_some());
@@ -1958,7 +1958,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_trigger_for_checkpoint_invalid_panics() {
-        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
         assert!(lsm_compaction_ops > 1);
         let invalid_checkpoint = lsm_compaction_ops;
         let _ = trigger_for_checkpoint(invalid_checkpoint);
@@ -2690,7 +2690,7 @@ mod proptests {
 
         #[test]
         fn prop_trigger_for_checkpoint_valid_boundary_returns_next_bar(k in 1u64..10_000u64) {
-            let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+            let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
             let checkpoint = k
                 .checked_mul(lsm_compaction_ops)
                 .and_then(|v| v.checked_sub(1))
