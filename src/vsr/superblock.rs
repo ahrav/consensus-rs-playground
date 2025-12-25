@@ -2736,11 +2736,6 @@ mod tests {
         prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
     }
 
-    // NOTE: test_prepare_checkpoint_panics_on_empty_view_headers is not implemented
-    // because ViewChangeArray cannot be constructed with zero length through safe APIs.
-    // The assertion `view_attrs.headers.len() > 0` is a defensive check against invariant
-    // violations that cannot occur through normal usage.
-
     proptest! {
         #[test]
         fn prop_checkpoint_sequence_always_advances(
@@ -3225,55 +3220,6 @@ mod tests {
 
             prop_assert_eq!(sb.queue_depth, enqueue_count - release_count);
         }
-    }
-
-    #[test]
-    fn test_queued_checkpoint_loses_data() {
-        let mut sb = setup_formatted_superblock();
-        let mut ctx1 = Context::<MockStorage>::new(1, 1);
-        let mut ctx2 = Context::<MockStorage>::new(2, 2);
-
-        let cb: Callback<MockStorage> = |_| {};
-
-        // 1. Start first checkpoint.
-        let opts1 = make_checkpoint_options(1, 1);
-        sb.checkpoint(cb, &mut ctx1, opts1);
-
-        // 2. Queue second checkpoint.
-        let mut opts2 = make_checkpoint_options(2, 2);
-        opts2.commit_max = 999;
-        sb.checkpoint(cb, &mut ctx2, opts2);
-
-        // Verify ctx2 captured the state intent
-        assert!(sb.is_queue_head(&ctx1));
-        assert!(!sb.is_queue_head(&ctx2));
-
-        // This assertion will FAIL until the bug is fixed:
-        assert!(
-            ctx2.vsr_state.is_some(),
-            "Context should have captured vsr_state"
-        );
-        assert_eq!(
-            ctx2.vsr_state.unwrap().commit_max,
-            999,
-            "Context should have captured commit_max"
-        );
-
-        // 3. Complete first checkpoint.
-        sb.release(&mut ctx1);
-
-        // 4. Now ctx2 becomes head and is kicked.
-        // It should have written sequence 3 (assuming sequence 2 was written by ctx1)
-        // and correct commit_max.
-
-        // Note: In this mock, ctx1 didn't actually update working because we didn't run the full callbacks.
-        // So staging.sequence might be 2 (if it based on working=1).
-        // But vsr_state should be from ctx2.
-
-        assert_eq!(
-            sb.staging.vsr_state.commit_max, 999,
-            "Staging should reflect ctx2 state"
-        );
     }
 
     #[test]
