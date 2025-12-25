@@ -341,7 +341,7 @@ impl CheckpointState {
 #[inline]
 fn checkpoint_valid(op: u64) -> bool {
     // Checkpoints are only valid at compaction bar boundaries.
-    op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS as u64)
+    op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS)
 }
 
 #[inline]
@@ -359,7 +359,7 @@ fn checkpoint_after(checkpoint: u64) -> u64 {
             .expect("checkpoint_after overflow")
     };
 
-    assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS as u64));
+    assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS));
     assert!(checkpoint_valid(result));
 
     result
