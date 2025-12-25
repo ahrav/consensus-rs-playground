@@ -213,7 +213,7 @@ pub fn detect_repairs<const N: usize>(
 
         // If valid, check if it matches canonical state.
         if !header.equal(canonical) {
-             mask |= 1 << i;
+            mask |= 1 << i;
         }
     }
 
@@ -226,7 +226,13 @@ mod tests {
     use crate::constants;
     use crate::vsr::ViewChangeArray;
     use crate::vsr::superblock::SuperBlockHeader;
+    use proptest::prelude::*;
 
+    // =========================================================================
+    // Test Helpers
+    // =========================================================================
+
+    /// Creates a valid header with given sequence and cluster.
     fn make_header(sequence: u64, cluster: u128) -> SuperBlockHeader {
         let mut header = SuperBlockHeader::zeroed();
         header.version = constants::SUPERBLOCK_VERSION;
@@ -237,57 +243,179 @@ mod tests {
         header
     }
 
-    #[test]
-    fn test_select_superblock_basic() {
-        // N=4, Threshold::Open (2)
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // 3 copies at seq 10, 1 at seq 5
-        for i in 0..3 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+    /// Assigns copy indices and recomputes checksums.
+    fn finalize_headers<const N: usize>(headers: &mut [SuperBlockHeader; N]) {
+        for (i, h) in headers.iter_mut().enumerate() {
+            h.copy = i as u16;
+            h.set_checksum();
         }
-        headers[3] = make_header(5, 1);
-        headers[3].copy = 3;
-        headers[3].set_checksum();
+    }
 
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        let h = result.unwrap();
-        assert_eq!(h.sequence, 10);
+    /// Corrupts a header's checksum to make it invalid.
+    fn corrupt_checksum(header: &mut SuperBlockHeader) {
+        header.checksum ^= 1;
+    }
+
+    // =========================================================================
+    // Threshold::count() Tests
+    // =========================================================================
+
+    #[test]
+    fn threshold_count_verify_4_copies() {
+        assert_eq!(Threshold::Verify.count::<4>(), 3);
     }
 
     #[test]
-    fn test_select_superblock_quorum_lost() {
-        // N=4, Threshold::Open (2)
+    fn threshold_count_verify_6_copies() {
+        assert_eq!(Threshold::Verify.count::<6>(), 4);
+    }
+
+    #[test]
+    fn threshold_count_verify_8_copies() {
+        assert_eq!(Threshold::Verify.count::<8>(), 5);
+    }
+
+    #[test]
+    fn threshold_count_open_4_copies() {
+        assert_eq!(Threshold::Open.count::<4>(), 2);
+    }
+
+    #[test]
+    fn threshold_count_open_6_copies() {
+        assert_eq!(Threshold::Open.count::<6>(), 3);
+    }
+
+    #[test]
+    fn threshold_count_open_8_copies() {
+        assert_eq!(Threshold::Open.count::<8>(), 4);
+    }
+
+    #[test]
+    fn threshold_open_tolerates_more_faults_than_verify() {
+        // Open quorum is lower (tolerates 2 faults vs 1)
+        assert!(Threshold::Open.count::<4>() < Threshold::Verify.count::<4>());
+        assert!(Threshold::Open.count::<6>() < Threshold::Verify.count::<6>());
+        assert!(Threshold::Open.count::<8>() < Threshold::Verify.count::<8>());
+    }
+
+    // =========================================================================
+    // select_superblock() - Basic Scenarios
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_basic_quorum() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
 
-        // All different sequences: 10, 11, 12, 13
-        for i in 0..4 {
-            headers[i] = make_header(10 + i as u64, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        // 3 copies at seq 10, 1 at seq 5
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
         }
+        headers[3] = make_header(5, 1);
+        finalize_headers(&mut headers);
 
-        // Each has size 1, need 2.
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    #[test]
+    fn select_superblock_unanimous() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // All copies agree
+        for h in &mut headers {
+            *h = make_header(42, 1);
+        }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 42);
+
+        // Also works for Verify
+        let result = select_superblock(&headers, Threshold::Verify);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 42);
+    }
+
+    #[test]
+    fn select_superblock_exactly_at_quorum_boundary() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // Exactly 2 copies at seq 10 (Open threshold = 2)
+        headers[0] = make_header(10, 1);
+        headers[1] = make_header(10, 1);
+        headers[2] = make_header(5, 1);
+        headers[3] = make_header(3, 1);
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    #[test]
+    fn select_superblock_one_below_quorum() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // Only 1 copy at highest seq (below Open threshold of 2)
+        headers[0] = make_header(10, 1);
+        headers[1] = make_header(5, 1);
+        headers[2] = make_header(3, 1);
+        headers[3] = make_header(1, 1);
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(matches!(result, Err(Error::QuorumLost)));
+    }
+
+    // =========================================================================
+    // select_superblock() - Error Cases
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_quorum_lost() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // All different sequences
+        for (i, h) in headers.iter_mut().enumerate() {
+            *h = make_header(10 + i as u64, 1);
+        }
+        finalize_headers(&mut headers);
+
         let result = select_superblock(&headers, Threshold::Open);
         assert!(matches!(result, Err(Error::QuorumLost)));
     }
 
     #[test]
-    fn test_select_superblock_not_found() {
-        // N=4
+    fn select_superblock_all_invalid() {
+        // Zeroed headers have invalid checksums
         let headers = [SuperBlockHeader::zeroed(); 4];
-        // All checksums invalid (zeroed headers with non-zeroed checksum field due to Aegis)
 
         let result = select_superblock(&headers, Threshold::Open);
         assert!(matches!(result, Err(Error::NotFound)));
     }
 
     #[test]
-    fn test_select_superblock_fork() {
-        // N=4, Threshold::Open (2)
+    fn select_superblock_all_corrupt() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        for h in &mut headers {
+            *h = make_header(10, 1);
+        }
+        finalize_headers(&mut headers);
+
+        // Corrupt all checksums
+        for h in &mut headers {
+            corrupt_checksum(h);
+        }
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(matches!(result, Err(Error::NotFound)));
+    }
+
+    #[test]
+    fn select_superblock_fork_detection() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
 
         // Group A: Seq 10, Cluster 1 (indices 0, 1)
@@ -298,35 +426,202 @@ mod tests {
         headers[2] = make_header(10, 2);
         headers[3] = make_header(10, 2);
 
-        // Fix copies and checksums
-        for i in 0..4 {
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
-        }
+        finalize_headers(&mut headers);
 
         let result = select_superblock(&headers, Threshold::Open);
         assert!(matches!(result, Err(Error::Fork)));
     }
 
     #[test]
-    fn test_select_superblock_higher_sequence_wins() {
-        // N=4, Threshold::Open (2)
+    fn select_superblock_fork_different_parent() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
 
-        // Group A: Seq 10 (indices 0, 1) - Quorum
+        // Same sequence, same cluster, but different parent
+        for h in &mut headers {
+            *h = make_header(10, 1);
+        }
+        headers[0].parent = 111;
+        headers[1].parent = 111;
+        headers[2].parent = 222;
+        headers[3].parent = 222;
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(matches!(result, Err(Error::Fork)));
+    }
+
+    // =========================================================================
+    // select_superblock() - Sequence Selection
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_higher_sequence_wins() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // Lower seq with quorum, higher seq without quorum
         headers[0] = make_header(10, 1);
         headers[1] = make_header(10, 1);
-
-        // Group B: Seq 20 (index 2) - No Quorum
-        headers[2] = make_header(20, 1);
-
-        // Group C: Seq 5 (index 3) - No Quorum
+        headers[2] = make_header(20, 1); // Higher but alone
         headers[3] = make_header(5, 1);
+        finalize_headers(&mut headers);
 
-        for i in 0..4 {
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10); // Highest with quorum
+    }
+
+    #[test]
+    fn select_superblock_higher_sequence_has_quorum() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // Higher seq with quorum beats lower seq with quorum
+        headers[0] = make_header(20, 1);
+        headers[1] = make_header(20, 1);
+        headers[2] = make_header(10, 1);
+        headers[3] = make_header(10, 1);
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 20);
+    }
+
+    // =========================================================================
+    // select_superblock() - Partial Corruption
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_survives_single_corruption() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        for h in &mut headers {
+            *h = make_header(10, 1);
         }
+        finalize_headers(&mut headers);
+
+        // Corrupt one copy
+        corrupt_checksum(&mut headers[0]);
+
+        // Still have 3 valid (Verify threshold = 3)
+        let result = select_superblock(&headers, Threshold::Verify);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    #[test]
+    fn select_superblock_survives_two_corruptions_open() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        for h in &mut headers {
+            *h = make_header(10, 1);
+        }
+        finalize_headers(&mut headers);
+
+        // Corrupt two copies
+        corrupt_checksum(&mut headers[0]);
+        corrupt_checksum(&mut headers[1]);
+
+        // 2 valid copies: enough for Open (threshold=2), not Verify (threshold=3)
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+
+        let result = select_superblock(&headers, Threshold::Verify);
+        assert!(matches!(result, Err(Error::QuorumLost)));
+    }
+
+    #[test]
+    fn select_superblock_mixed_valid_invalid() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // 2 valid at seq 10, 1 valid at seq 5, 1 corrupted at seq 10
+        headers[0] = make_header(10, 1);
+        headers[1] = make_header(10, 1);
+        headers[2] = make_header(5, 1);
+        headers[3] = make_header(10, 1);
+        finalize_headers(&mut headers);
+
+        corrupt_checksum(&mut headers[3]);
+
+        // Only 2 valid copies at seq 10
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    // =========================================================================
+    // select_superblock() - Threshold::Verify
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_verify_threshold_strict() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // 2 copies at each sequence (neither meets Verify threshold of 3)
+        headers[0] = make_header(10, 1);
+        headers[1] = make_header(10, 1);
+        headers[2] = make_header(5, 1);
+        headers[3] = make_header(5, 1);
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Verify);
+        assert!(matches!(result, Err(Error::QuorumLost)));
+    }
+
+    #[test]
+    fn select_superblock_verify_with_minority_old() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        // 3 copies at seq 10, 1 at seq 5
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
+        }
+        headers[3] = make_header(5, 1);
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Verify);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    // =========================================================================
+    // select_superblock() - N=6 Configuration
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_6_copies_open_quorum() {
+        let mut headers = [SuperBlockHeader::zeroed(); 6];
+
+        // 3 copies at seq 10 (Open threshold = 3)
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
+        }
+        for h in &mut headers[3..] {
+            *h = make_header(5, 1);
+        }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 10);
+    }
+
+    // =========================================================================
+    // select_superblock() - N=8 Configuration
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_8_copies_open_quorum() {
+        let mut headers = [SuperBlockHeader::zeroed(); 8];
+
+        // 4 copies at seq 10 (Open threshold = 4)
+        for h in &mut headers[..4] {
+            *h = make_header(10, 1);
+        }
+        for h in &mut headers[4..] {
+            *h = make_header(5, 1);
+        }
+        finalize_headers(&mut headers);
 
         let result = select_superblock(&headers, Threshold::Open);
         assert!(result.is_ok());
@@ -334,33 +629,103 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_threshold_strict() {
-        // N=4, Threshold::Verify (3)
+    fn select_superblock_8_copies_fork() {
+        let mut headers = [SuperBlockHeader::zeroed(); 8];
+
+        // Group A: 4 copies (meets Open quorum)
+        for h in &mut headers[..4] {
+            *h = make_header(10, 1);
+        }
+        // Group B: 4 copies at same seq, different cluster (also meets quorum)
+        for h in &mut headers[4..] {
+            *h = make_header(10, 2);
+        }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(matches!(result, Err(Error::Fork)));
+    }
+
+    // =========================================================================
+    // select_superblock() - Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn select_superblock_single_valid_copy() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
 
-        // 2 copies at Seq 10 (Not enough for Verify)
         headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-        headers[2] = make_header(5, 1);
-        headers[3] = make_header(5, 1);
+        finalize_headers(&mut headers);
 
-        for i in 0..4 {
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        // Invalidate all but one
+        for h in &mut headers[1..] {
+            *h = SuperBlockHeader::zeroed();
         }
 
-        let result = select_superblock(&headers, Threshold::Verify);
+        // 1 valid copy is below any threshold
+        let result = select_superblock(&headers, Threshold::Open);
         assert!(matches!(result, Err(Error::QuorumLost)));
     }
 
     #[test]
-    fn test_detect_repairs_all_match() {
+    fn select_superblock_sequence_zero() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for i in 0..4 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+
+        // Sequence 0 is valid (initial state)
+        for h in &mut headers {
+            *h = make_header(0, 1);
         }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, 0);
+    }
+
+    #[test]
+    fn select_superblock_max_sequence() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        for h in &mut headers {
+            *h = make_header(u64::MAX, 1);
+        }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().sequence, u64::MAX);
+    }
+
+    #[test]
+    fn select_superblock_ptr_stability() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+        for h in &mut headers {
+            *h = make_header(10, 1);
+        }
+        finalize_headers(&mut headers);
+
+        let result = select_superblock(&headers, Threshold::Open).unwrap();
+
+        // Verify returned reference points into original array
+        let result_ptr = result as *const _;
+        let array_start = headers.as_ptr();
+        let array_end = unsafe { array_start.add(4) };
+
+        assert!(result_ptr >= array_start && result_ptr < array_end);
+    }
+
+    // =========================================================================
+    // detect_repairs() Tests
+    // =========================================================================
+
+    #[test]
+    fn detect_repairs_all_match() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for h in &mut headers {
+            *h = make_header(10, 1);
+        }
+        finalize_headers(&mut headers);
 
         let canonical = &headers[0];
         let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
@@ -368,16 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_repairs_invalid_checksum() {
+    fn detect_repairs_invalid_checksum() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for i in 0..4 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        for h in &mut headers {
+            *h = make_header(10, 1);
         }
-        
+        finalize_headers(&mut headers);
+
         // Corrupt index 2
-        headers[2].sequence += 1; // Checksum now invalid
+        corrupt_checksum(&mut headers[2]);
 
         let canonical = &headers[0];
         let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
@@ -385,17 +749,14 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_repairs_old_sequence() {
+    fn detect_repairs_old_sequence() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for i in 0..3 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
         }
         // Old sequence at index 3
         headers[3] = make_header(5, 1);
-        headers[3].copy = 3;
-        headers[3].set_checksum();
+        finalize_headers(&mut headers);
 
         let canonical = &headers[0];
         let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
@@ -403,18 +764,15 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_repairs_higher_sequence_without_quorum() {
+    fn detect_repairs_higher_sequence_without_quorum() {
         // Scenario: canonical is seq 10 (quorum), but index 3 is seq 11 (minority).
         // Index 3 should be repaired (rolled back).
         let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for i in 0..3 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
         }
         headers[3] = make_header(11, 1);
-        headers[3].copy = 3;
-        headers[3].set_checksum();
+        finalize_headers(&mut headers);
 
         let canonical = &headers[0];
         let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
@@ -422,20 +780,221 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_repairs_divergent_cluster() {
+    fn detect_repairs_divergent_cluster() {
         let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for i in 0..3 {
-            headers[i] = make_header(10, 1);
-            headers[i].copy = i as u16;
-            headers[i].set_checksum();
+        for h in &mut headers[..3] {
+            *h = make_header(10, 1);
         }
         // Different cluster at index 3
         headers[3] = make_header(10, 2);
-        headers[3].copy = 3;
-        headers[3].set_checksum();
+        finalize_headers(&mut headers);
 
         let canonical = &headers[0];
         let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
         assert_eq!(repairs, vec![3]);
+    }
+
+    #[test]
+    fn detect_repairs_multiple_issues() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        headers[0] = make_header(10, 1);
+        headers[1] = make_header(5, 1); // Old sequence
+        headers[2] = make_header(10, 1);
+        headers[3] = make_header(10, 2); // Different cluster
+        finalize_headers(&mut headers);
+
+        corrupt_checksum(&mut headers[2]); // Corrupt checksum
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert_eq!(repairs, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn detect_repairs_all_need_repair() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for (i, h) in headers.iter_mut().enumerate() {
+            *h = make_header(i as u64, 1);
+        }
+        finalize_headers(&mut headers);
+
+        // Canonical is seq 10, none match
+        let canonical = make_header(10, 1);
+        let repairs: Vec<usize> = detect_repairs(&headers, &canonical).collect();
+        assert_eq!(repairs, vec![0, 1, 2, 3]);
+    }
+
+    // =========================================================================
+    // RepairIterator Tests
+    // =========================================================================
+
+    #[test]
+    fn repair_iterator_empty_mask() {
+        let iter: RepairIterator<4> = RepairIterator { mask: 0, index: 0 };
+        let repairs: Vec<usize> = iter.collect();
+        assert!(repairs.is_empty());
+    }
+
+    #[test]
+    fn repair_iterator_all_set() {
+        let iter: RepairIterator<4> = RepairIterator {
+            mask: 0b1111,
+            index: 0,
+        };
+        let repairs: Vec<usize> = iter.collect();
+        assert_eq!(repairs, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn repair_iterator_sparse() {
+        let iter: RepairIterator<8> = RepairIterator {
+            mask: 0b10100010,
+            index: 0,
+        };
+        let repairs: Vec<usize> = iter.collect();
+        assert_eq!(repairs, vec![1, 5, 7]);
+    }
+
+    // =========================================================================
+    // Property-Based Tests
+    // =========================================================================
+
+    proptest! {
+        /// Unanimous copies always succeed.
+        #[test]
+        fn prop_unanimous_always_succeeds(
+            sequence in any::<u64>(),
+            cluster in 1u128..=u128::MAX,
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+            for h in &mut headers {
+                *h = make_header(sequence, cluster);
+            }
+            finalize_headers(&mut headers);
+
+            prop_assert!(select_superblock(&headers, Threshold::Open).is_ok());
+            prop_assert!(select_superblock(&headers, Threshold::Verify).is_ok());
+        }
+
+        /// Selected header has the highest sequence among quorum groups.
+        #[test]
+        fn prop_selected_has_highest_quorum_sequence(
+            seq_a in 0u64..1000,
+            seq_b in 0u64..1000,
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+            // 2 copies each at different sequences
+            headers[0] = make_header(seq_a, 1);
+            headers[1] = make_header(seq_a, 1);
+            headers[2] = make_header(seq_b, 1);
+            headers[3] = make_header(seq_b, 1);
+            finalize_headers(&mut headers);
+
+            let result = select_superblock(&headers, Threshold::Open);
+            prop_assert!(result.is_ok());
+            prop_assert_eq!(result.unwrap().sequence, seq_a.max(seq_b));
+        }
+
+        /// Fork requires exactly two disjoint quorums at same sequence.
+        #[test]
+        fn prop_fork_requires_same_sequence(
+            seq_a in 0u64..1000,
+            seq_b in 0u64..1000,
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+
+            // Group A at seq_a, Group B at seq_b, different clusters
+            headers[0] = make_header(seq_a, 1);
+            headers[1] = make_header(seq_a, 1);
+            headers[2] = make_header(seq_b, 2);
+            headers[3] = make_header(seq_b, 2);
+            finalize_headers(&mut headers);
+
+            let result = select_superblock(&headers, Threshold::Open);
+
+            if seq_a == seq_b {
+                prop_assert!(matches!(result, Err(Error::Fork)));
+            } else {
+                prop_assert!(result.is_ok());
+            }
+        }
+
+        /// Corrupting copies below quorum still succeeds.
+        #[test]
+        fn prop_survives_single_corruption(
+            corrupt_idx in 0usize..4,
+            sequence in any::<u64>(),
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+            for h in &mut headers {
+                *h = make_header(sequence, 1);
+            }
+            finalize_headers(&mut headers);
+
+            corrupt_checksum(&mut headers[corrupt_idx]);
+
+            // 3 valid copies: passes Verify (threshold=3)
+            prop_assert!(select_superblock(&headers, Threshold::Verify).is_ok());
+        }
+
+        /// All invalid checksums returns NotFound.
+        #[test]
+        fn prop_all_invalid_returns_not_found(
+            sequences in proptest::collection::vec(any::<u64>(), 4),
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+            for (i, h) in headers.iter_mut().enumerate() {
+                *h = make_header(sequences[i], 1);
+            }
+            finalize_headers(&mut headers);
+
+            for h in &mut headers {
+                corrupt_checksum(h);
+            }
+
+            prop_assert!(matches!(
+                select_superblock(&headers, Threshold::Open),
+                Err(Error::NotFound)
+            ));
+        }
+
+        /// detect_repairs returns empty when all match canonical.
+        #[test]
+        fn prop_detect_repairs_empty_when_unanimous(
+            sequence in any::<u64>(),
+            cluster in 1u128..=u128::MAX,
+        ) {
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+            for h in &mut headers {
+                *h = make_header(sequence, cluster);
+            }
+            finalize_headers(&mut headers);
+
+            let canonical = &headers[0];
+            let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+            prop_assert!(repairs.is_empty());
+        }
+
+        /// detect_repairs finds all mismatches.
+        #[test]
+        fn prop_detect_repairs_finds_all_different(
+            seq_canonical in any::<u64>(),
+            seq_other in any::<u64>(),
+        ) {
+            if seq_canonical == seq_other {
+                return Ok(());
+            }
+
+            let mut headers = [SuperBlockHeader::zeroed(); 4];
+            for h in &mut headers {
+                *h = make_header(seq_other, 1);
+            }
+            finalize_headers(&mut headers);
+
+            let canonical = make_header(seq_canonical, 1);
+            let repairs: Vec<usize> = detect_repairs(&headers, &canonical).collect();
+            prop_assert_eq!(repairs, vec![0, 1, 2, 3]);
+        }
     }
 }
