@@ -196,10 +196,12 @@ impl SuperBlockHeader {
     /// Two headers are equal if they represent the same VSR state, even if
     /// stored in different copy slots or with different checksums.
     pub fn equal(&self, other: &SuperBlockHeader) -> bool {
-        self.version == other.version
+        self.checksum_padding == other.checksum_padding
+            && self.version == other.version
             && self.cluster == other.cluster
             && self.sequence == other.sequence
             && self.parent == other.parent
+            && self.parent_padding == other.parent_padding
             // SAFETY: VsrState is Pod, and ViewChangeArray constructors zero-fill bytes.
             && unsafe {
                 as_bytes_unchecked(&self.vsr_state) == as_bytes_unchecked(&other.vsr_state)
@@ -317,7 +319,7 @@ impl<S: storage::Storage> Context<S> {
     /// Panics if context is not ready to issue a read.
     pub(super) fn assert_ready_for_read(&self) {
         assert!(self.caller != Caller::None);
-        assert!(self.caller.expects_read() || self.caller.expects_write());
+        assert!(self.caller.expects_read());
     }
 
     /// Panics if context is not ready to issue a write.
@@ -708,9 +710,8 @@ mod tests {
         assert!(header1.equal(&header2));
     }
 
-    // Bug test: equal() should check parent_padding
     #[test]
-    fn test_equal_ignores_parent_padding_bug() {
+    fn test_equal_detects_parent_padding_difference() {
         let mut header1 = make_header();
         let mut header2 = make_header();
 
@@ -718,9 +719,19 @@ mod tests {
         header1.parent_padding = 0;
         header2.parent_padding = 1;
 
-        // BUG: equal() doesn't check parent_padding
-        // Two headers with different padding are incorrectly considered equal
-        assert!(header1.equal(&header2));
+        assert!(!header1.equal(&header2));
+    }
+
+    #[test]
+    fn test_equal_detects_checksum_padding_difference() {
+        let mut header1 = make_header();
+        let mut header2 = make_header();
+
+        // This violates invariants but tests equal() behavior
+        header1.checksum_padding = 0;
+        header2.checksum_padding = 1;
+
+        assert!(!header1.equal(&header2));
     }
 
     #[test]
@@ -1123,6 +1134,30 @@ mod tests {
     fn test_context_panic_on_invalid_read_state() {
         let ctx = Context::<MockStorage>::new(0, 0);
         // Caller is None
+        ctx.assert_ready_for_read();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_read_panics_for_format() {
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.caller = Caller::Format;
+        ctx.assert_ready_for_read();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_read_panics_for_checkpoint() {
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.caller = Caller::Checkpoint;
+        ctx.assert_ready_for_read();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_context_read_panics_for_view_change() {
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.caller = Caller::ViewChange;
         ctx.assert_ready_for_read();
     }
 
