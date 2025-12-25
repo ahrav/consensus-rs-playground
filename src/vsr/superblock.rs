@@ -583,7 +583,7 @@ impl<S: storage::Storage> SuperBlock<S> {
             .view_headers
             .take()
             .expect("format requires view_headers");
-        assert!(view_headers.len() > 0);
+        assert!(!view_headers.is_empty());
 
         // Initial header: sequence 1, chains from genesis.
         *self.staging = *self.working;
@@ -1614,7 +1614,6 @@ mod tests {
         // Caller is None
         ctx.assert_ready_for_read();
     }
-
 
     #[test]
     #[should_panic]
