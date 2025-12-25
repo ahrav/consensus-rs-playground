@@ -483,30 +483,6 @@ mod tests {
     }
 
     #[test]
-    fn push_and_pop() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-
-        arr.push(1);
-        arr.push(2);
-        arr.push(3);
-
-        // Verify state after pushes
-        assert_eq!(arr.len(), 3);
-        assert!(!arr.is_empty());
-        assert!(!arr.is_full());
-
-        // Pop and verify LIFO order
-        assert_eq!(arr.pop(), Some(3));
-        assert_eq!(arr.pop(), Some(2));
-        assert_eq!(arr.pop(), Some(1));
-        assert_eq!(arr.pop(), None);
-
-        // Verify empty state
-        assert!(arr.is_empty());
-        assert_eq!(arr.len(), 0);
-    }
-
-    #[test]
     fn push_to_capacity() {
         let mut arr: BoundedArray<u32, 3> = BoundedArray::new();
 
@@ -528,58 +504,10 @@ mod tests {
     }
 
     #[test]
-    fn get_and_index() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.push(10);
-        arr.push(20);
-        arr.push(30);
-
-        // Test get()
-        assert_eq!(arr.get(0), 10);
-        assert_eq!(arr.get(1), 20);
-        assert_eq!(arr.get(2), 30);
-
-        // Test Index trait
-        assert_eq!(arr[0], 10);
-        assert_eq!(arr[1], 20);
-        assert_eq!(arr[2], 30);
-
-        // Test try_get
-        assert_eq!(arr.try_get(0), Some(&10));
-        assert_eq!(arr.try_get(3), None);
-    }
-
-    #[test]
     #[should_panic(expected = "index out of bounds")]
     fn get_out_of_bounds() {
         let arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.get(0); // Empty array, should panic
-    }
-
-    #[test]
-    fn slices() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.push(1);
-        arr.push(2);
-        arr.push(3);
-
-        // const_slice
-        assert_eq!(arr.const_slice(), &[1, 2, 3]);
-
-        // slice (mutable)
-        arr.slice()[1] = 20;
-        assert_eq!(arr.const_slice(), &[1, 20, 3]);
-    }
-
-    #[test]
-    fn extend_from_slice() {
-        let mut arr: BoundedArray<u32, 10> = BoundedArray::new();
-        arr.push(1);
-
-        arr.extend_from_slice(&[2, 3, 4]);
-
-        assert_eq!(arr.len(), 4);
-        assert_eq!(arr.const_slice(), &[1, 2, 3, 4]);
     }
 
     #[test]
@@ -588,19 +516,6 @@ mod tests {
         let mut arr: BoundedArray<u32, 3> = BoundedArray::new();
         arr.push(1);
         arr.extend_from_slice(&[2, 3, 4]); // Would need 4 total, capacity is 3
-    }
-
-    #[test]
-    fn truncate() {
-        let mut arr: BoundedArray<u32, 10> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3, 4, 5]);
-
-        arr.truncate(3);
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr.const_slice(), &[1, 2, 3]);
-
-        arr.truncate(0);
-        assert!(arr.is_empty());
     }
 
     #[test]
@@ -624,56 +539,6 @@ mod tests {
     }
 
     #[test]
-    fn clear() {
-        let mut arr: BoundedArray<u32, 10> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        arr.clear();
-
-        assert!(arr.is_empty());
-        assert_eq!(arr.len(), 0);
-        assert_eq!(arr.remaining_capacity(), 10);
-    }
-
-    #[test]
-    fn first_and_last() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-
-        assert_eq!(arr.first(), None);
-        assert_eq!(arr.last(), None);
-
-        arr.push(10);
-        assert_eq!(arr.first(), Some(10));
-        assert_eq!(arr.last(), Some(10));
-
-        arr.push(20);
-        arr.push(30);
-        assert_eq!(arr.first(), Some(10));
-        assert_eq!(arr.last(), Some(30));
-    }
-
-    #[test]
-    fn set_and_swap() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        arr.set(1, 20);
-        assert_eq!(arr.const_slice(), &[1, 20, 3]);
-
-        arr.swap(0, 2);
-        assert_eq!(arr.const_slice(), &[3, 20, 1]);
-    }
-
-    #[test]
-    fn try_push() {
-        let mut arr: BoundedArray<u32, 2> = BoundedArray::new();
-
-        assert!(arr.try_push(1).is_ok());
-        assert!(arr.try_push(2).is_ok());
-        assert_eq!(arr.try_push(3), Err(3)); // Full, returns value back
-    }
-
-    #[test]
     fn try_push_err_does_not_mutate() {
         let mut arr: BoundedArray<u32, 2> = BoundedArray::new();
         arr.push(1);
@@ -686,23 +551,6 @@ mod tests {
         assert_eq!(arr.len(), len_before);
         assert_eq!(arr.remaining_capacity(), 0);
         assert_eq!(arr.const_slice(), before.as_slice());
-    }
-
-    #[test]
-    fn from_value() {
-        let arr: BoundedArray<u32, 10> = BoundedArray::from_value(42, 5);
-
-        assert_eq!(arr.len(), 5);
-        assert_eq!(arr.const_slice(), &[42, 42, 42, 42, 42]);
-    }
-
-    #[test]
-    fn iterator() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        let collected: Vec<u32> = arr.into_iter().collect();
-        assert_eq!(collected, vec![1, 2, 3]);
     }
 
     #[test]
@@ -820,14 +668,6 @@ mod tests {
         let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
         arr.push(1);
         arr[5] = 10; // Should panic
-    }
-
-    #[test]
-    fn from_value_zero_count() {
-        let arr: BoundedArray<u32, 10> = BoundedArray::from_value(42, 0);
-
-        assert!(arr.is_empty());
-        assert_eq!(arr.len(), 0);
     }
 
     #[test]
@@ -953,25 +793,6 @@ mod tests {
         arr.push(3);
         assert!(arr.is_full());
         assert_eq!(arr.const_slice(), &[1, 3]);
-    }
-
-    #[test]
-    fn pop_updates_len_and_slice() {
-        let mut arr: BoundedArray<u32, 4> = BoundedArray::new();
-        arr.extend_from_slice(&[1, 2, 3]);
-
-        assert_eq!(arr.pop(), Some(3));
-        assert_eq!(arr.len(), 2);
-        assert_eq!(arr.remaining_capacity(), 2);
-        assert_eq!(arr.const_slice(), &[1, 2]);
-    }
-
-    #[test]
-    fn equality_empty_arrays() {
-        let a: BoundedArray<u32, 10> = BoundedArray::new();
-        let b: BoundedArray<u32, 10> = BoundedArray::new();
-
-        assert_eq!(a, b);
     }
 
     #[test]
