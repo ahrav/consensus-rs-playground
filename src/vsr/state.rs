@@ -262,6 +262,7 @@ impl CheckpointState {
 #[inline]
 fn checkpoint_valid(op: u64) -> bool {
     let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+    // Checkpoints are only valid at compaction bar boundaries.
     op == 0 || (op + 1) % lsm_compaction_ops == 0
 }
 
@@ -709,8 +710,9 @@ impl VsrState {
 
     /// Returns `true` if `op` has been compacted (removed from the journal).
     ///
-    /// Operations at or before the checkpoint trigger are no longer available
-    /// in the journal and must be recovered via state sync if needed.
+    /// Operations at or before the checkpoint trigger (one bar after the
+    /// checkpoint op) are no longer available in the journal and must be
+    /// recovered via state sync if needed.
     #[inline]
     pub fn op_compacted(&self, op: u64) -> bool {
         let checkpoint_op = self.checkpoint.header.op;
@@ -718,6 +720,7 @@ impl VsrState {
             return false;
         }
 
+        // The compaction trigger is one bar after the checkpoint op.
         let trigger = trigger_for_checkpoint(checkpoint_op)
             .expect("checkpoint_op > 0 but trigger_for_checkpoint return None");
         op <= trigger
@@ -893,6 +896,8 @@ fn client_sessions_encode_size() -> u64 {
 
 /// Returns the op number that triggered a given checkpoint.
 ///
+/// The trigger is one compaction bar after the checkpoint:
+/// `checkpoint + LSM_COMPACTION_OPS`, and checkpoints are only valid on bars.
 /// Returns `None` for checkpoint 0 (the root checkpoint has no trigger).
 #[inline]
 fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
@@ -902,6 +907,7 @@ fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
     let valid = if checkpoint == 0 {
         true
     } else if let Some(next) = checkpoint.checked_add(1) {
+        // Bar boundary: (op + 1) % LSM_COMPACTION_OPS == 0.
         next % lsm_compaction_ops == 0
     } else {
         false
@@ -1869,14 +1875,19 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        // Checkpoint at op 100
-        state.checkpoint.header.op = 100;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let checkpoint = lsm_compaction_ops - 1;
+        state.checkpoint.header.op = checkpoint;
+        let trigger = checkpoint + lsm_compaction_ops;
 
-        // Op 100 is in the checkpoint -> compacted
-        assert!(state.op_compacted(100));
+        // Ops at or before trigger are compacted.
+        assert!(state.op_compacted(checkpoint));
+        assert!(state.op_compacted(checkpoint + 1));
+        assert!(state.op_compacted(trigger));
+        assert!(state.op_compacted(0));
 
-        // Op 101 is NOT in the checkpoint -> NOT compacted
-        assert!(!state.op_compacted(101));
+        // Ops after trigger are not compacted.
+        assert!(!state.op_compacted(trigger + 1));
     }
 
     #[test]
@@ -1895,13 +1906,16 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        state.checkpoint.header.op = 100;
-        let trigger = 100;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let checkpoint = (lsm_compaction_ops * 3) - 1;
+        state.checkpoint.header.op = checkpoint;
+        let trigger = checkpoint + lsm_compaction_ops;
 
         // Ops at or before trigger are compacted
         assert!(state.op_compacted(0));
-        assert!(state.op_compacted(50));
-        assert!(state.op_compacted(100));
+        assert!(state.op_compacted(checkpoint - 1));
+        assert!(state.op_compacted(checkpoint));
+        assert!(state.op_compacted(checkpoint + 1));
         assert!(state.op_compacted(trigger));
 
         // Ops after trigger are not compacted
@@ -1914,9 +1928,10 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        // Use a small checkpoint op to test boundary precisely
-        state.checkpoint.header.op = 1;
-        let trigger = 1;
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let checkpoint = lsm_compaction_ops - 1;
+        state.checkpoint.header.op = checkpoint;
+        let trigger = checkpoint + lsm_compaction_ops;
 
         assert!(state.op_compacted(trigger));
         assert!(!state.op_compacted(trigger + 1));
@@ -1932,18 +1947,21 @@ mod tests {
     }
 
     #[test]
-    fn test_trigger_for_checkpoint_nonzero() {
-        let checkpoint = 100;
+    fn test_trigger_for_checkpoint_valid_boundary() {
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        let checkpoint = lsm_compaction_ops - 1;
         let trigger = trigger_for_checkpoint(checkpoint);
         assert!(trigger.is_some());
-        assert_eq!(trigger.unwrap(), checkpoint);
+        assert_eq!(trigger.unwrap(), checkpoint + lsm_compaction_ops);
     }
 
     #[test]
-    fn test_trigger_for_checkpoint_one() {
-        let trigger = trigger_for_checkpoint(1);
-        assert!(trigger.is_some());
-        assert_eq!(trigger.unwrap(), 1);
+    #[should_panic]
+    fn test_trigger_for_checkpoint_invalid_panics() {
+        let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+        assert!(lsm_compaction_ops > 1);
+        let invalid_checkpoint = lsm_compaction_ops;
+        let _ = trigger_for_checkpoint(invalid_checkpoint);
     }
 
     #[test]
@@ -2671,10 +2689,14 @@ mod proptests {
         }
 
         #[test]
-        fn prop_trigger_for_checkpoint_nonzero_returns_some(checkpoint in 1u64..u64::MAX / 2) {
+        fn prop_trigger_for_checkpoint_valid_boundary_returns_next_bar(k in 1u64..10_000u64) {
+            let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
+            let checkpoint = k
+                .checked_mul(lsm_compaction_ops)
+                .and_then(|v| v.checked_sub(1))
+                .expect("checkpoint overflow");
             let trigger = trigger_for_checkpoint(checkpoint);
-            prop_assert!(trigger.is_some());
-            prop_assert_eq!(trigger.unwrap(), checkpoint);
+            prop_assert_eq!(trigger, Some(checkpoint + lsm_compaction_ops));
         }
 
         #[test]
