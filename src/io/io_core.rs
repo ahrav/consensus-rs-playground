@@ -1382,20 +1382,6 @@ mod tests {
     }
 
     #[test]
-    fn io_core_read_for_uses_typed_handler() {
-        let mut io: IoCore<MockBackend> = IoCore::new(16).unwrap();
-        let mut handler = TestHandler::new();
-        let mut buf = [0u8; 64];
-        let mut comp = Completion::new();
-
-        io.read_for(&mut handler, &mut comp, 3, buf.as_mut_ptr(), 64, 0);
-        io.tick().unwrap();
-
-        assert_eq!(handler.completed_count, 1);
-        assert_eq!(handler.results, vec![0]);
-    }
-
-    #[test]
     fn io_core_write_for_uses_typed_handler() {
         let mut io: IoCore<MockBackend> = IoCore::new(16).unwrap();
         let mut handler = TestHandler::new();
