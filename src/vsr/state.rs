@@ -2711,6 +2711,278 @@ mod tests {
             456
         );
     }
+
+    // =========================================================================
+    // VsrState::update_for_view_change Tests
+    // =========================================================================
+
+    fn make_view_headers(op: u64) -> [HeaderPrepare; 1] {
+        [super::make_prepare_header(1, op)]
+    }
+
+    fn make_sync_checkpoint(
+        state: &VsrState,
+        op: u64,
+        parent_checkpoint_id: u128,
+        grandparent_checkpoint_id: u128,
+    ) -> CheckpointState {
+        let mut checkpoint = state.checkpoint;
+        checkpoint.header = super::make_prepare_header(1, op);
+        checkpoint.parent_checkpoint_id = parent_checkpoint_id;
+        checkpoint.grandparent_checkpoint_id = grandparent_checkpoint_id;
+        checkpoint
+    }
+
+    #[test]
+    fn test_update_for_view_change_advances_view_and_commit() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.sync_op_min = 5;
+        state.sync_op_max = 7;
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 10,
+            log_view: 1,
+            view: 2,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+
+        assert_eq!(state.commit_max, 10);
+        assert_eq!(state.log_view, 1);
+        assert_eq!(state.view, 2);
+        assert_eq!(state.checkpoint.header.op, 0);
+        assert_eq!(state.sync_op_min, 5);
+        assert_eq!(state.sync_op_max, 7);
+    }
+
+    #[test]
+    fn test_update_for_view_change_with_sync_checkpoint_updates_checkpoint_and_sync_bounds() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.sync_view = 7;
+
+        let current_checkpoint_id = state.checkpoint.checkpoint_id();
+        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+
+        let checkpoint =
+            make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
+
+        let sync = SyncCheckpointOptions {
+            checkpoint,
+            sync_op_min: 10,
+            sync_op_max: 12,
+        };
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: checkpoint_next,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: Some(sync),
+        };
+
+        state.update_for_view_change(&opts);
+
+        assert_eq!(state.commit_max, checkpoint_next);
+        assert_eq!(state.view, 1);
+        assert_eq!(state.log_view, 1);
+        assert_eq!(state.checkpoint.header.op, checkpoint_next);
+        assert_eq!(state.checkpoint.parent_checkpoint_id, current_checkpoint_id);
+        assert_eq!(state.sync_op_min, 10);
+        assert_eq!(state.sync_op_max, 12);
+        assert_eq!(state.sync_view, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_without_progress_or_sync() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 0,
+            log_view: 0,
+            view: 0,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_commit_max_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.commit_max = 10;
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 9,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_log_view_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.log_view = 2;
+        state.view = 2;
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 0,
+            log_view: 1,
+            view: 2,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_view_lt_log_view() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 0,
+            log_view: 2,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_empty_view_headers() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let view_headers: [HeaderPrepare; 0] = [];
+
+        let opts = ViewChangeOptions {
+            commit_max: 0,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_view_headers_before_checkpoint() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.header.op = 10;
+        state.commit_max = 10;
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: 10,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: None,
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_sync_checkpoint_parent_mismatch() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let current_checkpoint_id = state.checkpoint.checkpoint_id();
+        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+        let wrong_parent = if current_checkpoint_id == 0 {
+            1
+        } else {
+            current_checkpoint_id - 1
+        };
+
+        let checkpoint = make_sync_checkpoint(&state, checkpoint_next, wrong_parent, 0);
+
+        let sync = SyncCheckpointOptions {
+            checkpoint,
+            sync_op_min: 1,
+            sync_op_max: 1,
+        };
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: checkpoint_next,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: Some(sync),
+        };
+
+        state.update_for_view_change(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_view_change_panics_sync_bounds_inverted() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let current_checkpoint_id = state.checkpoint.checkpoint_id();
+        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+        let checkpoint =
+            make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
+
+        let sync = SyncCheckpointOptions {
+            checkpoint,
+            sync_op_min: 5,
+            sync_op_max: 4,
+        };
+
+        let view_headers = make_view_headers(1);
+
+        let opts = ViewChangeOptions {
+            commit_max: checkpoint_next,
+            log_view: 1,
+            view: 1,
+            view_headers: &view_headers,
+            sync_checkpoint: Some(sync),
+        };
+
+        state.update_for_view_change(&opts);
+    }
 }
 
 #[cfg(test)]
