@@ -10,7 +10,9 @@ use crate::{
     constants,
     util::{Pod, equal_bytes},
     vsr::{
-        HeaderPrepare, Members, member_index, valid_members,
+        HeaderPrepare, Members, member_index,
+        superblock::CheckpointOptions,
+        valid_members,
         wire::{Checksum128, checksum, header::Release},
     },
 };
@@ -681,6 +683,126 @@ impl VsrState {
             .expect("checkpoint_op > 0 but trigger_for_checkpoint return None");
         op <= trigger
     }
+
+    /// Updates this state for a new checkpoint.
+    ///
+    /// Advances the checkpoint chain and updates all checkpoint-related fields
+    /// from the provided options. The current checkpoint ID (header checksum)
+    /// becomes the new `parent_checkpoint_id`, and the old parent becomes
+    /// `grandparent_checkpoint_id`.
+    ///
+    /// # Fields Updated
+    ///
+    /// **Checkpoint chain:**
+    /// - `parent_checkpoint_id` ← current `header.checksum`
+    /// - `grandparent_checkpoint_id` ← current `parent_checkpoint_id`
+    ///
+    /// **From options:**
+    /// - `checkpoint.header` ← `opts.header`
+    /// - Manifest, free set, and client sessions references
+    /// - `storage_size`, `release`
+    /// - `commit_max`, `sync_op_min`, `sync_op_max`
+    /// - `view`, `log_view` (if `view_attributes` provided)
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `opts.header.op <= self.checkpoint.header.op` (checkpoint must advance)
+    /// - `opts.commit_max < opts.header.op` (commit must cover checkpoint)
+    /// - `opts.storage_size < DATA_FILE_SIZE_MIN`
+    /// - `opts.sync_op_max < opts.sync_op_min`
+    /// - the update would violate monotonic state progression
+    pub fn update_for_checkpoint(&mut self, opts: &CheckpointOptions<'_>) {
+        let old = *self;
+
+        // Validate: checkpoint must advance
+        assert!(
+            opts.header.op > self.checkpoint.header.op,
+            "checkpoint op must advance: new {} <= current {}",
+            opts.header.op,
+            self.checkpoint.header.op
+        );
+
+        // Validate: commit_max must be at least checkpoint op
+        assert!(
+            opts.commit_max >= opts.header.op,
+            "commit_max {} must be >= checkpoint op {}",
+            opts.commit_max,
+            opts.header.op
+        );
+
+        // Validate: sync bounds are ordered
+        assert!(
+            opts.sync_op_max >= opts.sync_op_min,
+            "sync_op_max {} must be >= sync_op_min {}",
+            opts.sync_op_max,
+            opts.sync_op_min
+        );
+
+        // Validate: storage size meets minimum
+        assert!(
+            opts.storage_size >= constants::DATA_FILE_SIZE_MIN,
+            "storage_size {} must be >= DATA_FILE_SIZE_MIN {}",
+            opts.storage_size,
+            constants::DATA_FILE_SIZE_MIN
+        );
+
+        // Advance checkpoint chain: current ID becomes parent, parent becomes grandparent
+        self.checkpoint.grandparent_checkpoint_id = self.checkpoint.parent_checkpoint_id;
+        self.checkpoint.parent_checkpoint_id = self.checkpoint.header.checksum;
+
+        // Update checkpoint header
+        self.checkpoint.header = opts.header;
+
+        // Update manifest references
+        let (oldest_cs, oldest_addr, newest_cs, newest_addr, block_count) =
+            opts.manifest_references;
+        self.checkpoint.manifest_oldest_checksum = oldest_cs;
+        self.checkpoint.manifest_oldest_address = oldest_addr;
+        self.checkpoint.manifest_newest_checksum = newest_cs;
+        self.checkpoint.manifest_newest_address = newest_addr;
+        self.checkpoint.manifest_block_count = block_count as u32;
+
+        // Update free set references
+        let (acq_cs, acq_size, acq_last_cs, acq_last_addr) = opts.free_set_acquired_references;
+        self.checkpoint.free_set_blocks_acquired_checksum = acq_cs;
+        self.checkpoint.free_set_blocks_acquired_size = acq_size;
+        self.checkpoint.free_set_blocks_acquired_last_block_checksum = acq_last_cs;
+        self.checkpoint.free_set_blocks_acquired_last_block_address = acq_last_addr;
+
+        let (rel_cs, rel_size, rel_last_cs, rel_last_addr) = opts.free_set_released_references;
+        self.checkpoint.free_set_blocks_released_checksum = rel_cs;
+        self.checkpoint.free_set_blocks_released_size = rel_size;
+        self.checkpoint.free_set_blocks_released_last_block_checksum = rel_last_cs;
+        self.checkpoint.free_set_blocks_released_last_block_address = rel_last_addr;
+
+        // Update client sessions references
+        let (cs_checksum, cs_size, cs_last_cs, cs_last_addr) = opts.client_sessions_references;
+        self.checkpoint.client_sessions_checksum = cs_checksum;
+        self.checkpoint.client_sessions_size = cs_size;
+        self.checkpoint.client_sessions_last_block_checksum = cs_last_cs;
+        self.checkpoint.client_sessions_last_block_address = cs_last_addr;
+
+        // Update storage and release
+        self.checkpoint.storage_size = opts.storage_size;
+        self.checkpoint.release = opts.release;
+
+        // Update VSR-level fields
+        self.commit_max = opts.commit_max;
+        self.sync_op_min = opts.sync_op_min;
+        self.sync_op_max = opts.sync_op_max;
+
+        // Update view attributes if provided
+        if let Some(view_attrs) = &opts.view_attributes {
+            self.view = view_attrs.view;
+            self.log_view = view_attrs.log_view;
+        }
+
+        assert!(
+            Self::monotonic(&old, self),
+            "checkpoint update must be monotonic"
+        );
+    }
 }
 
 /// Computes the encoded size of client sessions data for checkpointing.
@@ -719,6 +841,32 @@ fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
         return None;
     }
     Some(checkpoint)
+}
+
+#[cfg(test)]
+fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
+    use crate::vsr::wire::{Command, Operation};
+
+    assert!(op > 0);
+
+    let mut header = HeaderPrepare::new();
+    header.cluster = cluster;
+    header.command = Command::Prepare;
+    header.operation = Operation::NOOP;
+    header.op = op;
+    header.commit = op - 1;
+    header.timestamp = 1;
+    header.parent = 1;
+    header.client = 1;
+    header.request = 1;
+    header.release = Release(1);
+
+    header.set_checksum_body(&[]);
+    header.set_checksum();
+
+    debug_assert!(header.invalid().is_none());
+
+    header
 }
 
 #[cfg(test)]
@@ -1750,6 +1898,592 @@ mod tests {
         // Should have at least 8-byte alignment for u64 fields
         assert!(mem::align_of::<VsrState>() >= 8);
     }
+
+    // =========================================================================
+    // VsrState::update_for_checkpoint Tests
+    // =========================================================================
+
+    /// Helper to create a valid CheckpointOptions for testing.
+    fn make_checkpoint_options(
+        op: u64,
+        commit_max: u64,
+        storage_size: u64,
+    ) -> CheckpointOptions<'static> {
+        let header = super::make_prepare_header(1, op);
+
+        CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size,
+            release: Release::ZERO,
+        }
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_basic() {
+        let options = make_valid_root_options(3, 0);
+        let mut state = VsrState::root(&options);
+
+        let old_header_checksum = state.checkpoint.header.checksum;
+
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+
+        // Checkpoint chain advanced
+        assert_eq!(state.checkpoint.parent_checkpoint_id, old_header_checksum);
+        assert_eq!(state.checkpoint.grandparent_checkpoint_id, 0);
+
+        // Header updated
+        assert_eq!(state.checkpoint.header.op, 100);
+
+        // Commit updated
+        assert_eq!(state.commit_max, 100);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_chain_advancement() {
+        let options = make_valid_root_options(3, 0);
+        let mut state = VsrState::root(&options);
+
+        // First checkpoint
+        let first_checksum = state.checkpoint.header.checksum;
+        let opts1 = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts1);
+
+        assert_eq!(state.checkpoint.parent_checkpoint_id, first_checksum);
+        assert_eq!(state.checkpoint.grandparent_checkpoint_id, 0);
+
+        // Second checkpoint
+        let second_checksum = state.checkpoint.header.checksum;
+        let opts2 = make_checkpoint_options(200, 200, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts2);
+
+        assert_eq!(state.checkpoint.parent_checkpoint_id, second_checksum);
+        assert_eq!(state.checkpoint.grandparent_checkpoint_id, first_checksum);
+
+        // Third checkpoint
+        let third_checksum = state.checkpoint.header.checksum;
+        let opts3 = make_checkpoint_options(300, 300, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts3);
+
+        assert_eq!(state.checkpoint.parent_checkpoint_id, third_checksum);
+        assert_eq!(state.checkpoint.grandparent_checkpoint_id, second_checksum);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_manifest_references() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+        let oldest_addr = constants::BLOCK_SIZE;
+        let newest_addr = constants::BLOCK_SIZE * 2;
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (111, oldest_addr, 333, newest_addr, 2),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.checkpoint.manifest_oldest_checksum, 111);
+        assert_eq!(state.checkpoint.manifest_oldest_address, oldest_addr);
+        assert_eq!(state.checkpoint.manifest_newest_checksum, 333);
+        assert_eq!(state.checkpoint.manifest_newest_address, newest_addr);
+        assert_eq!(state.checkpoint.manifest_block_count, 2);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_free_set_references() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+        let acquired_last_addr = constants::BLOCK_SIZE;
+        let released_last_addr = constants::BLOCK_SIZE * 2;
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (1111, 2222, 7777, acquired_last_addr),
+            free_set_released_references: (3333, 4444, 8888, released_last_addr),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.checkpoint.free_set_blocks_acquired_checksum, 1111);
+        assert_eq!(state.checkpoint.free_set_blocks_acquired_size, 2222);
+        assert_eq!(
+            state
+                .checkpoint
+                .free_set_blocks_acquired_last_block_checksum,
+            7777
+        );
+        assert_eq!(
+            state.checkpoint.free_set_blocks_acquired_last_block_address,
+            acquired_last_addr
+        );
+        assert_eq!(state.checkpoint.free_set_blocks_released_checksum, 3333);
+        assert_eq!(state.checkpoint.free_set_blocks_released_size, 4444);
+        assert_eq!(
+            state
+                .checkpoint
+                .free_set_blocks_released_last_block_checksum,
+            8888
+        );
+        assert_eq!(
+            state.checkpoint.free_set_blocks_released_last_block_address,
+            released_last_addr
+        );
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_client_sessions_references() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+        let sessions_size = client_sessions_encode_size();
+        let sessions_addr = constants::BLOCK_SIZE;
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (9999, sessions_size, 7777, sessions_addr),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.checkpoint.client_sessions_checksum, 9999);
+        assert_eq!(state.checkpoint.client_sessions_size, sessions_size);
+        assert_eq!(state.checkpoint.client_sessions_last_block_checksum, 7777);
+        assert_eq!(
+            state.checkpoint.client_sessions_last_block_address,
+            sessions_addr
+        );
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_sync_bounds() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 50,
+            sync_op_max: 75,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.sync_op_min, 50);
+        assert_eq!(state.sync_op_max, 75);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_with_view_attributes() {
+        use crate::vsr::ViewChangeArray;
+
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let view_headers = ViewChangeArray::root(1);
+
+        let header = super::make_prepare_header(1, 100);
+
+        let view_attrs = crate::vsr::superblock::ViewAttributes {
+            headers: &view_headers,
+            view: 42,
+            log_view: 40,
+        };
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: Some(view_attrs),
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.view, 42);
+        assert_eq!(state.log_view, 40);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_without_view_attributes() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.view = 10;
+        state.log_view = 5;
+
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+
+        // View attributes unchanged when None
+        assert_eq!(state.view, 10);
+        assert_eq!(state.log_view, 5);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_storage_size() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let new_size = constants::DATA_FILE_SIZE_MIN * 2;
+        let opts = make_checkpoint_options(100, 100, new_size);
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.checkpoint.storage_size, new_size);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_release() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+
+        let new_release = Release(0x00010203); // Version 1.2.3 encoded
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: new_release,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.checkpoint.release, new_release);
+    }
+
+    #[test]
+    #[should_panic(expected = "checkpoint op must advance")]
+    fn test_update_for_checkpoint_panics_op_not_advancing() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.header.op = 100;
+
+        // Try to checkpoint at same op
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic(expected = "checkpoint op must advance")]
+    fn test_update_for_checkpoint_panics_op_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.checkpoint.header.op = 100;
+
+        // Try to checkpoint at earlier op
+        let opts = make_checkpoint_options(50, 50, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic(expected = "commit_max")]
+    fn test_update_for_checkpoint_panics_commit_less_than_op() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // commit_max < header.op is invalid
+        let opts = make_checkpoint_options(100, 50, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic(expected = "sync_op_max")]
+    fn test_update_for_checkpoint_panics_sync_bounds_inverted() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 75, // min > max is invalid
+            sync_op_max: 50,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic(expected = "storage_size")]
+    fn test_update_for_checkpoint_panics_storage_too_small() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // Storage size below minimum
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN - 1);
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_preserves_identity_fields() {
+        let options = make_valid_root_options(3, 1);
+        let mut state = VsrState::root(&options);
+
+        let original_replica_id = state.replica_id;
+        let original_replica_count = state.replica_count;
+        let original_members = state.members;
+
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+
+        // Identity fields unchanged
+        assert_eq!(state.replica_id, original_replica_id);
+        assert_eq!(state.replica_count, original_replica_count);
+        assert_eq!(state.members, original_members);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_commit_equals_op() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // commit_max == header.op is valid (boundary case)
+        let opts = make_checkpoint_options(100, 100, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.commit_max, 100);
+        assert_eq!(state.checkpoint.header.op, 100);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_commit_greater_than_op() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // commit_max > header.op is valid
+        let opts = make_checkpoint_options(100, 150, constants::DATA_FILE_SIZE_MIN);
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(state.commit_max, 150);
+        assert_eq!(state.checkpoint.header.op, 100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_checkpoint_panics_commit_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.commit_max = 200;
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 150,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_checkpoint_panics_sync_bounds_regression() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.sync_op_min = 50;
+        state.sync_op_max = 75;
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 25,
+            sync_op_max: 25,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_checkpoint_panics_view_regression() {
+        use crate::vsr::ViewChangeArray;
+
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+        state.view = 10;
+        state.log_view = 5;
+
+        let view_headers = ViewChangeArray::root(1);
+
+        let view_attrs = crate::vsr::superblock::ViewAttributes {
+            headers: &view_headers,
+            view: 9,
+            log_view: 4,
+        };
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: Some(view_attrs),
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_update_for_checkpoint_panics_header_checksum_unchanged() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        let mut header = state.checkpoint.header;
+        header.op = 100;
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+    }
+
+    #[test]
+    fn test_update_for_checkpoint_updates_last_block_info() {
+        let options = make_valid_root_options(1, 0);
+        let mut state = VsrState::root(&options);
+
+        // Set some initial state for last block fields
+        state.checkpoint.free_set_blocks_acquired_last_block_address = 123;
+        state
+            .checkpoint
+            .free_set_blocks_acquired_last_block_checksum = 123;
+
+        let header = super::make_prepare_header(1, 100);
+
+        let opts = CheckpointOptions {
+            header,
+            view_attributes: None,
+            commit_max: 100,
+            sync_op_min: 0,
+            sync_op_max: 0,
+            manifest_references: (0, 0, 0, 0, 0),
+            free_set_acquired_references: (checksum(&[]), 1, 456, 456),
+            free_set_released_references: (checksum(&[]), 0, 0, 0),
+            client_sessions_references: (checksum(&[]), 0, 0, 0),
+            storage_size: constants::DATA_FILE_SIZE_MIN,
+            release: Release::ZERO,
+        };
+
+        state.update_for_checkpoint(&opts);
+
+        assert_eq!(
+            state.checkpoint.free_set_blocks_acquired_last_block_address,
+            456
+        );
+        assert_eq!(
+            state
+                .checkpoint
+                .free_set_blocks_acquired_last_block_checksum,
+            456
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1852,6 +2586,197 @@ mod proptests {
         fn prop_checkpoint_state_zeroed_passes_padding_check(_dummy in 0..1i32) {
             let state = CheckpointState::zeroed();
             state.assert_padding_zeroed();
+        }
+
+        // =====================================================================
+        // VsrState::update_for_checkpoint Property Tests
+        // =====================================================================
+
+        #[test]
+        fn prop_update_for_checkpoint_advances_chain(
+            opts in valid_root_options_strategy(),
+            new_op in 1u64..10000u64
+        ) {
+            let mut state = VsrState::root(&opts);
+            let original_checksum = state.checkpoint.header.checksum;
+            let original_parent = state.checkpoint.parent_checkpoint_id;
+
+            let header = make_prepare_header(opts.cluster, new_op);
+
+            let checkpoint_opts = CheckpointOptions {
+                header,
+                view_attributes: None,
+                commit_max: new_op,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                manifest_references: (0, 0, 0, 0, 0),
+                free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                free_set_released_references: (checksum(&[]), 0, 0, 0),
+                client_sessions_references: (checksum(&[]), 0, 0, 0),
+                storage_size: constants::DATA_FILE_SIZE_MIN,
+                release: Release::ZERO,
+            };
+
+            state.update_for_checkpoint(&checkpoint_opts);
+
+            // Parent should be the old checksum
+            prop_assert_eq!(state.checkpoint.parent_checkpoint_id, original_checksum);
+            // Grandparent should be the old parent
+            prop_assert_eq!(state.checkpoint.grandparent_checkpoint_id, original_parent);
+        }
+
+        #[test]
+        fn prop_update_for_checkpoint_updates_op(
+            opts in valid_root_options_strategy(),
+            new_op in 1u64..10000u64
+        ) {
+            let mut state = VsrState::root(&opts);
+
+            let header = make_prepare_header(opts.cluster, new_op);
+
+            let checkpoint_opts = CheckpointOptions {
+                header,
+                view_attributes: None,
+                commit_max: new_op,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                manifest_references: (0, 0, 0, 0, 0),
+                free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                free_set_released_references: (checksum(&[]), 0, 0, 0),
+                client_sessions_references: (checksum(&[]), 0, 0, 0),
+                storage_size: constants::DATA_FILE_SIZE_MIN,
+                release: Release::ZERO,
+            };
+
+            state.update_for_checkpoint(&checkpoint_opts);
+
+            prop_assert_eq!(state.checkpoint.header.op, new_op);
+            prop_assert_eq!(state.commit_max, new_op);
+        }
+
+        #[test]
+        fn prop_update_for_checkpoint_preserves_identity(
+            opts in valid_root_options_strategy(),
+            new_op in 1u64..10000u64
+        ) {
+            let mut state = VsrState::root(&opts);
+            let original_replica_id = state.replica_id;
+            let original_replica_count = state.replica_count;
+            let original_members = state.members;
+
+            let header = make_prepare_header(opts.cluster, new_op);
+
+            let checkpoint_opts = CheckpointOptions {
+                header,
+                view_attributes: None,
+                commit_max: new_op,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                manifest_references: (0, 0, 0, 0, 0),
+                free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                free_set_released_references: (checksum(&[]), 0, 0, 0),
+                client_sessions_references: (checksum(&[]), 0, 0, 0),
+                storage_size: constants::DATA_FILE_SIZE_MIN,
+                release: Release::ZERO,
+            };
+
+            state.update_for_checkpoint(&checkpoint_opts);
+
+            prop_assert_eq!(state.replica_id, original_replica_id);
+            prop_assert_eq!(state.replica_count, original_replica_count);
+            prop_assert_eq!(state.members, original_members);
+        }
+
+        #[test]
+        fn prop_update_for_checkpoint_sync_bounds_preserved(
+            opts in valid_root_options_strategy(),
+            new_op in 1u64..10000u64,
+            sync_min in 0u64..1000u64,
+            sync_delta in 0u64..1000u64
+        ) {
+            let mut state = VsrState::root(&opts);
+            let sync_max = sync_min + sync_delta;
+
+            let header = make_prepare_header(opts.cluster, new_op);
+
+            let checkpoint_opts = CheckpointOptions {
+                header,
+                view_attributes: None,
+                commit_max: new_op,
+                sync_op_min: sync_min,
+                sync_op_max: sync_max,
+                manifest_references: (0, 0, 0, 0, 0),
+                free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                free_set_released_references: (checksum(&[]), 0, 0, 0),
+                client_sessions_references: (checksum(&[]), 0, 0, 0),
+                storage_size: constants::DATA_FILE_SIZE_MIN,
+                release: Release::ZERO,
+            };
+
+            state.update_for_checkpoint(&checkpoint_opts);
+
+            prop_assert_eq!(state.sync_op_min, sync_min);
+            prop_assert_eq!(state.sync_op_max, sync_max);
+        }
+
+        #[test]
+        fn prop_update_for_checkpoint_storage_size_preserved(
+            opts in valid_root_options_strategy(),
+            new_op in 1u64..10000u64,
+            size_multiplier in 1u64..10u64
+        ) {
+            let mut state = VsrState::root(&opts);
+            let storage_size = constants::DATA_FILE_SIZE_MIN * size_multiplier;
+
+            let header = make_prepare_header(opts.cluster, new_op);
+
+            let checkpoint_opts = CheckpointOptions {
+                header,
+                view_attributes: None,
+                commit_max: new_op,
+                sync_op_min: 0,
+                sync_op_max: 0,
+                manifest_references: (0, 0, 0, 0, 0),
+                free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                free_set_released_references: (checksum(&[]), 0, 0, 0),
+                client_sessions_references: (checksum(&[]), 0, 0, 0),
+                storage_size,
+                release: Release::ZERO,
+            };
+
+            state.update_for_checkpoint(&checkpoint_opts);
+
+            prop_assert_eq!(state.checkpoint.storage_size, storage_size);
+        }
+
+        #[test]
+        fn prop_update_for_checkpoint_multiple_advances(
+            opts in valid_root_options_strategy(),
+            num_checkpoints in 1usize..10usize
+        ) {
+            let mut state = VsrState::root(&opts);
+
+            for i in 1..=num_checkpoints {
+                let op = (i * 100) as u64;
+                let header = make_prepare_header(opts.cluster, op);
+
+                let checkpoint_opts = CheckpointOptions {
+                    header,
+                    view_attributes: None,
+                    commit_max: op,
+                    sync_op_min: 0,
+                    sync_op_max: 0,
+                    manifest_references: (0, 0, 0, 0, 0),
+                    free_set_acquired_references: (checksum(&[]), 0, 0, 0),
+                    free_set_released_references: (checksum(&[]), 0, 0, 0),
+                    client_sessions_references: (checksum(&[]), 0, 0, 0),
+                    storage_size: constants::DATA_FILE_SIZE_MIN,
+                    release: Release::ZERO,
+                };
+
+                state.update_for_checkpoint(&checkpoint_opts);
+                prop_assert_eq!(state.checkpoint.header.op, op);
+            }
         }
     }
 }
