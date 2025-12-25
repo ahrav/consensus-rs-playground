@@ -305,6 +305,8 @@ pub struct Context<S: storage::Storage> {
     pub(super) vsr_state: Option<VsrState>,
     /// View change headers to persist (for view change operations).
     pub(super) view_headers: Option<ViewChangeArray>,
+    /// Format options to persist (for format operations).
+    pub(super) format_opts: Option<FormatOptions>,
     // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
     /// Intrusive linked list pointer for context pooling.
     pub(super) next: Option<NonNull<Context<S>>>,
@@ -322,6 +324,7 @@ impl<S: storage::Storage> Context<S> {
             write,
             vsr_state: None,
             view_headers: None,
+            format_opts: None,
             next: None,
             sb: core::ptr::null_mut(),
         }
@@ -541,12 +544,13 @@ impl<S: storage::Storage> SuperBlock<S> {
         ctx.caller = Caller::Format;
         ctx.callback = Some(cb);
         ctx.copy = Some(0);
+        ctx.format_opts = Some(opts);
         // ctx.repairs = None;
 
         self.enqueue(ctx);
 
         if self.is_queue_head(ctx) {
-            self.prepare_format(ctx, opts);
+            self.prepare_format(ctx);
         }
     }
 
@@ -556,7 +560,9 @@ impl<S: storage::Storage> SuperBlock<S> {
     }
 
     /// Builds genesis (seq 0) and initial (seq 1) superblock headers, then writes.
-    fn prepare_format(&mut self, ctx: &mut Context<S>, opts: FormatOptions) {
+    fn prepare_format(&mut self, ctx: &mut Context<S>) {
+        let opts = ctx.format_opts.take().expect("format requires format_opts");
+        
         // Genesis header: sequence 0, no parent.
         *self.working = SuperBlockHeader::zeroed();
         self.working.version = SUPERBLOCK_VERSION;
@@ -609,6 +615,16 @@ impl<S: storage::Storage> SuperBlock<S> {
     pub fn checkpoint(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: CheckpointOptions) {
         assert!(!ctx.is_active());
 
+        // Calculate VSR state immediately to capture intent.
+        let mut vsr_state = self.working.vsr_state;
+        vsr_state.update_for_checkpoint(&opts);
+        ctx.vsr_state = Some(vsr_state);
+        
+        if let Some(view_attrs) = &opts.view_attributes {
+            assert!(!view_attrs.headers.is_empty());
+            ctx.view_headers = Some(*view_attrs.headers);
+        }
+
         ctx.caller = Caller::Checkpoint;
         ctx.callback = Some(cb);
         // ctx.repairs = None;
@@ -617,14 +633,14 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.enqueue(ctx);
 
         if self.is_queue_head(ctx) {
-            self.prepare_checkpoint(ctx, opts);
+            self.prepare_checkpoint(ctx);
         }
     }
 
     /// Prepares staging header for checkpoint write.
     ///
     /// Chains from working header: copies state, increments sequence, updates parent checksum.
-    fn prepare_checkpoint(&mut self, ctx: &mut Context<S>, opts: CheckpointOptions) {
+    fn prepare_checkpoint(&mut self, ctx: &mut Context<S>) {
         // Chain from current working header.
         *self.staging = *self.working;
         self.staging.sequence = self
@@ -634,16 +650,13 @@ impl<S: storage::Storage> SuperBlock<S> {
             .expect("sequence overflow");
         self.staging.parent = self.working.checksum;
 
-        // Apply checkpoint-specific VSR state updates.
-        let mut current = self.working.vsr_state;
-        current.update_for_checkpoint(&opts);
-        self.staging.vsr_state = current;
+        // Apply captured VSR state.
+        self.staging.vsr_state = ctx.vsr_state.take().expect("checkpoint requires vsr_state");
 
-        // Snapshot view headers if provided (required for view change recovery).
-        if let Some(view_attrs) = &opts.view_attributes {
-            assert!(!view_attrs.headers.is_empty());
-            self.staging.view_headers_count = view_attrs.headers.len() as u32;
-            self.staging.view_headers_all = *view_attrs.headers;
+        // Apply view headers if provided.
+        if let Some(view_headers) = ctx.view_headers.take() {
+            self.staging.view_headers_count = view_headers.len() as u32;
+            self.staging.view_headers_all = view_headers;
         }
 
         self.staging.set_checksum();
@@ -684,6 +697,67 @@ impl<S: storage::Storage> SuperBlock<S> {
             S::SUPERBLOCK_ZONE,
             offset,
         );
+    }
+
+    /// Completes the current operation and returns control to the caller.
+    ///
+    /// Extracts the completion callback, resets context state, removes the context
+    /// from the queue, invokes the callback, then kicks off the next queued operation.
+    ///
+    /// # Callback Invocation Order
+    ///
+    /// The callback is invoked *after* dequeue but *before* `kick_next`. This ensures
+    /// the caller can inspect final state before the next operation potentially mutates it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ctx` has no callback or is not the current queue head.
+    fn release(&mut self, ctx: &mut Context<S>) {
+        assert!(ctx.callback.is_some());
+        assert!(self.is_queue_head(ctx));
+
+        let callback = ctx.callback.take().expect("callback must be Some");
+        ctx.caller = Caller::None;
+
+        self.dequeue(ctx);
+        assert!(!ctx.is_active());
+
+        // Invoke callback while context is still valid but no longer queued.
+        callback(ctx);
+
+        // Start the next pending operation, if any.
+        self.kick_next();
+    }
+
+    /// Starts the next queued operation, if any.
+    ///
+    /// Called after `release` completes an operation. Inspects the queue head's
+    /// `caller` to determine whether to start a read (Open) or write (Format,
+    /// Checkpoint, ViewChange) operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the queue head has `Caller::None`, which indicates a bug in
+    /// queue management (contexts should only be enqueued with a valid caller).
+    fn kick_next(&mut self) {
+        let Some(mut head_nn) = self.queue_head else {
+            // Queue is empty; nothing to do.
+            return;
+        };
+
+        // SAFETY: head_nn is valid while in the queue; we own the queue structure.
+        let head_ctx = unsafe { head_nn.as_mut() };
+
+        // Dispatch based on operation type.
+        match head_ctx.caller {
+            Caller::Open => self.read_working(head_ctx, Threshold::Open),
+            Caller::Format => self.prepare_format(head_ctx),
+            Caller::Checkpoint => self.prepare_checkpoint(head_ctx),
+            Caller::ViewChange => self.write_headers(head_ctx),
+            Caller::None => {
+                panic!("Caller::None should not be reached");
+            }
+        }
     }
 
     /// Writes staging header to the next copy slot.
@@ -2513,6 +2587,17 @@ mod tests {
         sb
     }
 
+    fn prepare_checkpoint_helper(sb: &mut SuperBlock<MockStorage>, ctx: &mut Context<MockStorage>, opts: CheckpointOptions) {
+        let mut vsr_state = sb.working.vsr_state;
+        vsr_state.update_for_checkpoint(&opts);
+        ctx.vsr_state = Some(vsr_state);
+
+        if let Some(view_attrs) = &opts.view_attributes {
+            ctx.view_headers = Some(*view_attrs.headers);
+        }
+        sb.prepare_checkpoint(ctx);
+    }
+
     #[test]
     fn test_checkpoint_sets_context_caller() {
         let mut sb = setup_formatted_superblock();
@@ -2625,7 +2710,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         assert_eq!(sb.staging.sequence, original_sequence + 1);
     }
@@ -2639,7 +2724,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         assert_eq!(sb.staging.parent, working_checksum);
     }
@@ -2652,7 +2737,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         // Core fields should be inherited from working.
         assert_eq!(sb.staging.cluster, sb.working.cluster);
@@ -2667,7 +2752,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(100, 100);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         // VsrState should reflect checkpoint options.
         assert_eq!(sb.staging.vsr_state.checkpoint.header.op, 100);
@@ -2704,7 +2789,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         assert_eq!(sb.staging.view_headers_count, 1);
         assert_eq!(sb.staging.vsr_state.view, 42);
@@ -2720,7 +2805,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         // View headers should remain unchanged when view_attributes is None.
         assert_eq!(sb.staging.view_headers_count, original_count);
@@ -2734,7 +2819,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         assert!(sb.staging.valid_checksum());
     }
@@ -2747,7 +2832,7 @@ mod tests {
         setup_checkpoint_context(&mut sb, &mut ctx);
         let opts = make_checkpoint_options(1, 1);
 
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
         // Staging should have advanced sequence and different checksum.
         assert!(sb.staging.sequence > sb.working.sequence);
@@ -2766,7 +2851,7 @@ mod tests {
         let opts = make_checkpoint_options(1, 1);
 
         // Should panic on sequence overflow.
-        sb.prepare_checkpoint(&mut ctx, opts);
+        prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
     }
 
     // NOTE: test_prepare_checkpoint_panics_on_empty_view_headers is not implemented
@@ -2787,7 +2872,7 @@ mod tests {
             setup_checkpoint_context(&mut sb, &mut ctx);
             let opts = make_checkpoint_options(1, 1);
 
-            sb.prepare_checkpoint(&mut ctx, opts);
+            prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
             prop_assert_eq!(sb.staging.sequence, initial_seq + 1);
         }
@@ -2805,7 +2890,7 @@ mod tests {
             setup_checkpoint_context(&mut sb, &mut ctx);
             let opts = make_checkpoint_options(1, 1);
 
-            sb.prepare_checkpoint(&mut ctx, opts);
+            prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
             prop_assert_eq!(sb.staging.parent, expected_parent);
             prop_assert!(sb.staging.valid_checksum());
@@ -2824,7 +2909,7 @@ mod tests {
             setup_checkpoint_context(&mut sb, &mut ctx);
             let opts = make_checkpoint_options(1, 1);
 
-            sb.prepare_checkpoint(&mut ctx, opts);
+            prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
             prop_assert_eq!(sb.staging.cluster, cluster);
         }
@@ -2839,7 +2924,7 @@ mod tests {
             setup_checkpoint_context(&mut sb, &mut ctx);
             let opts = make_checkpoint_options(op, op);
 
-            sb.prepare_checkpoint(&mut ctx, opts);
+            prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
             prop_assert!(sb.staging.valid_checksum());
             prop_assert!(sb.staging.checksum != 0);
@@ -2857,9 +2942,493 @@ mod tests {
             setup_checkpoint_context(&mut sb, &mut ctx);
             let opts = make_checkpoint_options(1, 1);
 
-            sb.prepare_checkpoint(&mut ctx, opts);
+            prepare_checkpoint_helper(&mut sb, &mut ctx, opts);
 
             prop_assert_eq!(sb.staging.version, version);
         }
+    }
+
+    // =========================================================================
+    // release() and kick_next() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_release_dequeues_and_resets_caller() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Set up context with callback.
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|_ctx| {
+            // Callback is invoked; context should already be dequeued.
+        });
+
+        sb.enqueue(&mut ctx);
+        assert!(sb.is_queue_head(&ctx));
+        assert_eq!(sb.queue_depth, 1);
+
+        // Release should dequeue, reset caller, and invoke callback.
+        sb.release(&mut ctx);
+
+        // Post-conditions.
+        assert_eq!(ctx.caller, Caller::None);
+        assert!(!ctx.is_active());
+        assert!(ctx.callback.is_none());
+        assert_eq!(sb.queue_depth, 0);
+        assert!(sb.queue_head.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "ctx.callback.is_some()")]
+    fn test_release_panics_without_callback() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        ctx.caller = Caller::Open;
+        ctx.callback = None; // Missing callback.
+
+        sb.enqueue(&mut ctx);
+
+        // Should panic: callback is None.
+        sb.release(&mut ctx);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_release_panics_if_not_head() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        ctx1.caller = Caller::Open;
+        ctx1.callback = Some(|_| {});
+        ctx2.caller = Caller::Open;
+        ctx2.callback = Some(|_| {});
+
+        sb.enqueue(&mut ctx1);
+        sb.enqueue(&mut ctx2);
+
+        // ctx2 is not head; should panic.
+        sb.release(&mut ctx2);
+    }
+
+    #[test]
+    fn test_kick_next_empty_queue_is_noop() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        // Queue is empty.
+        assert!(sb.queue_head.is_none());
+        assert_eq!(sb.queue_depth, 0);
+
+        // Should not panic or modify state.
+        sb.kick_next();
+
+        assert!(sb.queue_head.is_none());
+        assert_eq!(sb.queue_depth, 0);
+    }
+
+    #[test]
+    fn test_kick_next_dispatches_open() {
+        // Pre-populate disk with valid headers.
+        let mut storage = MockStorage::new();
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
+            let mut header = make_header();
+            header.copy = copy_idx as u16;
+            header.set_checksum();
+            let header_bytes = unsafe { as_bytes_unchecked(&header) };
+            storage.disk[offset..offset + header_bytes.len()].copy_from_slice(header_bytes);
+        }
+
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|_| {});
+        ctx.copy = None; // Not yet started.
+
+        sb.enqueue(&mut ctx);
+
+        // kick_next should dispatch read_working for Caller::Open.
+        sb.kick_next();
+
+        // With sync MockStorage, all reads complete immediately.
+        // Verify read_working was called by checking reading buffer has data.
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let read_header = &sb.reading[copy_idx];
+            assert_eq!(read_header.copy, copy_idx as u16);
+            assert!(read_header.valid_checksum());
+        }
+    }
+
+    #[test]
+    fn test_kick_next_dispatches_write_operations() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Set up context with state to write.
+        ctx.caller = Caller::Checkpoint;
+        ctx.callback = Some(|_| {});
+        ctx.copy = Some(0);
+        
+        let mut vsr_state = sb.working.vsr_state;
+        vsr_state.commit_max = 12345;
+        ctx.vsr_state = Some(vsr_state);
+
+        sb.enqueue(&mut ctx);
+
+        // kick_next should dispatch prepare_checkpoint -> write_headers.
+        sb.kick_next();
+
+        // With MockStorage (sync), data should be written to disk.
+        let mut header = SuperBlockHeader::zeroed();
+        let header_bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
+        header_bytes.copy_from_slice(&sb.storage.disk[0..header_bytes.len()]);
+
+        // Staging should have been updated by prepare_checkpoint.
+        assert_eq!(sb.staging.sequence, sb.working.sequence + 1);
+        assert_eq!(sb.staging.vsr_state.commit_max, 12345);
+        
+        assert_eq!(header.sequence, sb.staging.sequence);
+        assert_eq!(header.vsr_state.commit_max, 12345);
+    }
+
+    #[test]
+    #[should_panic(expected = "Caller::None should not be reached")]
+    fn test_kick_next_panics_on_caller_none() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Corrupt state: enqueued context has Caller::None.
+        ctx.caller = Caller::None;
+        ctx.callback = Some(|_| {});
+
+        sb.enqueue(&mut ctx);
+
+        // Should panic: Caller::None is invalid for queued context.
+        sb.kick_next();
+    }
+
+    #[test]
+    fn test_release_then_kick_next_continues_queue() {
+        // Pre-populate disk with valid headers so reading produces valid state.
+        let mut storage = MockStorage::new();
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
+            let mut header = make_header();
+            header.copy = copy_idx as u16;
+            header.set_checksum();
+            let header_bytes = unsafe { as_bytes_unchecked(&header) };
+            storage.disk[offset..offset + header_bytes.len()].copy_from_slice(header_bytes);
+        }
+
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        ctx1.caller = Caller::Open;
+        ctx1.callback = Some(|_| {});
+        ctx2.caller = Caller::Open;
+        ctx2.callback = Some(|_| {});
+
+        sb.enqueue(&mut ctx1);
+        sb.enqueue(&mut ctx2);
+
+        assert_eq!(sb.queue_depth, 2);
+        assert!(sb.is_queue_head(&ctx1));
+
+        // Release first context; should kick_next and start ctx2.
+        sb.release(&mut ctx1);
+
+        // ctx1 should be dequeued and inactive.
+        assert!(!ctx1.is_active());
+        assert_eq!(ctx1.caller, Caller::None);
+
+        // ctx2 should now be head. With MockStorage (sync), the entire read
+        // sequence completes, so copy ends up None after all copies are read.
+        // We verify kick_next ran by checking the reading buffer was populated.
+        assert_eq!(sb.queue_depth, 1);
+        assert!(sb.is_queue_head(&ctx2));
+
+        // Verify read_working was called by checking reading buffer has data.
+        // (With sync MockStorage, all copies are read immediately.)
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let read_header = &sb.reading[copy_idx];
+            assert_eq!(read_header.copy, copy_idx as u16);
+            assert!(read_header.valid_checksum());
+        }
+    }
+
+    #[test]
+    fn test_callback_invoked_after_dequeue() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Use atomic to track callback state since fn pointers can't capture.
+        static CALLBACK_CTX_WAS_INACTIVE: AtomicBool = AtomicBool::new(false);
+
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|ctx| {
+            // At callback time, context should already be dequeued and inactive.
+            CALLBACK_CTX_WAS_INACTIVE.store(!ctx.is_active(), Ordering::SeqCst);
+        });
+
+        sb.enqueue(&mut ctx);
+        sb.release(&mut ctx);
+
+        // Verify callback saw inactive context.
+        assert!(CALLBACK_CTX_WAS_INACTIVE.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_multiple_operations_fifo_sequence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        const COUNT: usize = 4;
+        let mut contexts: [Context<MockStorage>; COUNT] = [
+            Context::new(0, 0),
+            Context::new(1, 1),
+            Context::new(2, 2),
+            Context::new(3, 3),
+        ];
+
+        // Track completion order using atomics.
+        static COMPLETION_ORDER: [AtomicUsize; COUNT] = [
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+            AtomicUsize::new(usize::MAX),
+        ];
+        static COMPLETION_IDX: AtomicUsize = AtomicUsize::new(0);
+
+        fn make_callback(id: usize) -> Callback<MockStorage> {
+            match id {
+                0 => |_| {
+                    let idx = COMPLETION_IDX.fetch_add(1, Ordering::SeqCst);
+                    COMPLETION_ORDER[idx].store(0, Ordering::SeqCst);
+                },
+                1 => |_| {
+                    let idx = COMPLETION_IDX.fetch_add(1, Ordering::SeqCst);
+                    COMPLETION_ORDER[idx].store(1, Ordering::SeqCst);
+                },
+                2 => |_| {
+                    let idx = COMPLETION_IDX.fetch_add(1, Ordering::SeqCst);
+                    COMPLETION_ORDER[idx].store(2, Ordering::SeqCst);
+                },
+                3 => |_| {
+                    let idx = COMPLETION_IDX.fetch_add(1, Ordering::SeqCst);
+                    COMPLETION_ORDER[idx].store(3, Ordering::SeqCst);
+                },
+                _ => panic!("unexpected id"),
+            }
+        }
+
+        // Enqueue all contexts.
+        for (i, ctx) in contexts.iter_mut().enumerate() {
+            ctx.caller = Caller::Open;
+            ctx.callback = Some(make_callback(i));
+            sb.enqueue(ctx);
+        }
+
+        assert_eq!(sb.queue_depth, COUNT);
+
+        // Release all in FIFO order.
+        for ctx in contexts.iter_mut() {
+            if sb.is_queue_head(ctx) {
+                sb.release(ctx);
+            }
+        }
+
+        // All should be completed in FIFO order.
+        let order: [usize; COUNT] = [
+            COMPLETION_ORDER[0].load(Ordering::SeqCst),
+            COMPLETION_ORDER[1].load(Ordering::SeqCst),
+            COMPLETION_ORDER[2].load(Ordering::SeqCst),
+            COMPLETION_ORDER[3].load(Ordering::SeqCst),
+        ];
+        assert_eq!(order, [0, 1, 2, 3]);
+        assert_eq!(COMPLETION_IDX.load(Ordering::SeqCst), COUNT);
+        assert_eq!(sb.queue_depth, 0);
+    }
+
+    #[test]
+    fn test_context_reuse_after_release() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // First operation.
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|_| {});
+        sb.enqueue(&mut ctx);
+        sb.release(&mut ctx);
+
+        // Context should be fully reset.
+        assert!(!ctx.is_active());
+        assert_eq!(ctx.caller, Caller::None);
+        assert!(ctx.callback.is_none());
+        assert!(ctx.next.is_none());
+
+        // Reuse same context for second operation.
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|_| {});
+        sb.enqueue(&mut ctx);
+
+        assert!(ctx.is_active());
+        assert!(sb.is_queue_head(&ctx));
+        assert_eq!(sb.queue_depth, 1);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_release_always_deactivates_context(
+            caller in prop::sample::select(vec![
+                Caller::Open,
+                Caller::Format,
+                Caller::Checkpoint,
+                Caller::ViewChange,
+            ])
+        ) {
+            let storage = MockStorage::new();
+            let mut sb = SuperBlock::new(storage);
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+
+            ctx.caller = caller;
+            ctx.callback = Some(|_| {});
+
+            sb.enqueue(&mut ctx);
+            sb.release(&mut ctx);
+
+            prop_assert_eq!(ctx.caller, Caller::None);
+            prop_assert!(!ctx.is_active());
+        }
+
+        #[test]
+        fn prop_queue_depth_consistent_after_release(
+            enqueue_count in 1usize..=MAX_QUEUE_DEPTH,
+            release_count in 0usize..=MAX_QUEUE_DEPTH,
+        ) {
+            let release_count = release_count.min(enqueue_count);
+
+            let storage = MockStorage::new();
+            let mut sb = SuperBlock::new(storage);
+            let mut contexts: Vec<Context<MockStorage>> = (0..enqueue_count)
+                .map(|i| Context::new(i as u64, i as u64))
+                .collect();
+
+            // Enqueue all.
+            for ctx in contexts.iter_mut() {
+                ctx.caller = Caller::Open;
+                ctx.callback = Some(|_| {});
+                sb.enqueue(ctx);
+            }
+
+            // Release some.
+            for ctx in contexts.iter_mut().take(release_count) {
+                if sb.is_queue_head(ctx) {
+                    sb.release(ctx);
+                }
+            }
+
+            prop_assert_eq!(sb.queue_depth, enqueue_count - release_count);
+        }
+    }
+
+    #[test]
+    fn test_queued_checkpoint_loses_data() {
+        let mut sb = setup_formatted_superblock();
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        let cb: Callback<MockStorage> = |_| {};
+
+        // 1. Start first checkpoint.
+        let opts1 = make_checkpoint_options(1, 1);
+        sb.checkpoint(cb, &mut ctx1, opts1);
+
+        // 2. Queue second checkpoint.
+        let mut opts2 = make_checkpoint_options(2, 2);
+        opts2.commit_max = 999; 
+        sb.checkpoint(cb, &mut ctx2, opts2);
+
+        // Verify ctx2 captured the state intent
+        assert!(sb.is_queue_head(&ctx1));
+        assert!(!sb.is_queue_head(&ctx2));
+        
+        // This assertion will FAIL until the bug is fixed:
+        assert!(ctx2.vsr_state.is_some(), "Context should have captured vsr_state");
+        assert_eq!(ctx2.vsr_state.unwrap().commit_max, 999, "Context should have captured commit_max");
+
+        // 3. Complete first checkpoint.
+        sb.release(&mut ctx1);
+
+        // 4. Now ctx2 becomes head and is kicked.
+        // It should have written sequence 3 (assuming sequence 2 was written by ctx1)
+        // and correct commit_max.
+        
+        // Note: In this mock, ctx1 didn't actually update working because we didn't run the full callbacks.
+        // So staging.sequence might be 2 (if it based on working=1).
+        // But vsr_state should be from ctx2.
+        
+        assert_eq!(sb.staging.vsr_state.commit_max, 999, "Staging should reflect ctx2 state");
+    }
+
+    #[test]
+    fn test_release_reentrant_enqueue() {
+        // Pre-populate disk with valid headers.
+        let mut storage = MockStorage::new();
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
+            let mut header = make_header();
+            header.copy = copy_idx as u16;
+            header.set_checksum();
+            let header_bytes = unsafe { as_bytes_unchecked(&header) };
+            storage.disk[offset..offset + header_bytes.len()].copy_from_slice(header_bytes);
+        }
+
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Setup a callback that re-enqueues the context.
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|c| {
+            // Re-use context for a new operation immediately.
+            c.caller = Caller::Open;
+            c.callback = Some(|_| {});
+        });
+        
+        // Manual simulation of re-entrant enqueue sequence:
+        sb.enqueue(&mut ctx);
+        
+        // 1. Release starts
+        assert!(ctx.callback.is_some());
+        let _cb = ctx.callback.take().unwrap();
+        ctx.caller = Caller::None;
+        sb.dequeue(&mut ctx);
+        assert!(!ctx.is_active());
+        
+        // 2. Callback runs (simulated) and enqueues ctx again
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(|_| {});
+        sb.enqueue(&mut ctx);
+        
+        // 3. Release continues -> kick_next
+        sb.kick_next();
+        
+        // Verification: ctx should be running again
+        assert!(sb.is_queue_head(&ctx));
+        // Check if read was dispatched (MockStorage reading buffer populated)
+        assert!(sb.reading[0].valid_checksum());
     }
 }
