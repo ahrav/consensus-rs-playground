@@ -170,6 +170,56 @@ pub fn select_superblock<const N: usize>(
     best_clique_header.ok_or(Error::QuorumLost)
 }
 
+/// Iterator over superblock copies that require repair.
+#[derive(Debug, Clone)]
+pub struct RepairIterator<const N: usize> {
+    mask: u16,
+    index: usize,
+}
+
+impl<const N: usize> Iterator for RepairIterator<N> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < N {
+            let i = self.index;
+            self.index += 1;
+            if (self.mask & (1 << i)) != 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+/// Identifies which copies deviate from the canonical state and need repair.
+///
+/// A copy needs repair if:
+/// - It has an invalid checksum.
+/// - It disagrees with the canonical header (sequence, cluster, data, etc).
+///   This includes cases where the copy has a *higher* sequence number but
+///   is not part of the quorum (minority write).
+pub fn detect_repairs<const N: usize>(
+    headers: &[SuperBlockHeader; N],
+    canonical: &SuperBlockHeader,
+) -> RepairIterator<N> {
+    let mut mask = 0u16;
+    for (i, header) in headers.iter().enumerate() {
+        // If checksum is invalid, strictly needs repair.
+        if !header.valid_checksum() {
+            mask |= 1 << i;
+            continue;
+        }
+
+        // If valid, check if it matches canonical state.
+        if !header.equal(canonical) {
+             mask |= 1 << i;
+        }
+    }
+
+    RepairIterator { mask, index: 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +351,91 @@ mod tests {
 
         let result = select_superblock(&headers, Threshold::Verify);
         assert!(matches!(result, Err(Error::QuorumLost)));
+    }
+
+    #[test]
+    fn test_detect_repairs_all_match() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for i in 0..4 {
+            headers[i] = make_header(10, 1);
+            headers[i].copy = i as u16;
+            headers[i].set_checksum();
+        }
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert!(repairs.is_empty());
+    }
+
+    #[test]
+    fn test_detect_repairs_invalid_checksum() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for i in 0..4 {
+            headers[i] = make_header(10, 1);
+            headers[i].copy = i as u16;
+            headers[i].set_checksum();
+        }
+        
+        // Corrupt index 2
+        headers[2].sequence += 1; // Checksum now invalid
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert_eq!(repairs, vec![2]);
+    }
+
+    #[test]
+    fn test_detect_repairs_old_sequence() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for i in 0..3 {
+            headers[i] = make_header(10, 1);
+            headers[i].copy = i as u16;
+            headers[i].set_checksum();
+        }
+        // Old sequence at index 3
+        headers[3] = make_header(5, 1);
+        headers[3].copy = 3;
+        headers[3].set_checksum();
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert_eq!(repairs, vec![3]);
+    }
+
+    #[test]
+    fn test_detect_repairs_higher_sequence_without_quorum() {
+        // Scenario: canonical is seq 10 (quorum), but index 3 is seq 11 (minority).
+        // Index 3 should be repaired (rolled back).
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for i in 0..3 {
+            headers[i] = make_header(10, 1);
+            headers[i].copy = i as u16;
+            headers[i].set_checksum();
+        }
+        headers[3] = make_header(11, 1);
+        headers[3].copy = 3;
+        headers[3].set_checksum();
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert_eq!(repairs, vec![3]);
+    }
+
+    #[test]
+    fn test_detect_repairs_divergent_cluster() {
+        let mut headers = [SuperBlockHeader::zeroed(); 4];
+        for i in 0..3 {
+            headers[i] = make_header(10, 1);
+            headers[i].copy = i as u16;
+            headers[i].set_checksum();
+        }
+        // Different cluster at index 3
+        headers[3] = make_header(10, 2);
+        headers[3].copy = 3;
+        headers[3].set_checksum();
+
+        let canonical = &headers[0];
+        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
+        assert_eq!(repairs, vec![3]);
     }
 }
