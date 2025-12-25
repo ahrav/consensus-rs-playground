@@ -130,7 +130,7 @@ unsafe impl Send for AlignedBuf {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MIN};
+    use crate::storage::constants::SECTOR_SIZE_DEFAULT;
 
     #[test]
     #[should_panic(expected = "assertion failed")]
