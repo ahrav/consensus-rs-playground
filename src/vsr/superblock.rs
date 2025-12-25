@@ -28,7 +28,7 @@ use crate::{
     vsr::{
         HeaderPrepare,
         members::{Members, member_index},
-        state::{CheckpointOptions, RootOptions, ViewAttributes},
+        state::{CheckpointOptions, RootOptions},
         superblock_quorum::Threshold,
         wire::{checksum, header::Release},
     },
@@ -2646,7 +2646,7 @@ mod tests {
         let mut sb = setup_formatted_superblock();
 
         let view_headers = ViewChangeArray::root(1);
-        let view_attrs = ViewAttributes {
+        let view_attrs = crate::vsr::state::ViewAttributes {
             headers: &view_headers,
             view: 42,
             log_view: 40,

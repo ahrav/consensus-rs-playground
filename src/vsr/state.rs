@@ -340,28 +340,26 @@ impl CheckpointState {
 
 #[inline]
 fn checkpoint_valid(op: u64) -> bool {
-    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
     // Checkpoints are only valid at compaction bar boundaries.
-    op == 0 || (op + 1) % lsm_compaction_ops == 0
+    op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS as u64)
 }
 
 #[inline]
 fn checkpoint_after(checkpoint: u64) -> u64 {
     assert!(checkpoint_valid(checkpoint));
 
-    let vsr_checkpoint_op = constants::VSR_CHECKPOINT_OPS as u64;
-    assert!(vsr_checkpoint_op > 0);
+    let vsr_checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
+    assert!(vsr_checkpoint_ops > 0);
 
     let result = if checkpoint == 0 {
-        vsr_checkpoint_op - 1
+        vsr_checkpoint_ops - 1
     } else {
         checkpoint
-            .checked_add(vsr_checkpoint_op)
+            .checked_add(vsr_checkpoint_ops)
             .expect("checkpoint_after overflow")
     };
 
-    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS as u64;
-    assert!((result + 1) % lsm_compaction_ops == 0);
+    assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS as u64));
     assert!(checkpoint_valid(result));
 
     result
@@ -2354,7 +2352,7 @@ mod tests {
 
         let header = super::make_prepare_header(1, 100);
 
-        let view_attrs = crate::vsr::superblock::ViewAttributes {
+        let view_attrs = ViewAttributes {
             headers: &view_headers,
             view: 42,
             log_view: 40,
@@ -2621,7 +2619,7 @@ mod tests {
 
         let view_headers = ViewChangeArray::root(1);
 
-        let view_attrs = crate::vsr::superblock::ViewAttributes {
+        let view_attrs = ViewAttributes {
             headers: &view_headers,
             view: 9,
             log_view: 4,
