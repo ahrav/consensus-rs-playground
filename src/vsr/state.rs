@@ -2769,8 +2769,7 @@ mod tests {
         let current_checkpoint_id = state.checkpoint.checkpoint_id();
         let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
 
-        let checkpoint =
-            make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
+        let checkpoint = make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
 
         let sync = SyncCheckpointOptions {
             checkpoint,
@@ -2962,8 +2961,7 @@ mod tests {
 
         let current_checkpoint_id = state.checkpoint.checkpoint_id();
         let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
-        let checkpoint =
-            make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
+        let checkpoint = make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
 
         let sync = SyncCheckpointOptions {
             checkpoint,
