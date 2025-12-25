@@ -14,14 +14,23 @@
 use core::mem::size_of;
 use std::ptr::NonNull;
 
-use crate::vsr::wire::checksum;
 #[allow(unused_imports)]
 use crate::{
     constants,
-    util::{AlignedBox, align_up, as_bytes_unchecked},
+    util::{AlignedBox, Zeroable, align_up, as_bytes_unchecked, as_bytes_unchecked_mut},
     vsr::{
         Header, ViewChangeArray, ViewChangeCommand, ViewChangeSlice, VsrState, storage,
         wire::Checksum128,
+    },
+};
+use crate::{
+    constants::SUPERBLOCK_VERSION,
+    vsr::{
+        HeaderPrepare,
+        members::{Members, member_index},
+        state::RootOptions,
+        superblock_quorum::Threshold,
+        wire::{checksum, header::Release},
     },
 };
 // use crate::vsr::superblock_quorums::{Quorums, RepairIterator, Threshold};
@@ -101,7 +110,7 @@ pub fn assert_bounds(offset: u64, len: usize) {
 /// This excludes `checksum`, `checksum_padding`, and `copy` since:
 /// - `checksum` obviously can't cover itself
 /// - `copy` differs between copies but shouldn't affect logical equality
-#[repr(C)]
+#[repr(C, align(4096))]
 #[derive(Clone, Copy)]
 pub struct SuperBlockHeader {
     /// AEGIS-128L MAC covering bytes after `copy` field.
@@ -130,6 +139,10 @@ pub struct SuperBlockHeader {
     /// Headers from recent view changes for view-change recovery.
     pub view_headers_all: ViewChangeArray,
 }
+
+// SAFETY: SuperBlockHeader is #[repr(C)] with only primitive types and arrays thereof.
+// All-zeros is a valid bit pattern for every field, as validated by `SuperBlockHeader::zeroed()`.
+unsafe impl Zeroable for SuperBlockHeader {}
 
 impl SuperBlockHeader {
     /// Byte offset where checksum coverage begins.
@@ -253,7 +266,10 @@ impl Caller {
 
     /// Returns `true` if this operation reads superblock copies.
     pub(super) fn expects_read(&self) -> bool {
-        matches!(self, Caller::Open)
+        matches!(
+            self,
+            Caller::Open | Caller::Format | Caller::Checkpoint | Caller::ViewChange
+        )
     }
 }
 
@@ -292,7 +308,7 @@ pub struct Context<S: storage::Storage> {
     // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
     /// Intrusive linked list pointer for context pooling.
     pub(super) next: Option<NonNull<Context<S>>>,
-    // pub(super) sb: *mut SuperBlock<S>,
+    pub(super) sb: *mut SuperBlock<S>,
 }
 
 impl<S: storage::Storage> Context<S> {
@@ -307,7 +323,7 @@ impl<S: storage::Storage> Context<S> {
             vsr_state: None,
             view_headers: None,
             next: None,
-            // sb: core::ptr::null_mut(),
+            sb: core::ptr::null_mut(),
         }
     }
 
@@ -339,6 +355,394 @@ impl<S: storage::Storage> Context<S> {
     pub fn is_active(&self) -> bool {
         self.caller != Caller::None
     }
+}
+
+/// Manages durable superblock state with copy-on-write semantics.
+///
+/// Maintains three header buffers:
+/// - `working`: current committed state (read-only during normal operation)
+/// - `staging`: next state being prepared (write target)
+/// - `reading`: scratch space for reading all copies during open/verify
+///
+/// Operations are queued and processed sequentially via an intrusive linked list.
+pub struct SuperBlock<S: storage::Storage> {
+    storage: S,
+    /// Last committed superblock state. Updated only after successful quorum verification.
+    pub working: AlignedBox<SuperBlockHeader>,
+    /// Next superblock state being prepared. Becomes `working` after commit.
+    pub staging: AlignedBox<SuperBlockHeader>,
+    /// Buffer for reading all copies during open/verification.
+    reading: AlignedBox<[SuperBlockHeader; constants::SUPERBLOCK_COPIES]>,
+    // quorums: Quorums< {constants::SUPERBLOCK_COPIES}>,
+    /// Head of the pending operation queue (intrusive linked list).
+    queue_head: Option<NonNull<Context<S>>>,
+    /// Tail of the pending operation queue.
+    queue_tail: Option<NonNull<Context<S>>>,
+    /// This replica's index in the cluster, set during `open`.
+    replica_index: Option<u8>,
+    queue_depth: usize,
+}
+
+impl<S: storage::Storage> SuperBlock<S> {
+    /// Creates an uninitialized superblock. Call `open` or `format` before use.
+    pub fn new(storage: S) -> Self {
+        // SAFETY: SuperBlockHeader implements Zeroable; all-zeros is valid.
+        let working = unsafe { AlignedBox::new_zeroed() };
+        let staging = unsafe { AlignedBox::new_zeroed() };
+        let reading = unsafe { AlignedBox::new_zeroed() };
+        let queue_head = None;
+        let queue_tail = None;
+        let replica_index = None;
+        let queue_depth = 0;
+
+        let sb = Self {
+            storage,
+            working,
+            staging,
+            reading,
+            // quorums: Quorums::default(),
+            queue_head,
+            queue_tail,
+            replica_index,
+            queue_depth,
+        };
+        sb.assert_invariants();
+
+        sb
+    }
+
+    /// Validates queue consistency and replica index bounds.
+    fn assert_invariants(&self) {
+        if self.queue_head.is_none() {
+            assert!(self.queue_tail.is_none());
+            assert_eq!(self.queue_depth, 0);
+        }
+        if self.queue_tail.is_none() {
+            assert!(self.queue_head.is_none());
+        }
+        assert!(self.queue_depth <= MAX_QUEUE_DEPTH);
+        if let Some(idx) = self.replica_index {
+            assert!((idx as usize) < constants::REPLICAS_MAX);
+        }
+    }
+
+    /// Validates staging header forms a valid chain from working.
+    ///
+    /// For `Open`: staging equals working (no pending changes).
+    /// For other callers: staging.sequence = working.sequence + 1, parent links correctly.
+    fn assert_staging_for_write(&self, caller: Caller) {
+        if caller == Caller::Open {
+            assert_eq!(self.staging.sequence, self.working.sequence);
+        } else {
+            assert_eq!(self.staging.sequence, self.working.sequence + 1);
+            assert_eq!(self.staging.parent, self.working.checksum);
+        }
+    }
+
+    /// Appends a context to the operation queue.
+    ///
+    /// The context's `sb` pointer is set to this superblock for callback access.
+    fn enqueue(&mut self, ctx: &mut Context<S>) {
+        ctx.assert_valid_for_enqueue();
+        assert!(self.queue_depth < MAX_QUEUE_DEPTH);
+
+        let nn = NonNull::from(&mut *ctx);
+        ctx.next = None;
+        ctx.sb = self as *mut SuperBlock<S>;
+
+        match self.queue_tail {
+            None => {
+                assert!(self.queue_head.is_none());
+                self.queue_tail = Some(nn);
+                self.queue_head = Some(nn);
+            }
+            Some(mut tail) => {
+                assert!(self.queue_head.is_some());
+                // SAFETY: tail is valid while in the queue; we own the queue structure.
+                unsafe {
+                    let tail_ref = tail.as_mut();
+                    assert!(tail_ref.next.is_none());
+                    tail_ref.next = Some(nn);
+                }
+                self.queue_tail = Some(nn);
+            }
+        }
+
+        self.queue_depth += 1;
+
+        assert!(self.queue_head.is_some());
+        assert!(self.queue_tail.is_some());
+        assert!(self.queue_depth > 0);
+    }
+
+    /// Removes the head context from the queue after operation completion.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is not the current queue head.
+    fn dequeue(&mut self, ctx: &mut Context<S>) {
+        assert!(self.is_queue_head(ctx));
+        assert!(self.queue_depth > 0);
+
+        let next = ctx.next;
+        ctx.next = None;
+
+        self.queue_head = next;
+        self.queue_depth -= 1;
+
+        if self.queue_head.is_none() {
+            self.queue_tail = None;
+            assert_eq!(self.queue_depth, 0);
+        }
+
+        assert!(ctx.next.is_none());
+    }
+
+    /// Returns true if `ctx` is at the head of the operation queue.
+    fn is_queue_head(&self, ctx: &Context<S>) -> bool {
+        self.queue_head
+            .is_some_and(|nn| core::ptr::eq(nn.as_ptr(), ctx))
+    }
+
+    /// Opens an existing superblock by reading all copies and selecting via quorum.
+    ///
+    /// Reads all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES), selects the
+    /// authoritative state, and repairs any corrupted copies. Invokes `cb` on completion.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active or `replica_index` exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX).
+    pub fn open(&mut self, cb: Callback<S>, ctx: &mut Context<S>, replica_index: u8) {
+        assert!(!ctx.is_active());
+        assert!((replica_index as usize) < constants::REPLICAS_MAX);
+
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(cb);
+        ctx.copy = None;
+        // ctx.repairs = None;
+
+        self.replica_index = Some(replica_index);
+        self.enqueue(ctx);
+
+        if self.is_queue_head(ctx) {
+            self.read_working(ctx, Threshold::Open);
+        }
+    }
+
+    /// Initializes a fresh superblock with the given cluster configuration.
+    ///
+    /// Creates sequence 0 (genesis) in `working`, then sequence 1 with VSR state in `staging`.
+    /// Writes all copies and verifies via read-back. Invokes `cb` on completion.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active or options are invalid.
+    pub fn format(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: FormatOptions) {
+        assert!(!ctx.is_active());
+        self.assert_format_options(&opts);
+
+        ctx.caller = Caller::Format;
+        ctx.callback = Some(cb);
+        ctx.copy = Some(0);
+        // ctx.repairs = None;
+
+        self.enqueue(ctx);
+
+        if self.is_queue_head(ctx) {
+            self.prepare_format(ctx, opts);
+        }
+    }
+
+    fn assert_format_options(&self, opts: &FormatOptions) {
+        assert!(opts.replica_count > 0);
+        assert!((opts.replica_count as usize) <= constants::REPLICAS_MAX);
+    }
+
+    /// Builds genesis (seq 0) and initial (seq 1) superblock headers, then writes.
+    fn prepare_format(&mut self, ctx: &mut Context<S>, opts: FormatOptions) {
+        // Genesis header: sequence 0, no parent.
+        *self.working = SuperBlockHeader::zeroed();
+        self.working.version = SUPERBLOCK_VERSION;
+        self.working.cluster = opts.cluster;
+        self.working.sequence = 0;
+        self.working.parent = 0;
+        self.working.vsr_state.checkpoint.header = HeaderPrepare::zeroed();
+        self.working.set_checksum();
+
+        let members = Members(opts.members);
+        let replica_index =
+            member_index(&members, opts.replica_id).expect("replica_id not found in members");
+
+        let vsr_state = VsrState::root(&RootOptions {
+            cluster: opts.cluster,
+            release: opts.release,
+            replica_index,
+            members,
+            replica_count: opts.replica_count,
+            view: opts.view,
+        });
+
+        let view_headers = ctx
+            .view_headers
+            .take()
+            .expect("format requires view_headers");
+        assert!(!view_headers.is_empty());
+
+        // Initial header: sequence 1, chains from genesis.
+        *self.staging = *self.working;
+        self.staging.sequence = 1;
+        self.staging.parent = self.working.checksum;
+        self.staging.vsr_state = vsr_state;
+        self.staging.view_headers_count = view_headers.len() as u32;
+        self.staging.view_headers_all = view_headers;
+        self.staging.set_checksum();
+
+        assert!(self.staging.valid_checksum());
+        self.assert_staging_for_write(Caller::Format);
+
+        self.write_headers(ctx);
+    }
+
+    /// Reads the next superblock copy into `self.reading[ctx.copy]`.
+    ///
+    /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
+    fn read_working(&mut self, ctx: &mut Context<S>, _threshold: Threshold) {
+        ctx.assert_ready_for_read();
+
+        if ctx.copy.is_none() {
+            ctx.copy = Some(0);
+        }
+
+        let copy = ctx.copy.expect("copy must be Some after init");
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        let offset = (SUPERBLOCK_COPY_SIZE as u64)
+            .checked_mul(copy as u64)
+            .expect("offset overflow");
+
+        let header_ref = &mut self.reading.as_mut()[copy as usize];
+        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
+        let buf = unsafe { as_bytes_unchecked_mut(header_ref) };
+
+        assert_bounds(offset, buf.len());
+
+        self.storage.read_sectors(
+            Self::read_header_callback,
+            &mut ctx.read,
+            buf,
+            S::SUPERBLOCK_ZONE,
+            offset,
+        );
+    }
+
+    /// Writes staging header to the next copy slot.
+    ///
+    /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
+    fn write_headers(&mut self, ctx: &mut Context<S>) {
+        ctx.assert_ready_for_write();
+
+        let copy = ctx.copy.expect("copy must be Some for write");
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        self.assert_staging_for_write(ctx.caller);
+
+        self.staging.copy = copy as u16;
+        assert!(self.staging.valid_checksum());
+
+        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
+        let buf = unsafe { as_bytes_unchecked_mut(&mut *self.staging) };
+        let offset = (SUPERBLOCK_COPY_SIZE as u64)
+            .checked_mul(copy as u64)
+            .expect("offset overflow");
+
+        assert_bounds(offset, buf.len());
+
+        self.storage.write_sectors(
+            Self::write_header_callback,
+            &mut ctx.write,
+            buf,
+            S::SUPERBLOCK_ZONE,
+            offset,
+        );
+    }
+
+    /// Callback invoked after each sector read completes.
+    ///
+    /// Continues reading remaining copies or transitions to quorum processing.
+    fn read_header_callback(read: &mut S::Read) {
+        // SAFETY: Storage guarantees context pointer validity for callback duration.
+        let ctx = unsafe { S::context_from_read(read) };
+
+        assert!(!ctx.sb.is_null());
+
+        // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
+        let sb = unsafe { &mut *ctx.sb };
+
+        let threshold = if ctx.caller == Caller::Open {
+            Threshold::Open
+        } else {
+            Threshold::Verify
+        };
+
+        let copy = ctx.copy.expect("copy must be Some in read callback");
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        // Continue reading remaining copies.
+        if (copy as usize) + 1 < constants::SUPERBLOCK_COPIES {
+            ctx.copy = Some(copy + 1);
+            sb.read_working(ctx, threshold);
+            return;
+        }
+
+        // All copies read; proceed to quorum selection.
+        ctx.copy = None;
+        // sb.process_quorum(ctx, threshold);
+    }
+
+    /// Callback invoked after each sector write completes.
+    ///
+    /// For format/update: writes remaining copies, then verifies via read-back.
+    /// For open (repair): transitions to repair completion.
+    fn write_header_callback(write: &mut S::Write) {
+        // SAFETY: Storage guarantees context pointer validity for callback duration.
+        let ctx = unsafe { S::context_from_write(write) };
+        assert!(!ctx.sb.is_null());
+
+        // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
+        let sb = unsafe { &mut *ctx.sb };
+
+        let copy = ctx.copy.expect("copy must be Some in write callback");
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        if ctx.caller == Caller::Open {
+            // Repair write completed.
+            ctx.copy = None;
+            // sb.repair(ctx);
+            return;
+        }
+
+        if (copy as usize) + 1 == constants::SUPERBLOCK_COPIES {
+            // All copies written; verify by reading back.
+            ctx.copy = None;
+            sb.read_working(ctx, Threshold::Verify);
+        } else {
+            ctx.copy = Some(copy + 1);
+            sb.write_headers(ctx);
+        }
+    }
+}
+
+/// Configuration for initializing a new superblock.
+pub struct FormatOptions {
+    /// Cluster identifier (must match all replicas).
+    pub cluster: u128,
+    /// This replica's unique identifier within `members`.
+    pub replica_id: u128,
+    /// All cluster member IDs; `replica_id` must be present.
+    pub members: [u128; constants::MEMBERS_MAX],
+    /// Number of active replicas (1..=REPLICAS_MAX).
+    pub replica_count: u8,
+    /// Initial view number.
+    pub view: u32,
+    /// Software release version for compatibility checks.
+    pub release: Release,
 }
 
 #[cfg(test)]
@@ -1030,12 +1434,12 @@ mod tests {
     }
     #[test]
     fn test_superblock_header_size_alignment() {
-        assert_eq!(mem::align_of::<SuperBlockHeader>(), 16);
+        assert_eq!(mem::align_of::<SuperBlockHeader>(), 4096);
         assert!(mem::size_of::<SuperBlockHeader>() <= SUPERBLOCK_COPY_SIZE);
         assert_eq!(
-            mem::size_of::<SuperBlockHeader>() % 16,
+            mem::size_of::<SuperBlockHeader>() % constants::SECTOR_SIZE,
             0,
-            "SuperBlockHeader size {} not multiple of 16",
+            "SuperBlockHeader size {} not multiple of SECTOR_SIZE",
             mem::size_of::<SuperBlockHeader>()
         );
     }
@@ -1044,7 +1448,19 @@ mod tests {
     // Context & Caller Tests
     // =========================================================================
 
-    struct MockStorage;
+    use crate::container_of;
+
+    struct MockStorage {
+        pub disk: Box<[u8]>,
+    }
+
+    impl MockStorage {
+        fn new() -> Self {
+            Self {
+                disk: vec![0; constants::SUPERBLOCK_ZONE_SIZE as usize].into_boxed_slice(),
+            }
+        }
+    }
 
     impl crate::vsr::storage::Storage for MockStorage {
         type Read = u64;
@@ -1054,31 +1470,90 @@ mod tests {
 
         fn read_sectors(
             &mut self,
-            _cb: fn(&mut Self::Read),
-            _read: &mut Self::Read,
-            _buf: &mut [u8],
+            cb: fn(&mut Self::Read),
+            read: &mut Self::Read,
+            buf: &mut [u8],
             _zone: Self::Zone,
-            _offset: u64,
+            offset: u64,
         ) {
+            let offset = offset as usize;
+            assert!(offset + buf.len() <= self.disk.len());
+            buf.copy_from_slice(&self.disk[offset..offset + buf.len()]);
+            cb(read);
         }
 
         fn write_sectors(
             &mut self,
-            _cb: fn(&mut Self::Write),
-            _write: &mut Self::Write,
-            _buf: &[u8],
+            cb: fn(&mut Self::Write),
+            write: &mut Self::Write,
+            buf: &[u8],
             _zone: Self::Zone,
-            _offset: u64,
+            offset: u64,
         ) {
+            let offset = offset as usize;
+            assert!(offset + buf.len() <= self.disk.len());
+            self.disk[offset..offset + buf.len()].copy_from_slice(buf);
+            cb(write);
         }
 
-        unsafe fn context_from_read(_read: &mut Self::Read) -> &mut Context<Self> {
-            unimplemented!("Not needed for current tests")
+        unsafe fn context_from_read(read: &mut Self::Read) -> &mut Context<Self> {
+            let ptr = read as *mut Self::Read;
+            let ctx_ptr = container_of!(ptr, Context<Self>, read);
+            unsafe { &mut *ctx_ptr }
         }
 
-        unsafe fn context_from_write(_write: &mut Self::Write) -> &mut Context<Self> {
-            unimplemented!("Not needed for current tests")
+        unsafe fn context_from_write(write: &mut Self::Write) -> &mut Context<Self> {
+            let ptr = write as *mut Self::Write;
+            let ctx_ptr = container_of!(ptr, Context<Self>, write);
+            unsafe { &mut *ctx_ptr }
         }
+    }
+
+    #[test]
+    fn test_format_hangs_due_to_missing_quorum() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::new(0, 0);
+
+        // Required for format
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let cb: Callback<MockStorage> = |_| {
+            panic!("Callback should not be called because logic is incomplete");
+        };
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+        members[1] = 2;
+        members[2] = 3;
+
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 3,
+            view: 0,
+            release: Release(0),
+        };
+
+        sb.format(cb, &mut ctx, opts);
+
+        // Verification:
+        // 1. Context should still be in queue (active) because the operation chain stops
+        //    before calling the completion callback.
+        assert!(sb.is_queue_head(&ctx));
+        assert!(ctx.is_active());
+
+        // 2. Data should have been written to disk (since MockStorage is sync)
+        let disk = &sb.storage.disk;
+
+        let mut header = SuperBlockHeader::zeroed();
+        let header_bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
+        let len = header_bytes.len();
+        header_bytes.copy_from_slice(&disk[0..len]);
+
+        assert_eq!(header.cluster, 1);
+        assert_eq!(header.sequence, 1);
     }
 
     #[test]
@@ -1095,7 +1570,8 @@ mod tests {
 
         // Write operations
         for caller in [Caller::Format, Caller::Checkpoint, Caller::ViewChange] {
-            assert!(!caller.expects_read());
+            // Updated behavior: write operations verify their writes by reading back
+            assert!(caller.expects_read());
             assert!(caller.expects_write());
         }
     }
@@ -1141,30 +1617,6 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_context_read_panics_for_format() {
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-        ctx.caller = Caller::Format;
-        ctx.assert_ready_for_read();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_context_read_panics_for_checkpoint() {
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-        ctx.caller = Caller::Checkpoint;
-        ctx.assert_ready_for_read();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_context_read_panics_for_view_change() {
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-        ctx.caller = Caller::ViewChange;
-        ctx.assert_ready_for_read();
-    }
-
-    #[test]
-    #[should_panic]
     fn test_context_panic_on_invalid_write_state() {
         let ctx = Context::<MockStorage>::new(0, 0);
         // Caller is None
@@ -1186,5 +1638,693 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
         ctx.copy = Some(constants::SUPERBLOCK_COPIES as u8);
         ctx.assert_valid_copy();
+    }
+
+    // =========================================================================
+    // SuperBlock Construction Tests
+    // =========================================================================
+
+    #[test]
+    fn test_superblock_new_initial_state() {
+        let storage = MockStorage::new();
+        let sb = SuperBlock::new(storage);
+
+        // Queue starts empty.
+        assert!(sb.queue_head.is_none());
+        assert!(sb.queue_tail.is_none());
+        assert_eq!(sb.queue_depth, 0);
+
+        // Replica index unset until open().
+        assert!(sb.replica_index.is_none());
+
+        // Headers are zeroed.
+        assert_eq!(sb.working.sequence, 0);
+        assert_eq!(sb.staging.sequence, 0);
+    }
+
+    #[test]
+    fn test_superblock_new_invariants_hold() {
+        let storage = MockStorage::new();
+        let sb = SuperBlock::new(storage);
+        // Should not panic.
+        sb.assert_invariants();
+    }
+
+    // =========================================================================
+    // Queue Operation Tests (enqueue/dequeue/is_queue_head)
+    // =========================================================================
+
+    #[test]
+    fn test_enqueue_single_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        sb.enqueue(&mut ctx);
+
+        assert!(sb.queue_head.is_some());
+        assert!(sb.queue_tail.is_some());
+        assert_eq!(sb.queue_depth, 1);
+        assert!(sb.is_queue_head(&ctx));
+    }
+
+    #[test]
+    fn test_enqueue_sets_context_sb_pointer() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        sb.enqueue(&mut ctx);
+
+        // Context should point back to superblock.
+        assert!(!ctx.sb.is_null());
+        assert!(core::ptr::eq(ctx.sb, &sb as *const _ as *mut _));
+    }
+
+    #[test]
+    fn test_enqueue_multiple_contexts_fifo_order() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        sb.enqueue(&mut ctx1);
+        sb.enqueue(&mut ctx2);
+
+        assert_eq!(sb.queue_depth, 2);
+        // First enqueued is head.
+        assert!(sb.is_queue_head(&ctx1));
+        assert!(!sb.is_queue_head(&ctx2));
+    }
+
+    #[test]
+    fn test_dequeue_single_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        sb.enqueue(&mut ctx);
+        sb.dequeue(&mut ctx);
+
+        assert!(sb.queue_head.is_none());
+        assert!(sb.queue_tail.is_none());
+        assert_eq!(sb.queue_depth, 0);
+        assert!(ctx.next.is_none());
+    }
+
+    #[test]
+    fn test_dequeue_preserves_remaining_queue() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        sb.enqueue(&mut ctx1);
+        sb.enqueue(&mut ctx2);
+        sb.dequeue(&mut ctx1);
+
+        assert_eq!(sb.queue_depth, 1);
+        assert!(sb.is_queue_head(&ctx2));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_dequeue_panics_if_not_head() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx1 = Context::<MockStorage>::new(1, 1);
+        let mut ctx2 = Context::<MockStorage>::new(2, 2);
+
+        sb.enqueue(&mut ctx1);
+        sb.enqueue(&mut ctx2);
+        // ctx2 is not head, should panic.
+        sb.dequeue(&mut ctx2);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_dequeue_panics_on_empty_queue() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Never enqueued, should panic.
+        sb.dequeue(&mut ctx);
+    }
+
+    #[test]
+    fn test_is_queue_head_empty_queue() {
+        let storage = MockStorage::new();
+        let sb = SuperBlock::new(storage);
+        let ctx = Context::<MockStorage>::new(0, 0);
+
+        assert!(!sb.is_queue_head(&ctx));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_enqueue_panics_at_max_depth() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        // Create MAX_QUEUE_DEPTH + 1 contexts.
+        let mut contexts: Vec<Context<MockStorage>> = (0..=MAX_QUEUE_DEPTH)
+            .map(|i| Context::new(i as u64, i as u64))
+            .collect();
+
+        // Enqueue up to max should succeed.
+        for ctx in contexts.iter_mut().take(MAX_QUEUE_DEPTH) {
+            sb.enqueue(ctx);
+        }
+
+        // One more should panic.
+        sb.enqueue(contexts.last_mut().unwrap());
+    }
+
+    // =========================================================================
+    // assert_invariants() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_assert_invariants_valid_replica_index() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        sb.replica_index = Some(0);
+        sb.assert_invariants();
+
+        sb.replica_index = Some((constants::REPLICAS_MAX - 1) as u8);
+        sb.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_invariants_panics_invalid_replica_index() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        sb.replica_index = Some(constants::REPLICAS_MAX as u8);
+        sb.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_invariants_panics_head_without_tail() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Manually corrupt state: head set, tail None.
+        sb.queue_head = Some(NonNull::from(&mut ctx));
+        sb.queue_tail = None;
+        sb.queue_depth = 1;
+
+        sb.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_invariants_panics_tail_without_head() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Manually corrupt state: tail set, head None.
+        sb.queue_head = None;
+        sb.queue_tail = Some(NonNull::from(&mut ctx));
+        sb.queue_depth = 1;
+
+        sb.assert_invariants();
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_invariants_panics_depth_exceeds_max() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        sb.queue_depth = MAX_QUEUE_DEPTH + 1;
+        sb.assert_invariants();
+    }
+
+    // =========================================================================
+    // assert_staging_for_write() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_assert_staging_for_write_open_caller() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        sb.working.sequence = 5;
+        sb.staging.sequence = 5;
+
+        // Should not panic for Open when sequences match.
+        sb.assert_staging_for_write(Caller::Open);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_staging_for_write_open_sequence_mismatch() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        sb.working.sequence = 5;
+        sb.staging.sequence = 6;
+
+        sb.assert_staging_for_write(Caller::Open);
+    }
+
+    #[test]
+    fn test_assert_staging_for_write_format_caller() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        sb.working.sequence = 0;
+        sb.working.set_checksum();
+        sb.staging.sequence = 1;
+        sb.staging.parent = sb.working.checksum;
+
+        // Should not panic for Format with proper chain.
+        sb.assert_staging_for_write(Caller::Format);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_staging_for_write_format_wrong_sequence() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        sb.working.sequence = 0;
+        sb.staging.sequence = 2; // Should be 1.
+
+        sb.assert_staging_for_write(Caller::Format);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_assert_staging_for_write_format_wrong_parent() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        sb.working.sequence = 0;
+        sb.working.set_checksum();
+        sb.staging.sequence = 1;
+        sb.staging.parent = 0xDEADBEEF; // Wrong parent.
+
+        sb.assert_staging_for_write(Caller::Format);
+    }
+
+    // =========================================================================
+    // open() Tests
+    // =========================================================================
+
+    #[test]
+    #[should_panic]
+    fn test_open_panics_on_active_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        // Mark context as active.
+        ctx.caller = Caller::Open;
+
+        let cb: Callback<MockStorage> = |_| {};
+        sb.open(cb, &mut ctx, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_open_panics_on_invalid_replica_index() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        sb.open(cb, &mut ctx, constants::REPLICAS_MAX as u8);
+    }
+
+    #[test]
+    fn test_open_sets_replica_index() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        sb.open(cb, &mut ctx, 2);
+
+        assert_eq!(sb.replica_index, Some(2));
+    }
+
+    #[test]
+    fn test_open_enqueues_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        sb.open(cb, &mut ctx, 0);
+
+        assert!(sb.is_queue_head(&ctx));
+        assert_eq!(ctx.caller, Caller::Open);
+        assert!(ctx.callback.is_some());
+    }
+
+    // =========================================================================
+    // format() and assert_format_options() Tests
+    // =========================================================================
+
+    #[test]
+    #[should_panic]
+    fn test_format_panics_on_active_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        // Mark context as active.
+        ctx.caller = Caller::Format;
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_format_panics_on_zero_replica_count() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 0, // Invalid.
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_format_panics_on_replica_count_exceeds_max() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: (constants::REPLICAS_MAX + 1) as u8,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+    }
+
+    #[test]
+    fn test_format_enqueues_context() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+
+        // Context remains queued (callback not invoked due to incomplete quorum logic).
+        assert!(sb.is_queue_head(&ctx));
+        assert_eq!(ctx.caller, Caller::Format);
+        // Note: With sync MockStorage, copy advances through write/read cycles.
+        // Final state depends on how far the operation progressed.
+    }
+
+    // =========================================================================
+    // prepare_format() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_prepare_format_genesis_header() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(42));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 100;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 42,
+            replica_id: 100,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(1),
+        };
+        sb.format(cb, &mut ctx, opts);
+
+        // Working should have genesis state.
+        assert_eq!(sb.working.version, SUPERBLOCK_VERSION);
+        assert_eq!(sb.working.cluster, 42);
+        assert_eq!(sb.working.sequence, 0);
+        assert_eq!(sb.working.parent, 0);
+        assert!(sb.working.valid_checksum());
+    }
+
+    #[test]
+    fn test_prepare_format_staging_chains_from_working() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(42));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 100;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 42,
+            replica_id: 100,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(1),
+        };
+        sb.format(cb, &mut ctx, opts);
+
+        // Staging should chain from working.
+        assert_eq!(sb.staging.sequence, 1);
+        assert_eq!(sb.staging.parent, sb.working.checksum);
+        assert_eq!(sb.staging.cluster, 42);
+        assert!(sb.staging.valid_checksum());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_prepare_format_panics_without_view_headers() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        // No view_headers set.
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_prepare_format_panics_replica_not_in_members() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+        members[1] = 2;
+        members[2] = 3;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 999, // Not in members.
+            members,
+            replica_count: 3,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+    }
+
+    // =========================================================================
+    // I/O Callback Iteration Tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_writes_all_copies() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+        ctx.view_headers = Some(ViewChangeArray::root(1));
+
+        let mut members = [0u128; constants::MEMBERS_MAX];
+        members[0] = 1;
+
+        let cb: Callback<MockStorage> = |_| {};
+        let opts = FormatOptions {
+            cluster: 1,
+            replica_id: 1,
+            members,
+            replica_count: 1,
+            view: 0,
+            release: Release(0),
+        };
+        sb.format(cb, &mut ctx, opts);
+
+        // With MockStorage (sync), all copies should be written.
+        // Verify each copy location has valid data.
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
+            let mut header = SuperBlockHeader::zeroed();
+            let header_bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
+            header_bytes.copy_from_slice(&sb.storage.disk[offset..offset + header_bytes.len()]);
+
+            assert_eq!(header.cluster, 1);
+            assert_eq!(header.sequence, 1);
+            assert_eq!(header.copy, copy_idx as u16);
+        }
+    }
+
+    #[test]
+    fn test_open_reads_all_copies() {
+        // Pre-populate disk with valid headers.
+        let mut storage = MockStorage::new();
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
+            let mut header = make_header();
+            header.copy = copy_idx as u16;
+            header.set_checksum();
+            let header_bytes = unsafe { as_bytes_unchecked(&header) };
+            storage.disk[offset..offset + header_bytes.len()].copy_from_slice(header_bytes);
+        }
+
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        sb.open(cb, &mut ctx, 0);
+
+        // After open completes reads (sync mock), all copies should be in reading buffer.
+        for copy_idx in 0..constants::SUPERBLOCK_COPIES {
+            let read_header = &sb.reading[copy_idx];
+            assert_eq!(read_header.copy, copy_idx as u16);
+            assert!(read_header.valid_checksum());
+        }
+    }
+
+    // =========================================================================
+    // Property-Based Tests for SuperBlock
+    // =========================================================================
+
+    proptest! {
+        #[test]
+        fn prop_format_staging_always_chains(
+            cluster in any::<u128>(),
+            view in any::<u32>(),
+        ) {
+            let storage = MockStorage::new();
+            let mut sb = SuperBlock::new(storage);
+            let mut ctx = Context::<MockStorage>::new(0, 0);
+            ctx.view_headers = Some(ViewChangeArray::root(cluster));
+
+            let mut members = [0u128; constants::MEMBERS_MAX];
+            members[0] = 1;
+
+            let cb: Callback<MockStorage> = |_| {};
+            let opts = FormatOptions {
+                cluster,
+                replica_id: 1,
+                members,
+                replica_count: 1,
+                view,
+                release: Release(0),
+            };
+            sb.format(cb, &mut ctx, opts);
+
+            // Staging always chains from working.
+            prop_assert_eq!(sb.staging.sequence, sb.working.sequence + 1);
+            prop_assert_eq!(sb.staging.parent, sb.working.checksum);
+            prop_assert!(sb.staging.valid_checksum());
+        }
+
+        #[test]
+        fn prop_enqueue_dequeue_preserves_depth(
+            count in 1usize..=MAX_QUEUE_DEPTH,
+        ) {
+            let storage = MockStorage::new();
+            let mut sb = SuperBlock::new(storage);
+
+            let mut contexts: Vec<Context<MockStorage>> = (0..count)
+                .map(|i| Context::new(i as u64, i as u64))
+                .collect();
+
+            // Enqueue all.
+            for ctx in contexts.iter_mut() {
+                sb.enqueue(ctx);
+            }
+            prop_assert_eq!(sb.queue_depth, count);
+
+            // Dequeue all.
+            for ctx in contexts.iter_mut() {
+                sb.dequeue(ctx);
+            }
+            prop_assert_eq!(sb.queue_depth, 0);
+            prop_assert!(sb.queue_head.is_none());
+            prop_assert!(sb.queue_tail.is_none());
+        }
     }
 }

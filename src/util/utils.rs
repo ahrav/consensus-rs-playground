@@ -106,6 +106,39 @@ pub unsafe fn as_bytes_unchecked<T>(v: &T) -> &[u8] {
     result
 }
 
+/// Mutable version of [`as_bytes_unchecked`].
+///
+/// Reinterprets a mutable reference as a mutable byte slice without requiring `Pod`.
+/// This is useful for types that need to be filled by I/O operations (e.g., reading
+/// from storage into a struct buffer).
+///
+/// # Safety
+///
+/// - Caller must ensure all bytes of `v` are initialized before reading them.
+/// - Any writes through the returned slice must leave `v` in a valid state.
+/// - The caller must not create overlapping mutable references.
+///
+/// # Panics
+///
+/// Panics if `T` is a ZST or exceeds `isize::MAX` bytes.
+#[inline]
+pub unsafe fn as_bytes_unchecked_mut<T>(v: &mut T) -> &mut [u8] {
+    const { assert!(size_of::<T>() > 0) };
+    assert!(size_of::<T>() <= isize::MAX as usize);
+
+    let ptr = v as *mut T;
+    assert!(ptr.is_aligned());
+
+    let byte_ptr = ptr.cast::<u8>();
+    let len = size_of::<T>();
+    let result = unsafe { slice::from_raw_parts_mut(byte_ptr, len) };
+
+    assert_eq!(result.len(), size_of::<T>());
+    assert_eq!(result.as_ptr() as usize, ptr as usize);
+
+    result
+}
+
 /// Mutable version of [`as_bytes`].
 ///
 /// # Safety
@@ -499,6 +532,70 @@ mod tests {
     }
 
     #[test]
+    fn test_as_bytes_unchecked_mut() {
+        let mut value: u32 = 0;
+        let bytes = unsafe { as_bytes_unchecked_mut(&mut value) };
+
+        // Write bytes in native endian
+        bytes.copy_from_slice(&0xCAFEBABEu32.to_ne_bytes());
+
+        assert_eq!(value, 0xCAFEBABE);
+    }
+
+    #[test]
+    fn test_as_bytes_unchecked_mut_struct() {
+        // Test with a non-Pod struct (no Pod impl required)
+        #[repr(C)]
+        struct NonPodStruct {
+            a: u32,
+            b: u32,
+        }
+
+        let mut value = NonPodStruct { a: 0, b: 0 };
+        let bytes = unsafe { as_bytes_unchecked_mut(&mut value) };
+
+        assert_eq!(bytes.len(), size_of::<NonPodStruct>());
+
+        // Write values through byte slice
+        bytes[..4].copy_from_slice(&42u32.to_ne_bytes());
+        bytes[4..].copy_from_slice(&100u32.to_ne_bytes());
+
+        assert_eq!(value.a, 42);
+        assert_eq!(value.b, 100);
+    }
+
+    #[test]
+    fn test_as_bytes_unchecked_roundtrip() {
+        #[repr(C)]
+        struct Header {
+            magic: u32,
+            version: u16,
+            flags: u16,
+        }
+
+        let mut header = Header {
+            magic: 0,
+            version: 0,
+            flags: 0,
+        };
+
+        // Simulate I/O read filling the buffer
+        let bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
+        bytes[..4].copy_from_slice(&0xDEADBEEFu32.to_ne_bytes());
+        bytes[4..6].copy_from_slice(&1u16.to_ne_bytes());
+        bytes[6..8].copy_from_slice(&0x8000u16.to_ne_bytes());
+
+        assert_eq!(header.magic, 0xDEADBEEF);
+        assert_eq!(header.version, 1);
+        assert_eq!(header.flags, 0x8000);
+
+        // Now read back using immutable version
+        let read_bytes = unsafe { as_bytes_unchecked(&header) };
+        assert_eq!(read_bytes.len(), 8);
+        assert_eq!(&read_bytes[..4], &0xDEADBEEFu32.to_ne_bytes());
+    }
+
+    #[test]
     fn test_as_bytes_aligned() {
         #[repr(C, align(64))]
         #[derive(Clone, Copy)]
@@ -628,6 +725,22 @@ mod proptests {
             let bytes = unsafe { as_bytes_mut(&mut v) };
             let restored = u64::from_ne_bytes(bytes.try_into().unwrap());
             prop_assert_eq!(value, restored);
+        }
+
+        #[test]
+        fn prop_as_bytes_unchecked_mut_roundtrip(value: u64) {
+            let mut v = value;
+            let bytes = unsafe { as_bytes_unchecked_mut(&mut v) };
+            let restored = u64::from_ne_bytes(bytes.try_into().unwrap());
+            prop_assert_eq!(value, restored);
+        }
+
+        #[test]
+        fn prop_as_bytes_unchecked_mut_write_read(value: u64) {
+            let mut v: u64 = 0;
+            let bytes = unsafe { as_bytes_unchecked_mut(&mut v) };
+            bytes.copy_from_slice(&value.to_ne_bytes());
+            prop_assert_eq!(v, value);
         }
 
         #[test]

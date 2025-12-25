@@ -63,7 +63,7 @@ impl Threshold {
     pub const fn count<const COPIES: usize>(self) -> u8 {
         assert!(COPIES >= MIN_COPIES);
         assert!(COPIES <= MAX_COPIES);
-        assert!(COPIES % 2 == 0);
+        assert!(COPIES.is_multiple_of(2));
 
         // Quorum formula: ⌈(COPIES + fault_tolerance) / 2⌉
         // - Verify: fault_tolerance = 1
@@ -125,18 +125,18 @@ pub fn select_superblock<const N: usize>(
         // Optimization: If we already found a better clique (higher sequence),
         // we can skip this candidate if its sequence is strictly lower.
         // However, we must process equal sequence numbers to detect forks.
-        if let Some(best) = best_clique_header {
-            if candidate.sequence < best.sequence {
-                continue;
-            }
+        if let Some(best) = best_clique_header
+            && candidate.sequence < best.sequence
+        {
+            continue;
         }
 
         // Count members of this candidate's clique.
         let mut clique_size = 0;
-        for j in 0..N {
+        for (j, header) in headers.iter().enumerate().take(N) {
             if (valid_mask & (1 << j)) != 0 {
                 // Logic equality check (ignores copy index and checksum fields)
-                if headers[j].equal(candidate) {
+                if header.equal(candidate) {
                     clique_size += 1;
                 }
             }
