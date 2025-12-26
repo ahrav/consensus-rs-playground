@@ -695,36 +695,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.acquire(ctx);
     }
 
-    /// Prepares staging header for checkpoint write.
-    ///
-    /// Chains from working header: copies state, increments sequence, updates parent checksum.
-    fn prepare_checkpoint(&mut self, ctx: &mut Context<S>) {
-        // Chain from current working header.
-        *self.staging = *self.working;
-        self.staging.sequence = self
-            .working
-            .sequence
-            .checked_add(1)
-            .expect("sequence overflow");
-        self.staging.parent = self.working.checksum;
-
-        // Apply captured VSR state.
-        self.staging.vsr_state = ctx.vsr_state.take().expect("checkpoint requires vsr_state");
-
-        // Apply view headers if provided.
-        if let Some(view_headers) = ctx.view_headers.take() {
-            self.staging.view_headers_count = view_headers.len() as u32;
-            self.staging.view_headers_all = view_headers.into_array();
-        }
-
-        self.staging.set_checksum();
-
-        assert!(self.staging.valid_checksum());
-
-        ctx.copy = Some(0);
-        self.write_header(ctx)
-    }
-
     /// Validates queue consistency and replica index bounds.
     fn assert_invariants(&self) {
         // Tail can only exist if head exists.
@@ -3044,13 +3014,36 @@ mod tests {
         ctx: &mut Context<MockStorage>,
         opts: &CheckpointOptions,
     ) {
+        // Set up VSR state from options.
         let mut vsr_state = sb.working.vsr_state;
         vsr_state.update_for_checkpoint(opts);
-        ctx.vsr_state = Some(vsr_state);
 
-        if let Some(view_attrs) = &opts.view_attributes {
-            ctx.view_headers = Some(*view_attrs.headers);
+        // Set up view headers from options.
+        let view_headers = opts.view_attributes.as_ref().map(|va| *va.headers);
+
+        // Chain from current working header.
+        *sb.staging = *sb.working;
+        sb.staging.sequence = sb
+            .working
+            .sequence
+            .checked_add(1)
+            .expect("sequence overflow");
+        sb.staging.parent = sb.working.checksum;
+
+        // Apply captured VSR state.
+        sb.staging.vsr_state = vsr_state;
+
+        // Apply view headers if provided.
+        if let Some(view_headers) = view_headers {
+            sb.staging.view_headers_count = view_headers.len() as u32;
+            sb.staging.view_headers_all = view_headers.into_array();
         }
-        sb.prepare_checkpoint(ctx);
+
+        sb.staging.set_checksum();
+
+        assert!(sb.staging.valid_checksum());
+
+        ctx.copy = Some(0);
+        sb.write_header(ctx);
     }
 }
