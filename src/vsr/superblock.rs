@@ -379,8 +379,6 @@ pub struct Context<S: storage::Storage> {
     pub(super) vsr_state: Option<VsrState>,
     /// View change headers to persist (for view change operations).
     pub(super) view_headers: Option<ViewChangeArray>,
-    /// Format options to persist (for format operations).
-    pub(super) format_opts: Option<FormatOptions>,
     // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
 }
 
@@ -396,7 +394,6 @@ impl<S: storage::Storage> Context<S> {
             read_threshold: None,
             vsr_state: None,
             view_headers: None,
-            format_opts: None,
             sb: core::ptr::null_mut(),
         }
     }
@@ -653,9 +650,11 @@ impl<S: storage::Storage> SuperBlock<S> {
 
     /// Returns true if an operation of the given type is in-flight or queued.
     fn updating(&self, caller: Caller) -> bool {
-        let head = self.queue_head.map(|nn| unsafe { nn.as_ref().caller });
-        let tail = self.queue_tail.map(|nn| unsafe { nn.as_ref().caller });
-        head == Some(caller) || tail == Some(caller)
+        self.queue_head
+            .is_some_and(|nn| unsafe { nn.as_ref().caller } == caller)
+            || self
+                .queue_tail
+                .is_some_and(|nn| unsafe { nn.as_ref().caller } == caller)
     }
 
     /// Acquires the queue for a new operation.
