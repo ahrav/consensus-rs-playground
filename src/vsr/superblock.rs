@@ -735,11 +735,11 @@ impl<S: storage::Storage> SuperBlock<S> {
         let tail = self.queue_tail.take();
         self.queue_head = None;
 
-        // If there is a tail, start it before invoking the callback (matches Zig).
+        // If there is a tail, start it before invoking the callback.
         if let Some(mut tail_nn) = tail {
             let tail_ctx = unsafe { tail_nn.as_mut() };
 
-            // Reverse transition check (matches superblock.zig's `transitions()` assertion).
+            // Reverse transition check.
             assert!(
                 tail_ctx.caller.tail_allowed().contains(&caller),
                 "invalid queued transition at release: {:?} -> {:?}",
@@ -755,6 +755,18 @@ impl<S: storage::Storage> SuperBlock<S> {
         ctx.reset_operation_fields();
 
         cb(ctx);
+
+        match caller {
+            Caller::Open | Caller::Format => {
+                assert!(!self.opened);
+                assert!(self.replica_index.is_some());
+                self.opened = true;
+            }
+            Caller::Checkpoint | Caller::ViewChange => {
+                assert!(self.opened);
+            }
+            Caller::None => unreachable!(),
+        }
     }
 
     // ------------------------------------------------------------------------
