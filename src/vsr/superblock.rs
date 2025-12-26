@@ -215,6 +215,11 @@ impl SuperBlockHeader {
         checksum(&bytes[Self::CHECKSUM_EXCLUDE_SIZE..])
     }
 
+    /// Returns a content-addressable identifier for this superblock state.
+    ///
+    /// The checkpoint ID is the header checksum, making it deterministic and
+    /// collision-resistant. Two headers with identical VSR state produce the
+    /// same ID regardless of which copy slot they occupy.
     pub fn checkpoint_id(&self) -> Checksum128 {
         self.calculate_checksum()
     }
@@ -306,6 +311,10 @@ pub enum Caller {
 }
 
 impl Caller {
+    /// Returns `true` if this operation persists new view headers.
+    ///
+    /// Format, checkpoint, and view change all write fresh state and must include
+    /// current view headers. Open only reads existing state for recovery.
     fn updates_view_headers(&self) -> bool {
         match self {
             Caller::Format | Caller::Checkpoint | Caller::ViewChange => true,
@@ -314,9 +323,11 @@ impl Caller {
         }
     }
 
-    /// Allowed tail caller transitions.
-    /// checkpoint -> view_change
-    /// view_change -> checkpoint
+    /// Returns callers that may queue behind this operation.
+    ///
+    /// Only checkpoint↔view_change queueing is permitted because both are
+    /// normal-operation mutations that can safely interleave. Format and open
+    /// are one-time initialization operations that must complete in isolation.
     fn tail_allowed(&self) -> &'static [Caller] {
         match self {
             Caller::Checkpoint => &[Caller::ViewChange],
@@ -710,7 +721,11 @@ impl<S: storage::Storage> SuperBlock<S> {
     // Queueing (head + optional tail)
     // ------------------------------------------------------------------------
 
-    /// Returns true if an operation of the given type is in-flight or queued.
+    /// Returns `true` if an operation of the given type is in-flight or queued.
+    ///
+    /// Used to enforce mutual exclusion: at most one checkpoint and one view_change
+    /// may be active (including queued) at any time. Prevents duplicate operations
+    /// from corrupting the staging state machine.
     fn updating(&self, caller: Caller) -> bool {
         self.queue_head
             .is_some_and(|nn| unsafe { nn.as_ref().caller } == caller)
@@ -834,6 +849,21 @@ impl<S: storage::Storage> SuperBlock<S> {
     // I/O state machine
     // ------------------------------------------------------------------------
 
+    /// Prepares and initiates a superblock update by building staging from working.
+    ///
+    /// This is the entry point for all superblock mutations (checkpoint, view change, format).
+    /// The staging superblock is constructed by:
+    /// 1. Copying the durable working state as a base
+    /// 2. Incrementing sequence and chaining parent checksum for crash recovery
+    /// 3. Applying the new VSR state from the context
+    /// 4. Optionally updating view headers (for callers that require it)
+    /// 5. Computing the final checksum and initiating copy 0 write
+    ///
+    /// # Preconditions
+    /// - `ctx.caller` must be `Checkpoint`, `ViewChange`, or `Format` (not `None` or `Open`)
+    /// - `ctx.vsr_state` must be `Some` (consumed by this call)
+    /// - `ctx.view_headers` must be `Some` iff `caller.updates_view_headers()`
+    /// - `ctx.copy` and `ctx.read_threshold` must be `None` (fresh context)
     fn write_staging(&mut self, ctx: &mut Context<S>) {
         assert!(ctx.caller != Caller::None);
         assert!(ctx.caller != Caller::Open);
@@ -946,6 +976,10 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.read_header(ctx);
     }
 
+    /// Reads a single superblock copy into `self.reading[ctx.copy]`.
+    ///
+    /// Called iteratively by [`read_working`] and the read callback to process
+    /// all copies. After all reads complete, quorum logic selects the authoritative state.
     fn read_header(&mut self, ctx: &mut Context<S>) {
         let copy = ctx.copy.expect("copy must be Some after init") as usize;
         assert!(copy < constants::SUPERBLOCK_COPIES);
