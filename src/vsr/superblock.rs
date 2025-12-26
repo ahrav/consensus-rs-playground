@@ -48,6 +48,30 @@ pub const SUPERBLOCK_COPY_SIZE: usize = align_up(
     constants::SECTOR_SIZE,
 );
 
+const VIEW_HEADERS_RESERVED_SIZE: usize = constants::SECTOR_SIZE
+    - ((constants::VIEW_HEADERS_MAX * size_of::<Header>()) % constants::SECTOR_SIZE);
+
+// --- On-disk header padding calculations ---
+//
+// The header is laid out as:
+//
+//   [ sector 0 ] fixed fields up through view_headers_count + reserved padding to sector boundary
+//   [ sector 1.. ] view_headers_all (typically one full sector)
+//   [ final padding ] view_headers_reserved to make total header size a multiple of sector size
+
+const RESERVED_SIZE: usize = constants::SECTOR_SIZE
+    - size_of::<Checksum128>() * 2  // checksum, checksum_padding
+    - size_of::<u16>()              // copy
+    - size_of::<u16>()              // version
+    - size_of::<Release>()          // release_format
+    - size_of::<u64>()              // sequence
+    - size_of::<u128>()             // cluster
+    - size_of::<Checksum128>()      // parent
+    - size_of::<u128>()             // parent_padding
+    - size_of::<VsrState>()         // vsr_state
+    - size_of::<u64>()              // flags
+    - size_of::<u32>(); // view_headers_count
+
 /// Max concurrent I/O operations to the superblock zone.
 const MAX_QUEUE_DEPTH: usize = 16;
 
@@ -82,6 +106,15 @@ const _: () = {
     assert!(MAX_QUEUE_DEPTH <= 256);
 
     assert!(MAX_REPAIR_ITERATIONS >= constants::SUPERBLOCK_COPIES);
+
+    assert!(core::mem::offset_of!(SuperBlockHeader, view_headers_all) == constants::SECTOR_SIZE);
+    assert!(
+        core::mem::offset_of!(SuperBlockHeader, reserved) + RESERVED_SIZE == constants::SECTOR_SIZE
+    );
+
+    // View headers array must fit within one sector. The VIEW_HEADERS_RESERVED_SIZE
+    // pads to the next sector boundary.
+    assert!(size_of::<[HeaderPrepare; constants::VIEW_HEADERS_MAX]>() <= constants::SECTOR_SIZE);
 };
 
 /// Validates that an I/O region falls within the superblock zone and is sector-aligned.
@@ -122,10 +155,15 @@ pub struct SuperBlockHeader {
 
     /// Schema version for forward compatibility.
     pub version: u16,
-    /// Cluster identifier; must match across all replicas.
-    pub cluster: u128,
+    /// Software release version used when formatting this superblock.
+    ///
+    /// Used for compatibility checks on recovery to ensure the replica
+    /// can safely interpret the stored state.
+    pub release_format: Release,
     /// Monotonically increasing write sequence number.
     pub sequence: u64,
+    /// Cluster identifier; must match across all replicas.
+    pub cluster: u128,
     /// Checksum of the previous superblock (chain integrity).
     pub parent: u128,
     /// Reserved; must be zero.
@@ -134,10 +172,18 @@ pub struct SuperBlockHeader {
     /// Current VSR protocol state (view, commit index, etc).
     pub vsr_state: VsrState,
 
+    /// Bitflags for optional superblock features; reserved for future use.
+    pub flags: u64,
     /// Number of valid entries in `view_headers_all`.
     pub view_headers_count: u32,
+
+    /// Reserved padding to align `view_headers_all` to sector boundary; must be zero.
+    pub reserved: [u8; RESERVED_SIZE],
+
     /// Headers from recent view changes for view-change recovery.
-    pub view_headers_all: ViewChangeArray,
+    pub view_headers_all: [HeaderPrepare; constants::VIEW_HEADERS_MAX],
+    /// Reserved padding after view headers to align total size; must be zero.
+    pub view_headers_reserved: [u8; VIEW_HEADERS_RESERVED_SIZE],
 }
 
 // SAFETY: SuperBlockHeader is #[repr(C)] with only primitive types and arrays thereof.
@@ -183,6 +229,10 @@ impl SuperBlockHeader {
         checksum(&bytes[Self::CHECKSUM_EXCLUDE_SIZE..])
     }
 
+    pub fn checkpoint_id(&self) -> Checksum128 {
+        self.calculate_checksum()
+    }
+
     /// Returns true if the stored checksum matches the computed value.
     ///
     /// Also validates that `checksum_padding` is zero.
@@ -204,6 +254,19 @@ impl SuperBlockHeader {
         assert!(self.valid_checksum())
     }
 
+    pub fn view_headers(&self) -> ViewChangeSlice<'_> {
+        let command = if self.vsr_state.log_view == self.vsr_state.view {
+            ViewChangeCommand::StartView
+        } else {
+            ViewChangeCommand::DoViewChange
+        };
+
+        let count = self.view_headers_count as usize;
+        assert!(count <= constants::VIEW_HEADERS_MAX);
+
+        ViewChangeSlice::init(command, &self.view_headers_all[..count])
+    }
+
     /// Logical equality ignoring `checksum` and `copy` fields.
     ///
     /// Two headers are equal if they represent the same VSR state, even if
@@ -211,8 +274,9 @@ impl SuperBlockHeader {
     pub fn equal(&self, other: &SuperBlockHeader) -> bool {
         self.checksum_padding == other.checksum_padding
             && self.version == other.version
-            && self.cluster == other.cluster
+            && self.release_format == other.release_format
             && self.sequence == other.sequence
+            && self.cluster == other.cluster
             && self.parent == other.parent
             && self.parent_padding == other.parent_padding
             // SAFETY: VsrState is Pod, and ViewChangeArray constructors zero-fill bytes.
@@ -597,7 +661,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.staging.parent = self.working.checksum;
         self.staging.vsr_state = vsr_state;
         self.staging.view_headers_count = view_headers.len() as u32;
-        self.staging.view_headers_all = view_headers;
+        self.staging.view_headers_all = view_headers.into_array();
         self.staging.set_checksum();
 
         assert!(self.staging.valid_checksum());
@@ -656,7 +720,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         // Apply view headers if provided.
         if let Some(view_headers) = ctx.view_headers.take() {
             self.staging.view_headers_count = view_headers.len() as u32;
-            self.staging.view_headers_all = view_headers;
+            self.staging.view_headers_all = view_headers.into_array();
         }
 
         self.staging.set_checksum();
@@ -940,7 +1004,7 @@ mod tests {
         header.cluster = 1;
         header.sequence = 1;
         header.view_headers_count = 1;
-        header.view_headers_all = ViewChangeArray::root(header.cluster);
+        header.view_headers_all = ViewChangeArray::root(header.cluster).into_array();
         header
     }
 
@@ -1121,6 +1185,17 @@ mod tests {
     }
 
     #[test]
+    fn test_checksum_includes_release_format() {
+        let mut header1 = make_header();
+        let mut header2 = make_header();
+
+        header1.release_format = Release(1);
+        header2.release_format = Release(2);
+
+        assert_ne!(header1.calculate_checksum(), header2.calculate_checksum());
+    }
+
+    #[test]
     fn test_checksum_includes_parent() {
         let mut header1 = make_header();
         let mut header2 = make_header();
@@ -1257,6 +1332,17 @@ mod tests {
 
         header1.sequence = 1;
         header2.sequence = 2;
+
+        assert!(!header1.equal(&header2));
+    }
+
+    #[test]
+    fn test_equal_detects_release_format_difference() {
+        let mut header1 = make_header();
+        let mut header2 = make_header();
+
+        header1.release_format = Release(1);
+        header2.release_format = Release(2);
 
         assert!(!header1.equal(&header2));
     }
@@ -1554,8 +1640,8 @@ mod tests {
         let mut header2 = make_header();
 
         // Create different view change arrays
-        header1.view_headers_all = ViewChangeArray::root(1);
-        header2.view_headers_all = ViewChangeArray::root(2);
+        header1.view_headers_all = ViewChangeArray::root(1).into_array();
+        header2.view_headers_all = ViewChangeArray::root(2).into_array();
 
         assert!(!header1.equal(&header2));
     }
@@ -2569,7 +2655,7 @@ mod tests {
         sb.working.cluster = 1;
         sb.working.sequence = 1;
         sb.working.view_headers_count = 1;
-        sb.working.view_headers_all = ViewChangeArray::root(1);
+        sb.working.view_headers_all = ViewChangeArray::root(1).into_array();
 
         // Initialize VsrState with valid replica config.
         let members = Members([1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -2891,7 +2977,7 @@ mod tests {
         ) {
             let mut sb = setup_formatted_superblock();
             sb.working.cluster = cluster;
-            sb.working.view_headers_all = ViewChangeArray::root(cluster);
+            sb.working.view_headers_all = ViewChangeArray::root(cluster).into_array();
             sb.working.set_checksum();
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
