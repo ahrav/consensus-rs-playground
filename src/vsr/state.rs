@@ -328,33 +328,6 @@ impl CheckpointState {
     }
 }
 
-#[inline]
-fn checkpoint_valid(op: u64) -> bool {
-    // Checkpoints are only valid at compaction bar boundaries.
-    op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS)
-}
-
-#[inline]
-fn checkpoint_after(checkpoint: u64) -> u64 {
-    assert!(checkpoint_valid(checkpoint));
-
-    let vsr_checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
-    assert!(vsr_checkpoint_ops > 0);
-
-    let result = if checkpoint == 0 {
-        vsr_checkpoint_ops - 1
-    } else {
-        checkpoint
-            .checked_add(vsr_checkpoint_ops)
-            .expect("checkpoint_after overflow")
-    };
-
-    assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS));
-    assert!(checkpoint_valid(result));
-
-    result
-}
-
 /// Durable replica state persisted to the superblock.
 ///
 /// Combines [`CheckpointState`] with replica identity and protocol progress fields.
@@ -1013,6 +986,37 @@ mod tests {
     use super::*;
     use crate::vsr::wire::header::Release;
     use crate::vsr::{ViewChangeArray, ViewChangeCommand};
+
+    // =========================================================================
+    // Helper functions for checkpoint boundary calculations
+    // =========================================================================
+
+    #[inline]
+    fn checkpoint_valid(op: u64) -> bool {
+        // Checkpoints are only valid at compaction bar boundaries.
+        op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS)
+    }
+
+    #[inline]
+    fn checkpoint_after(checkpoint: u64) -> u64 {
+        assert!(checkpoint_valid(checkpoint));
+
+        let vsr_checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
+        assert!(vsr_checkpoint_ops > 0);
+
+        let result = if checkpoint == 0 {
+            vsr_checkpoint_ops - 1
+        } else {
+            checkpoint
+                .checked_add(vsr_checkpoint_ops)
+                .expect("checkpoint_after overflow")
+        };
+
+        assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS));
+        assert!(checkpoint_valid(result));
+
+        result
+    }
 
     // =========================================================================
     // Helper function to create valid RootOptions for testing
@@ -2603,7 +2607,7 @@ mod tests {
         state.sync_view = 7;
 
         let current_checkpoint_id = state.checkpoint.checkpoint_id();
-        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+        let checkpoint_next = checkpoint_after(state.checkpoint.header.op);
 
         let checkpoint = make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
 
@@ -2722,7 +2726,7 @@ mod tests {
         let mut state = VsrState::root(&options);
 
         let current_checkpoint_id = state.checkpoint.checkpoint_id();
-        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+        let checkpoint_next = checkpoint_after(state.checkpoint.header.op);
         let wrong_parent = if current_checkpoint_id == 0 {
             1
         } else {
@@ -2757,7 +2761,7 @@ mod tests {
         let mut state = VsrState::root(&options);
 
         let current_checkpoint_id = state.checkpoint.checkpoint_id();
-        let checkpoint_next = super::checkpoint_after(state.checkpoint.header.op);
+        let checkpoint_next = checkpoint_after(state.checkpoint.header.op);
         let checkpoint = make_sync_checkpoint(&state, checkpoint_next, current_checkpoint_id, 0);
 
         let sync = SyncCheckpointOptions {
