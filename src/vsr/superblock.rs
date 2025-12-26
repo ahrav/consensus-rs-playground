@@ -28,7 +28,7 @@ use crate::{
     vsr::{
         HeaderPrepare,
         members::{Members, member_index},
-        state::RootOptions,
+        state::{CheckpointOptions, RootOptions},
         superblock_quorum::Threshold,
         wire::{checksum, header::Release},
     },
@@ -445,39 +445,51 @@ impl<S: storage::Storage> Context<S> {
 /// Operations are queued and processed sequentially via an intrusive linked list.
 pub struct SuperBlock<S: storage::Storage> {
     storage: S,
+
+    storage_size_limit: u64,
+
     /// Last committed superblock state. Updated only after successful quorum verification.
     pub working: AlignedBox<SuperBlockHeader>,
     /// Next superblock state being prepared. Becomes `working` after commit.
     pub staging: AlignedBox<SuperBlockHeader>,
+
     /// Buffer for reading all copies during open/verification.
     reading: AlignedBox<[SuperBlockHeader; constants::SUPERBLOCK_COPIES]>,
     // quorums: Quorums< {constants::SUPERBLOCK_COPIES}>,
+    /// Whether the superblock has been successfully opened.
+    opened: bool,
+    /// This replica's index in the cluster, set during `open`.
+    replica_index: Option<u8>,
+
     /// Current in-flight operation, if any.
     queue_head: Option<NonNull<Context<S>>>,
     /// Optional queued operation waiting for head to complete.
     /// Restricted by caller transitions: checkpoint <-> view_change only.
     queue_tail: Option<NonNull<Context<S>>>,
-    /// This replica's index in the cluster, set during `open`.
-    replica_index: Option<u8>,
 }
 
 impl<S: storage::Storage> SuperBlock<S> {
     /// Creates an uninitialized superblock. Call `open` or `format` before use.
     pub fn new(storage: S) -> Self {
-        // SAFETY: SuperBlockHeader implements Zeroable; all-zeros is valid.
+        Self::new_with_limit(storage, u64::MAX)
+    }
+
+    pub fn new_with_limit(storage: S, storage_size_limit: u64) -> Self {
         let working = unsafe { AlignedBox::new_zeroed() };
         let staging = unsafe { AlignedBox::new_zeroed() };
         let reading = unsafe { AlignedBox::new_zeroed() };
 
         let sb = Self {
             storage,
+            storage_size_limit,
             working,
             staging,
             reading,
             // quorums: Quorums::default(),
+            opened: false,
+            replica_index: None,
             queue_head: None,
             queue_tail: None,
-            replica_index: None,
         };
         sb.assert_invariants();
 
@@ -571,6 +583,56 @@ impl<S: storage::Storage> SuperBlock<S> {
         );
 
         self.queue_tail = Some(NonNull::from(&mut *ctx));
+    }
+
+    /// Completes the current operation and returns control to the caller.
+    ///
+    /// Releases the queue head, optionally starts the tail operation (if any),
+    /// and invokes the completion callback.
+    ///
+    /// # Queue Transitions
+    ///
+    /// If there is a queued tail operation, it is started via `acquire` *before*
+    /// the callback is invoked. This matches TigerBeetle's semantics where the
+    /// next operation begins before the previous callback completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ctx` has no callback or is not the current queue head.
+    pub(crate) fn release(&mut self, ctx: &mut Context<S>) {
+        assert!(ctx.caller != Caller::None);
+        assert!(ctx.callback.is_some());
+
+        let head_ptr = self.queue_head.expect("release without head").as_ptr();
+        assert!(core::ptr::eq(head_ptr, ctx as *mut _));
+
+        let caller = ctx.caller;
+        let cb = ctx.callback.take().unwrap();
+
+        // Detach head/tail.
+        let tail = self.queue_tail.take();
+        self.queue_head = None;
+
+        // If there is a tail, start it before invoking the callback (matches Zig).
+        if let Some(mut tail_nn) = tail {
+            let tail_ctx = unsafe { tail_nn.as_mut() };
+
+            // Reverse transition check (matches superblock.zig's `transitions()` assertion).
+            assert!(
+                tail_ctx.caller.tail_allowed().contains(&caller),
+                "invalid queued transition at release: {:?} -> {:?}",
+                caller,
+                tail_ctx.caller
+            );
+
+            self.acquire(tail_ctx);
+        }
+
+        // Mark context idle before callback.
+        ctx.caller = Caller::None;
+        ctx.reset_operation_fields();
+
+        cb(ctx);
     }
 
     /// Returns true if `ctx` is at the head of the operation queue.
@@ -761,56 +823,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         );
     }
 
-    /// Completes the current operation and returns control to the caller.
-    ///
-    /// Releases the queue head, optionally starts the tail operation (if any),
-    /// and invokes the completion callback.
-    ///
-    /// # Queue Transitions
-    ///
-    /// If there is a queued tail operation, it is started via `acquire` *before*
-    /// the callback is invoked. This matches TigerBeetle's semantics where the
-    /// next operation begins before the previous callback completes.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `ctx` has no callback or is not the current queue head.
-    pub(crate) fn release(&mut self, ctx: &mut Context<S>) {
-        assert!(ctx.caller != Caller::None);
-        assert!(ctx.callback.is_some());
-
-        let head_ptr = self.queue_head.expect("release without head").as_ptr();
-        assert!(core::ptr::eq(head_ptr, ctx as *mut _));
-
-        let caller = ctx.caller;
-        let cb = ctx.callback.take().unwrap();
-
-        // Detach head/tail.
-        let tail = self.queue_tail.take();
-        self.queue_head = None;
-
-        // If there is a tail, start it before invoking the callback (matches Zig).
-        if let Some(mut tail_nn) = tail {
-            let tail_ctx = unsafe { tail_nn.as_mut() };
-
-            // Reverse transition check (matches superblock.zig's `transitions()` assertion).
-            assert!(
-                tail_ctx.caller.tail_allowed().contains(&caller),
-                "invalid queued transition at release: {:?} -> {:?}",
-                caller,
-                tail_ctx.caller
-            );
-
-            self.acquire(tail_ctx);
-        }
-
-        // Mark context idle before callback.
-        ctx.caller = Caller::None;
-        ctx.reset_operation_fields();
-
-        cb(ctx);
-    }
-
     /// Writes staging header to the next copy slot.
     ///
     /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
@@ -924,59 +936,11 @@ pub struct FormatOptions {
     pub release: Release,
 }
 
-/// View state captured during checkpoint for view change recovery.
-///
-/// When a replica checkpoints during a view change, it must persist the current
-/// view headers to enable recovery. Without this, a restarted replica cannot
-/// determine which operations were committed in the new view.
-pub struct ViewAttributes<'a> {
-    /// Prepare headers from the current view (used to reconstruct commit state).
-    pub headers: &'a ViewChangeArray,
-    /// Current view number.
-    pub view: u32,
-    /// View in which the last log entry was created.
-    pub log_view: u32,
-}
-
-/// Configuration for persisting a checkpoint to the superblock.
-///
-/// Captures all state needed to resume from this checkpoint after crash recovery:
-/// block references, commit bounds, and optionally view change state.
-///
-/// # Tuple Field Layout
-/// Reference tuples follow consistent patterns:
-/// - `manifest_references`: (oldest_checksum, oldest_addr, newest_checksum, newest_addr, block_count)
-/// - `free_set_*_references`: (checksum, size, last_block_checksum, last_block_addr)
-/// - `client_sessions_references`: (checksum, size, last_block_checksum, last_block_addr)
-pub struct CheckpointOptions<'a> {
-    /// Prepare header that triggered this checkpoint.
-    pub header: HeaderPrepare,
-    /// View state if checkpointing during/after a view change.
-    pub view_attributes: Option<ViewAttributes<'a>>,
-    /// Highest committed operation number.
-    pub commit_max: u64,
-    /// Sync target range: minimum operation to sync from.
-    pub sync_op_min: u64,
-    /// Sync target range: maximum operation to sync to.
-    pub sync_op_max: u64,
-    /// LSM manifest block chain: (oldest_cs, oldest_addr, newest_cs, newest_addr, count).
-    pub manifest_references: (u128, u64, u128, u64, u64),
-    /// Acquired free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_acquired_references: (u128, u64, u128, u64),
-    /// Released free set blocks: (checksum, size, last_block_cs, last_block_addr).
-    pub free_set_released_references: (u128, u64, u128, u64),
-    /// Client session state: (checksum, size, last_block_cs, last_block_addr).
-    pub client_sessions_references: (u128, u64, u128, u64),
-    /// Total data file size in bytes.
-    pub storage_size: u64,
-    /// Software release for compatibility validation on recovery.
-    pub release: Release,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::constants;
+    use crate::vsr::state::ViewAttributes;
     use core::mem;
     use proptest::prelude::*;
 
