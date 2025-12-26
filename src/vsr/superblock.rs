@@ -512,6 +512,7 @@ impl<S: storage::Storage> SuperBlock<S> {
 
         self.replica_index = Some(replica_index);
 
+        ctx.sb = self as *mut _;
         ctx.caller = Caller::Open;
         ctx.callback = Some(cb);
         ctx.reset_operation_fields();
@@ -618,6 +619,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         assert!(opts.storage_size >= constants::DATA_FILE_SIZE_MIN);
         assert!(opts.storage_size <= self.storage_size_limit);
 
+        ctx.sb = self as *mut _;
         ctx.caller = Caller::Checkpoint;
         ctx.callback = Some(cb);
         ctx.reset_operation_fields();
