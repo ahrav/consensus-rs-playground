@@ -11,17 +11,11 @@ const MAX_COPIES: usize = 8;
 /// Minimum superblock copies. Below this, fault tolerance is insufficient.
 const MIN_COPIES: usize = 4;
 
-/// Bounds repair iteration to prevent infinite loops on malformed state.
-const MAX_REPAIR_ITERATIONS: usize = 16;
-
 const _: () = {
     assert!(MIN_COPIES > 0);
     assert!(MIN_COPIES <= MAX_COPIES);
     // Limit to 16 copies: beyond this, coordination overhead outweighs benefits.
     assert!(MAX_COPIES <= 16);
-
-    // Repairs must be able to iterate over all copies.
-    assert!(MAX_REPAIR_ITERATIONS >= MAX_COPIES);
 };
 
 /// Errors from quorum validation.
@@ -54,6 +48,17 @@ pub enum Threshold {
     Verify,
 }
 
+const fn validate_copies<const COPIES: usize>() {
+    assert!(COPIES >= MIN_COPIES, "COPIES below minimum");
+    assert!(COPIES <= MAX_COPIES, "COPIES exceeds maximum");
+    assert!(COPIES % 2 == 0, "COPIES must be even");
+
+    assert!(
+        COPIES == 4 || COPIES == 6 || COPIES == 8,
+        "unsupported COPIES (expected 4, 6, or 8)"
+    );
+}
+
 impl Threshold {
     /// Computes required agreeing copies for the given redundancy level.
     ///
@@ -61,9 +66,7 @@ impl Threshold {
     ///
     /// Panics if `COPIES` is outside `[MIN_COPIES, MAX_COPIES]` or odd.
     pub const fn count<const COPIES: usize>(self) -> u8 {
-        assert!(COPIES >= MIN_COPIES);
-        assert!(COPIES <= MAX_COPIES);
-        assert!(COPIES.is_multiple_of(2));
+        const { validate_copies::<COPIES>() };
 
         // Quorum formula: ⌈(COPIES + fault_tolerance) / 2⌉
         // - Verify: fault_tolerance = 1
@@ -77,6 +80,71 @@ impl Threshold {
             (Threshold::Open, 8) => 4,
             _ => unreachable!(),
         }
+    }
+}
+
+/// Tracks which superblock copies participate in a quorum decision.
+///
+/// Bit `i` indicates copy `i` is present. A bitset provides O(1) membership,
+/// 2-byte storage, and hardware `popcnt` for counting.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuorumCount(u16);
+
+impl QuorumCount {
+    /// Maximum valid copy index (0-15 for 16 copies).
+    const MAX_INDEX: u8 = 15;
+
+    /// Creates an empty set with no copies marked.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Marks copy `idx` as present in this quorum group.
+    ///
+    /// Idempotent: setting an already-set bit is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx > 15`.
+    #[inline]
+    pub fn set(&mut self, idx: u8) {
+        assert!(idx <= Self::MAX_INDEX);
+        self.0 |= 1u16 << idx;
+    }
+
+    /// Returns `true` if copy `idx` is marked present.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx > 15`.
+    #[inline]
+    pub fn is_set(&self, idx: u8) -> bool {
+        assert!(idx <= Self::MAX_INDEX);
+        self.0 & (1u16 << idx) != 0
+    }
+
+    /// Returns the number of copies marked present.
+    #[inline]
+    pub fn count(&self) -> u8 {
+        self.0.count_ones() as u8
+    }
+
+    /// Returns `true` if exactly copies 0..N are set, with no extras.
+    ///
+    /// This is stricter than `count() == N`: it verifies the set contains
+    /// precisely the expected indices. Used to confirm all expected copies
+    /// responded without spurious entries.
+    ///
+    /// # Compile-time constraint
+    ///
+    /// `N` must be ≤ 16.
+    #[inline]
+    pub fn full<const N: usize>(self) -> bool {
+        const { assert!(N <= (Self::MAX_INDEX as usize + 1)) };
+
+        let mask: u16 = if N == 16 { u16::MAX } else { (1u16 << N) - 1 };
+
+        (self.0 & mask) == mask && (self.0 & !mask) == 0
     }
 }
 
@@ -254,6 +322,70 @@ mod tests {
     /// Corrupts a header's checksum to make it invalid.
     fn corrupt_checksum(header: &mut SuperBlockHeader) {
         header.checksum ^= 1;
+    }
+
+    // =========================================================================
+    // QuorumCount Tests
+    // =========================================================================
+
+    #[test]
+    fn quorum_count_empty() {
+        let q = QuorumCount::empty();
+        assert_eq!(q.count(), 0);
+        assert!(q.full::<0>());
+        assert!(!q.full::<1>());
+    }
+
+    #[test]
+    fn quorum_count_set_is_set_and_count() {
+        let mut q = QuorumCount::empty();
+        q.set(0);
+        q.set(3);
+        q.set(15);
+        q.set(3);
+
+        assert!(q.is_set(0));
+        assert!(q.is_set(3));
+        assert!(q.is_set(15));
+        assert!(!q.is_set(1));
+        assert_eq!(q.count(), 3);
+    }
+
+    #[test]
+    fn quorum_count_full_prefix() {
+        let mut q = QuorumCount::empty();
+        q.set(0);
+        q.set(1);
+        q.set(2);
+
+        assert!(q.full::<3>());
+        assert!(!q.full::<4>());
+
+        q.set(4);
+        assert!(!q.full::<3>());
+    }
+
+    #[test]
+    fn quorum_count_full_16() {
+        let mut q = QuorumCount::empty();
+        for i in 0..16u8 {
+            q.set(i);
+        }
+        assert!(q.full::<16>());
+    }
+
+    #[test]
+    #[should_panic]
+    fn quorum_count_set_out_of_range_panics() {
+        let mut q = QuorumCount::empty();
+        q.set(16);
+    }
+
+    #[test]
+    #[should_panic]
+    fn quorum_count_is_set_out_of_range_panics() {
+        let q = QuorumCount::empty();
+        q.is_set(16);
     }
 
     // =========================================================================
