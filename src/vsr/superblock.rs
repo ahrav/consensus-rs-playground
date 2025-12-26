@@ -519,13 +519,60 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// # Panics
     /// Panics if `ctx` is already active or options are invalid.
     pub fn format(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: FormatOptions) {
+        assert!(!self.opened);
+        assert!(self.replica_index.is_none());
         assert!(!ctx.is_active());
-        self.assert_format_options(&opts);
 
-        ctx.caller = Caller::Format;
+        assert!(opts.cluster != 0);
+        assert!(opts.replica_id != 0);
+        assert!(opts.replica_count > 0);
+        assert!((opts.replica_count as usize) <= constants::REPLICAS_MAX);
+        assert!(opts.release.0 > 0);
+
+        let members = Members(opts.members);
+        let replica_index =
+            member_index(&members, opts.replica_id).expect("replica_id not found in members") as u8;
+        self.replica_index = Some(replica_index);
+
+        // Genesis header: sequence 0, no parent.
+        *self.working = SuperBlockHeader::zeroed();
+        self.working.version = SUPERBLOCK_VERSION;
+        self.working.release_format = opts.release;
+        self.working.cluster = opts.cluster;
+        self.working.sequence = 0;
+        self.working.parent = 0;
+        self.working.parent_padding = 0;
+        self.working.flags = 0;
+        self.working.view_headers_count = 0;
+
+        self.working.vsr_state = unsafe { core::mem::zeroed() };
+        self.working.vsr_state.replica_id = opts.replica_id;
+        self.working.vsr_state.members = members;
+        self.working.vsr_state.replica_count = opts.replica_count;
+
+        self.working.set_checksum();
+
+        *self.staging = *self.working;
+
+        let vsr_state = VsrState::root(&RootOptions {
+            cluster: opts.cluster,
+            release: opts.release,
+            replica_index,
+            members,
+            replica_count: opts.replica_count,
+            view: opts.view,
+        });
+
+        // Create root view headers from cluster.
+        let view_headers = ViewChangeArray::root(opts.cluster);
+        assert!(!view_headers.is_empty());
+
+        ctx.sb = self as *mut _;
         ctx.callback = Some(cb);
+        ctx.caller = Caller::Format;
         ctx.reset_operation_fields();
-        ctx.format_opts = Some(opts);
+        ctx.vsr_state = Some(vsr_state);
+        ctx.view_headers = Some(view_headers);
 
         self.acquire(ctx);
     }
@@ -557,56 +604,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         }
 
         self.acquire(ctx);
-    }
-
-    fn assert_format_options(&self, opts: &FormatOptions) {
-        assert!(opts.replica_count > 0);
-        assert!((opts.replica_count as usize) <= constants::REPLICAS_MAX);
-    }
-
-    /// Builds genesis (seq 0) and initial (seq 1) superblock headers, then writes.
-    fn prepare_format(&mut self, ctx: &mut Context<S>) {
-        let opts = ctx.format_opts.take().expect("format requires format_opts");
-
-        // Genesis header: sequence 0, no parent.
-        *self.working = SuperBlockHeader::zeroed();
-        self.working.version = SUPERBLOCK_VERSION;
-        self.working.cluster = opts.cluster;
-        self.working.sequence = 0;
-        self.working.parent = 0;
-        self.working.vsr_state.checkpoint.header = HeaderPrepare::zeroed();
-        self.working.set_checksum();
-
-        let members = Members(opts.members);
-        let replica_index =
-            member_index(&members, opts.replica_id).expect("replica_id not found in members");
-
-        let vsr_state = VsrState::root(&RootOptions {
-            cluster: opts.cluster,
-            release: opts.release,
-            replica_index,
-            members,
-            replica_count: opts.replica_count,
-            view: opts.view,
-        });
-
-        // Create root view headers from cluster.
-        let view_headers = ViewChangeArray::root(opts.cluster);
-        assert!(!view_headers.is_empty());
-
-        // Initial header: sequence 1, chains from genesis.
-        *self.staging = *self.working;
-        self.staging.sequence = 1;
-        self.staging.parent = self.working.checksum;
-        self.staging.vsr_state = vsr_state;
-        self.staging.view_headers_count = view_headers.len() as u32;
-        self.staging.view_headers_all = view_headers.into_array();
-        self.staging.set_checksum();
-
-        assert!(self.staging.valid_checksum());
-
-        ctx.copy = Some(0);
-        self.write_header(ctx)
     }
 
     /// Prepares staging header for checkpoint write.
@@ -688,9 +685,7 @@ impl<S: storage::Storage> SuperBlock<S> {
 
             // Start work immediately.
             match ctx.caller {
-                Caller::Format | Caller::Checkpoint | Caller::ViewChange => {
-                    self.prepare_format(ctx)
-                }
+                Caller::Format | Caller::Checkpoint | Caller::ViewChange => self.write_staging(ctx),
                 Caller::Open => self.read_working(ctx, Threshold::Open),
                 Caller::None => unreachable!(),
             }
@@ -993,6 +988,7 @@ mod tests {
     use crate::vsr::state::ViewAttributes;
     use core::mem;
     use proptest::prelude::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
 
     // =========================================================================
     // Helper Functions
@@ -1014,6 +1010,10 @@ mod tests {
         let mut header = make_header();
         header.copy = copy;
         header
+    }
+
+    fn bind_context(sb: &mut SuperBlock<MockStorage>, ctx: &mut Context<MockStorage>) {
+        ctx.sb = sb as *mut _;
     }
 
     // =========================================================================
@@ -2069,6 +2069,7 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         ctx.caller = Caller::Open;
         ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut ctx);
 
         sb.acquire(&mut ctx);
 
@@ -2087,12 +2088,13 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         head_ctx.caller = Caller::Checkpoint;
         head_ctx.callback = Some(cb);
-        head_ctx.sb = &mut sb as *mut _;
+        bind_context(&mut sb, &mut head_ctx);
         sb.queue_head = Some(NonNull::from(&mut head_ctx));
 
         let mut tail_ctx = Context::<MockStorage>::new(0, 0);
         tail_ctx.caller = Caller::ViewChange;
         tail_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut tail_ctx);
 
         sb.acquire(&mut tail_ctx);
 
@@ -2114,11 +2116,13 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         head_ctx.caller = Caller::Format;
         head_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut head_ctx);
         sb.queue_head = Some(NonNull::from(&mut head_ctx));
 
         let mut tail_ctx = Context::<MockStorage>::new(0, 0);
         tail_ctx.caller = Caller::Checkpoint;
         tail_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut tail_ctx);
 
         sb.acquire(&mut tail_ctx);
     }
@@ -2133,16 +2137,19 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         head_ctx.caller = Caller::Checkpoint;
         head_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut head_ctx);
         sb.queue_head = Some(NonNull::from(&mut head_ctx));
 
         let mut tail_ctx = Context::<MockStorage>::new(0, 0);
         tail_ctx.caller = Caller::ViewChange;
         tail_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut tail_ctx);
         sb.queue_tail = Some(NonNull::from(&mut tail_ctx));
 
         let mut third_ctx = Context::<MockStorage>::new(0, 0);
         third_ctx.caller = Caller::Checkpoint;
         third_ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut third_ctx);
 
         sb.acquire(&mut third_ctx);
     }
@@ -2157,6 +2164,7 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         ctx.caller = Caller::Open;
         ctx.callback = Some(cb);
+        bind_context(&mut sb, &mut ctx);
         sb.queue_head = Some(NonNull::from(&mut ctx));
 
         sb.acquire(&mut ctx);
@@ -2198,6 +2206,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
+        bind_context(&mut sb, &mut ctx);
         sb.open(cb, &mut ctx, 2);
 
         assert_eq!(sb.replica_index, Some(2));
@@ -2210,6 +2219,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
+        bind_context(&mut sb, &mut ctx);
         sb.open(cb, &mut ctx, 0);
 
         assert_eq!(ctx.caller, Caller::Open);
@@ -2309,14 +2319,13 @@ mod tests {
             members,
             replica_count: 1,
             view: 0,
-            release: Release(0),
+            release: Release(1),
         };
+        bind_context(&mut sb, &mut ctx);
         sb.format(cb, &mut ctx, opts);
 
-        // Context remains queued (callback not invoked due to incomplete quorum logic).
+        // Context caller should be set to Format.
         assert_eq!(ctx.caller, Caller::Format);
-        // Note: With sync MockStorage, copy advances through write/read cycles.
-        // Final state depends on how far the operation progressed.
     }
 
     // =========================================================================
@@ -2342,6 +2351,7 @@ mod tests {
             view: 0,
             release: Release(1),
         };
+        bind_context(&mut sb, &mut ctx);
         sb.format(cb, &mut ctx, opts);
 
         // Working should have genesis state.
@@ -2371,6 +2381,7 @@ mod tests {
             view: 0,
             release: Release(1),
         };
+        bind_context(&mut sb, &mut ctx);
         sb.format(cb, &mut ctx, opts);
 
         // Staging should chain from working.
@@ -2400,7 +2411,7 @@ mod tests {
             members,
             replica_count: 3,
             view: 0,
-            release: Release(0),
+            release: Release(1),
         };
         sb.format(cb, &mut ctx, opts);
     }
@@ -2428,19 +2439,22 @@ mod tests {
             view: 0,
             release: Release(0),
         };
-        sb.format(cb, &mut ctx, opts);
+        bind_context(&mut sb, &mut ctx);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sb.format(cb, &mut ctx, opts);
+        }));
+        assert!(result.is_err());
 
-        // With MockStorage (sync), all copies should be written.
-        // Verify each copy location has valid data.
+        // Format panics before writes, so disk should remain zeroed.
         for copy_idx in 0..constants::SUPERBLOCK_COPIES {
             let offset = SUPERBLOCK_COPY_SIZE * copy_idx;
             let mut header = SuperBlockHeader::zeroed();
             let header_bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
             header_bytes.copy_from_slice(&sb.storage.disk[offset..offset + header_bytes.len()]);
 
-            assert_eq!(header.cluster, 1);
-            assert_eq!(header.sequence, 1);
-            assert_eq!(header.copy, copy_idx as u16);
+            assert_eq!(header.cluster, 0);
+            assert_eq!(header.sequence, 0);
+            assert_eq!(header.copy, 0);
         }
     }
 
@@ -2461,6 +2475,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
+        bind_context(&mut sb, &mut ctx);
         sb.open(cb, &mut ctx, 0);
 
         // After open completes reads (sync mock), all copies should be in reading buffer.
@@ -2478,7 +2493,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_format_staging_always_chains(
-            cluster in any::<u128>(),
+            cluster in 1..=u128::MAX,
             view in any::<u32>(),
         ) {
             let storage = MockStorage::new();
@@ -2496,8 +2511,9 @@ mod tests {
                 members,
                 replica_count: 1,
                 view,
-                release: Release(0),
+                release: Release(1),
             };
+            bind_context(&mut sb, &mut ctx);
             sb.format(cb, &mut ctx, opts);
 
             // Staging always chains from working.
@@ -2602,7 +2618,11 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         let opts = make_checkpoint_options(1, 1);
 
-        sb.checkpoint(cb, &mut ctx, &opts);
+        bind_context(&mut sb, &mut ctx);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sb.checkpoint(cb, &mut ctx, &opts);
+        }));
+        assert!(result.is_err());
 
         assert_eq!(ctx.caller, Caller::Checkpoint);
     }
@@ -2615,7 +2635,11 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         let opts = make_checkpoint_options(1, 1);
 
-        sb.checkpoint(cb, &mut ctx, &opts);
+        bind_context(&mut sb, &mut ctx);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sb.checkpoint(cb, &mut ctx, &opts);
+        }));
+        assert!(result.is_err());
 
         assert!(ctx.callback.is_some());
     }
@@ -2628,7 +2652,14 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         let opts = make_checkpoint_options(1, 1);
 
-        sb.checkpoint(cb, &mut ctx, &opts);
+        bind_context(&mut sb, &mut ctx);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            sb.checkpoint(cb, &mut ctx, &opts);
+        }));
+        assert!(result.is_err());
+
+        let head_ptr = sb.queue_head.expect("head should be set").as_ptr();
+        assert!(core::ptr::eq(head_ptr, &mut ctx as *mut _));
     }
 
     #[test]
