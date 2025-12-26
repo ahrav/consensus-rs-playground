@@ -238,7 +238,7 @@ mod tests {
         header.version = constants::SUPERBLOCK_VERSION;
         header.cluster = cluster;
         header.sequence = sequence;
-        header.view_headers_all = ViewChangeArray::root(cluster);
+        header.view_headers_all = ViewChangeArray::root(cluster).into_array();
         header.set_checksum();
         header
     }

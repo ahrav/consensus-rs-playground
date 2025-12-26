@@ -251,6 +251,22 @@ impl ViewChangeArray {
         assert!(self.array.len() <= constants::VIEW_HEADERS_MAX);
         self.as_slice().verify()
     }
+
+    /// Converts to a fixed-size array for wire-format storage.
+    ///
+    /// Returns a `[HeaderPrepare; VIEW_HEADERS_MAX]` with valid headers copied
+    /// to the front and remaining slots zero-filled. Use [`Self::len()`] to
+    /// determine how many entries are valid.
+    ///
+    /// This method discards the [`ViewChangeCommand`]; callers storing the result
+    /// should preserve the command separately or reconstruct it from VSR state.
+    #[inline]
+    pub fn into_array(self) -> [HeaderPrepare; constants::VIEW_HEADERS_MAX] {
+        let mut result = [HeaderPrepare::zeroed(); constants::VIEW_HEADERS_MAX];
+        let slice = self.array.const_slice();
+        result[..slice.len()].copy_from_slice(slice);
+        result
+    }
 }
 
 impl std::fmt::Debug for ViewChangeArray {
@@ -481,6 +497,90 @@ mod tests {
                 std::mem::size_of::<HeaderPrepare>() * constants::VIEW_HEADERS_MAX <= 1024 * 1024
             );
         }
+    }
+
+    // --- ViewChangeArray::into_array Tests ---
+
+    #[test]
+    fn test_into_array_single_element() {
+        let array = ViewChangeArray::root(42);
+        assert_eq!(array.len(), 1);
+
+        let raw = array.into_array();
+
+        // First element should be the root header.
+        assert_eq!(raw[0].cluster, 42);
+        assert_eq!(raw[0].command, Command::Prepare);
+
+        // Remaining elements should be zeroed.
+        for header in &raw[1..] {
+            assert_eq!(header.checksum, 0);
+            assert_eq!(header.cluster, 0);
+        }
+    }
+
+    #[test]
+    fn test_into_array_multiple_elements() {
+        let headers: Vec<HeaderPrepare> = (0..5)
+            .map(|i| {
+                let mut h = header_prepare();
+                h.cluster = i as u128;
+                h
+            })
+            .collect();
+
+        let array = ViewChangeArray::init(ViewChangeCommand::StartView, &headers);
+        assert_eq!(array.len(), 5);
+
+        let raw = array.into_array();
+
+        // First 5 elements should match input.
+        for (i, header) in raw.iter().take(5).enumerate() {
+            assert_eq!(header.cluster, i as u128);
+        }
+
+        // Remaining elements should be zeroed.
+        for header in &raw[5..] {
+            assert_eq!(header.checksum, 0);
+        }
+    }
+
+    #[test]
+    fn test_into_array_full_capacity() {
+        let headers: Vec<HeaderPrepare> = (0..constants::VIEW_HEADERS_MAX)
+            .map(|i| {
+                let mut h = header_prepare();
+                h.cluster = i as u128;
+                h
+            })
+            .collect();
+
+        let array = ViewChangeArray::init(ViewChangeCommand::DoViewChange, &headers);
+        assert_eq!(array.len(), constants::VIEW_HEADERS_MAX);
+
+        let raw = array.into_array();
+
+        // All elements should match input.
+        for (i, header) in raw.iter().enumerate() {
+            assert_eq!(header.cluster, i as u128);
+        }
+    }
+
+    #[test]
+    fn test_into_array_preserves_header_data() {
+        let mut h = header_prepare();
+        h.cluster = 12345;
+        h.view = 99;
+        h.op = 1000;
+        h.commit = 500;
+
+        let array = ViewChangeArray::init(ViewChangeCommand::StartView, &[h]);
+        let raw = array.into_array();
+
+        assert_eq!(raw[0].cluster, 12345);
+        assert_eq!(raw[0].view, 99);
+        assert_eq!(raw[0].op, 1000);
+        assert_eq!(raw[0].commit, 500);
     }
 }
 
