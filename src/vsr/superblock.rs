@@ -508,13 +508,23 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.acquire(ctx);
     }
 
-    /// Initializes a fresh superblock with the given cluster configuration.
+    /// Initializes a new replica's superblock for first-time cluster membership.
     ///
-    /// Creates sequence 0 (genesis) in `working`, then sequence 1 with VSR state in `staging`.
-    /// Writes all copies and verifies via read-back. Invokes `cb` on completion.
+    /// Use [`open`](Self::open) instead for existing replicas recovering from storage.
+    /// Exactly one of `format` or `open` must be called before [`checkpoint`](Self::checkpoint).
+    ///
+    /// Writes all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES) copies, verifies via
+    /// read-back quorum, then invokes `cb`.
     ///
     /// # Panics
-    /// Panics if `ctx` is already active or options are invalid.
+    ///
+    /// - Superblock already initialized (`self.opened`)
+    /// - Context in use (`ctx.is_active()`)
+    /// - `opts.cluster == 0`
+    /// - `opts.replica_id == 0`
+    /// - `opts.replica_count == 0` or exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX)
+    /// - `opts.release.0 == 0`
+    /// - `opts.replica_id` not in `opts.members`
     pub fn format(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: FormatOptions) {
         assert!(!self.opened);
         assert!(self.replica_index.is_none());
@@ -582,9 +592,20 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// # Panics
     /// Panics if `ctx` is already active (reentrant use) or if checkpoint/view_change already active.
     pub fn checkpoint(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: &CheckpointOptions) {
+        assert!(self.opened);
+        assert!(self.replica_index.is_some());
         assert!(!ctx.is_active());
+
         assert!(!self.updating(Caller::Checkpoint));
         assert!(!self.updating(Caller::ViewChange));
+
+        assert!(opts.log_view <= opts.view);
+        assert!(opts.log_view >= self.staging.vsr_state.log_view);
+        assert!(opts.view >= self.staging.vsr_state.view);
+        assert!(opts.commit_max >= self.staging.vsr_state.commit_max);
+        assert!(opts.sync_op_min <= opts.sync_op_max);
+        assert!(opts.storage_size >= constants::DATA_FILE_SIZE_MIN);
+        assert!(opts.storage_size <= self.storage_size_limit);
 
         ctx.caller = Caller::Checkpoint;
         ctx.callback = Some(cb);
@@ -2569,21 +2590,36 @@ mod tests {
     /// Creates a minimal valid CheckpointOptions for testing.
     ///
     /// `op` must be > 0 to pass VsrState::update_for_checkpoint validation.
-    fn make_checkpoint_options(op: u64, commit_max: u64) -> CheckpointOptions<'static> {
+    fn make_checkpoint_options(
+        current: &VsrState,
+        op: u64,
+        commit_max: u64,
+    ) -> CheckpointOptions<'static> {
+        use crate::vsr::state::CheckpointState;
+
         let header = make_prepare_header(1, op);
 
+        let mut checkpoint = CheckpointState::zeroed();
+        checkpoint.header = header;
+        checkpoint.storage_size = constants::DATA_FILE_SIZE_MIN;
+        checkpoint.release = Release::ZERO;
+        checkpoint.parent_checkpoint_id = current.checkpoint.checkpoint_id();
+        checkpoint.grandparent_checkpoint_id = current.checkpoint.parent_checkpoint_id;
+        checkpoint.free_set_blocks_acquired_checksum = checksum(&[]);
+        checkpoint.free_set_blocks_released_checksum = checksum(&[]);
+        checkpoint.client_sessions_checksum = checksum(&[]);
+
         CheckpointOptions {
-            header,
+            checkpoint,
+            view: current.view,
+            log_view: current.log_view,
             view_attributes: None,
             commit_max,
             sync_op_min: 0,
             sync_op_max: 0,
-            manifest_references: (0, 0, 0, 0, 0),
-            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
-            free_set_released_references: (checksum(&[]), 0, 0, 0),
-            client_sessions_references: (checksum(&[]), 0, 0, 0),
             storage_size: constants::DATA_FILE_SIZE_MIN,
             release: Release::ZERO,
+            sync_checkpoint: false,
         }
     }
 
@@ -2618,6 +2654,10 @@ mod tests {
         // Staging mirrors working initially.
         *sb.staging = *sb.working;
 
+        // Mark as opened so checkpoint tests can proceed past the initial assertion.
+        sb.opened = true;
+        sb.replica_index = Some(0);
+
         sb
     }
 
@@ -2627,7 +2667,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         bind_context(&mut sb, &mut ctx);
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2644,7 +2684,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         bind_context(&mut sb, &mut ctx);
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2661,7 +2701,7 @@ mod tests {
         let mut ctx = Context::<MockStorage>::new(0, 0);
 
         let cb: Callback<MockStorage> = |_| {};
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         bind_context(&mut sb, &mut ctx);
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -2683,7 +2723,7 @@ mod tests {
         ctx.caller = Caller::Open;
 
         let cb: Callback<MockStorage> = |_| {};
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         // Should panic: context already active.
         sb.checkpoint(cb, &mut ctx, &opts);
@@ -2706,7 +2746,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2720,7 +2760,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2733,7 +2773,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2748,7 +2788,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(100, 100);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 100, 100);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2768,21 +2808,10 @@ mod tests {
             log_view: 40,
         };
 
-        let header = make_prepare_header(1, 1);
-
-        let opts = CheckpointOptions {
-            header,
-            view_attributes: Some(view_attrs),
-            commit_max: 1,
-            sync_op_min: 0,
-            sync_op_max: 0,
-            manifest_references: (0, 0, 0, 0, 0),
-            free_set_acquired_references: (checksum(&[]), 0, 0, 0),
-            free_set_released_references: (checksum(&[]), 0, 0, 0),
-            client_sessions_references: (checksum(&[]), 0, 0, 0),
-            storage_size: constants::DATA_FILE_SIZE_MIN,
-            release: crate::vsr::wire::header::Release::ZERO,
-        };
+        let mut opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
+        opts.view = 42;
+        opts.log_view = 40;
+        opts.view_attributes = Some(view_attrs);
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
@@ -2801,7 +2830,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2815,7 +2844,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2828,7 +2857,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2846,7 +2875,7 @@ mod tests {
 
         let mut ctx = Context::<MockStorage>::new(0, 0);
         setup_checkpoint_context(&mut sb, &mut ctx);
-        let opts = make_checkpoint_options(1, 1);
+        let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
         // Should panic on sequence overflow.
         prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
@@ -2868,7 +2897,7 @@ mod tests {
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
             setup_checkpoint_context(&mut sb, &mut ctx);
-            let opts = make_checkpoint_options(1, 1);
+            let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2886,7 +2915,7 @@ mod tests {
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
             setup_checkpoint_context(&mut sb, &mut ctx);
-            let opts = make_checkpoint_options(1, 1);
+            let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2905,7 +2934,7 @@ mod tests {
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
             setup_checkpoint_context(&mut sb, &mut ctx);
-            let opts = make_checkpoint_options(1, 1);
+            let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2920,7 +2949,7 @@ mod tests {
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
             setup_checkpoint_context(&mut sb, &mut ctx);
-            let opts = make_checkpoint_options(op, op);
+            let opts = make_checkpoint_options(&sb.working.vsr_state, op, op);
 
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
@@ -2938,7 +2967,7 @@ mod tests {
 
             let mut ctx = Context::<MockStorage>::new(0, 0);
             setup_checkpoint_context(&mut sb, &mut ctx);
-            let opts = make_checkpoint_options(1, 1);
+            let opts = make_checkpoint_options(&sb.working.vsr_state, 1, 1);
 
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
