@@ -496,6 +496,160 @@ impl<S: storage::Storage> SuperBlock<S> {
         sb
     }
 
+    // ------------------------------------------------------------------------
+    // Public API
+    // ------------------------------------------------------------------------
+
+    /// Opens an existing superblock by reading all copies and selecting via quorum.
+    ///
+    /// Reads all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES), selects the
+    /// authoritative state, and repairs any corrupted copies. Invokes `cb` on completion.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active or `replica_index` exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX).
+    pub fn open(&mut self, cb: Callback<S>, ctx: &mut Context<S>, replica_index: u8) {
+        assert!(!ctx.is_active());
+        assert!((replica_index as usize) < constants::REPLICAS_MAX);
+
+        self.replica_index = Some(replica_index);
+
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(cb);
+        ctx.reset_operation_fields();
+
+        self.acquire(ctx);
+    }
+
+    /// Initializes a fresh superblock with the given cluster configuration.
+    ///
+    /// Creates sequence 0 (genesis) in `working`, then sequence 1 with VSR state in `staging`.
+    /// Writes all copies and verifies via read-back. Invokes `cb` on completion.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active or options are invalid.
+    pub fn format(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: FormatOptions) {
+        assert!(!ctx.is_active());
+        self.assert_format_options(&opts);
+
+        ctx.caller = Caller::Format;
+        ctx.callback = Some(cb);
+        ctx.reset_operation_fields();
+        ctx.format_opts = Some(opts);
+
+        self.acquire(ctx);
+    }
+
+    /// Persists a checkpoint by writing a new superblock with incremented sequence.
+    ///
+    /// Queues the operation if another is in progress; executes immediately if at queue head.
+    /// Only one of {checkpoint, view_change} may be active/queued at once.
+    ///
+    /// # Panics
+    /// Panics if `ctx` is already active (reentrant use) or if checkpoint/view_change already active.
+    pub fn checkpoint(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: &CheckpointOptions) {
+        assert!(!ctx.is_active());
+        assert!(!self.updating(Caller::Checkpoint));
+        assert!(!self.updating(Caller::ViewChange));
+
+        ctx.caller = Caller::Checkpoint;
+        ctx.callback = Some(cb);
+        ctx.reset_operation_fields();
+
+        // Calculate VSR state immediately to capture intent.
+        let mut vsr_state = self.staging.vsr_state;
+        vsr_state.update_for_checkpoint(opts);
+        ctx.vsr_state = Some(vsr_state);
+
+        if let Some(view_attrs) = &opts.view_attributes {
+            assert!(!view_attrs.headers.is_empty());
+            ctx.view_headers = Some(*view_attrs.headers);
+        }
+
+        self.acquire(ctx);
+    }
+
+    fn assert_format_options(&self, opts: &FormatOptions) {
+        assert!(opts.replica_count > 0);
+        assert!((opts.replica_count as usize) <= constants::REPLICAS_MAX);
+    }
+
+    /// Builds genesis (seq 0) and initial (seq 1) superblock headers, then writes.
+    fn prepare_format(&mut self, ctx: &mut Context<S>) {
+        let opts = ctx.format_opts.take().expect("format requires format_opts");
+
+        // Genesis header: sequence 0, no parent.
+        *self.working = SuperBlockHeader::zeroed();
+        self.working.version = SUPERBLOCK_VERSION;
+        self.working.cluster = opts.cluster;
+        self.working.sequence = 0;
+        self.working.parent = 0;
+        self.working.vsr_state.checkpoint.header = HeaderPrepare::zeroed();
+        self.working.set_checksum();
+
+        let members = Members(opts.members);
+        let replica_index =
+            member_index(&members, opts.replica_id).expect("replica_id not found in members");
+
+        let vsr_state = VsrState::root(&RootOptions {
+            cluster: opts.cluster,
+            release: opts.release,
+            replica_index,
+            members,
+            replica_count: opts.replica_count,
+            view: opts.view,
+        });
+
+        // Create root view headers from cluster.
+        let view_headers = ViewChangeArray::root(opts.cluster);
+        assert!(!view_headers.is_empty());
+
+        // Initial header: sequence 1, chains from genesis.
+        *self.staging = *self.working;
+        self.staging.sequence = 1;
+        self.staging.parent = self.working.checksum;
+        self.staging.vsr_state = vsr_state;
+        self.staging.view_headers_count = view_headers.len() as u32;
+        self.staging.view_headers_all = view_headers.into_array();
+        self.staging.set_checksum();
+
+        assert!(self.staging.valid_checksum());
+        self.assert_staging_for_write(Caller::Format);
+
+        ctx.copy = Some(0);
+        self.write_headers(ctx)
+    }
+
+    /// Prepares staging header for checkpoint write.
+    ///
+    /// Chains from working header: copies state, increments sequence, updates parent checksum.
+    fn prepare_checkpoint(&mut self, ctx: &mut Context<S>) {
+        // Chain from current working header.
+        *self.staging = *self.working;
+        self.staging.sequence = self
+            .working
+            .sequence
+            .checked_add(1)
+            .expect("sequence overflow");
+        self.staging.parent = self.working.checksum;
+
+        // Apply captured VSR state.
+        self.staging.vsr_state = ctx.vsr_state.take().expect("checkpoint requires vsr_state");
+
+        // Apply view headers if provided.
+        if let Some(view_headers) = ctx.view_headers.take() {
+            self.staging.view_headers_count = view_headers.len() as u32;
+            self.staging.view_headers_all = view_headers.into_array();
+        }
+
+        self.staging.set_checksum();
+
+        assert!(self.staging.valid_checksum());
+        self.assert_staging_for_write(Caller::Checkpoint);
+
+        ctx.copy = Some(0);
+        self.write_headers(ctx)
+    }
+
     /// Validates queue consistency and replica index bounds.
     fn assert_invariants(&self) {
         // Tail can only exist if head exists.
@@ -519,6 +673,10 @@ impl<S: storage::Storage> SuperBlock<S> {
             assert_eq!(self.staging.parent, self.working.checksum);
         }
     }
+
+    // ------------------------------------------------------------------------
+    // Queueing (head + optional tail)
+    // ------------------------------------------------------------------------
 
     /// Returns true if an operation of the given type is in-flight or queued.
     fn updating(&self, caller: Caller) -> bool {
@@ -599,7 +757,7 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// # Panics
     ///
     /// Panics if `ctx` has no callback or is not the current queue head.
-    pub(crate) fn release(&mut self, ctx: &mut Context<S>) {
+    fn release(&mut self, ctx: &mut Context<S>) {
         assert!(ctx.caller != Caller::None);
         assert!(ctx.callback.is_some());
 
@@ -635,155 +793,9 @@ impl<S: storage::Storage> SuperBlock<S> {
         cb(ctx);
     }
 
-    /// Opens an existing superblock by reading all copies and selecting via quorum.
-    ///
-    /// Reads all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES), selects the
-    /// authoritative state, and repairs any corrupted copies. Invokes `cb` on completion.
-    ///
-    /// # Panics
-    /// Panics if `ctx` is already active or `replica_index` exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX).
-    pub fn open(&mut self, cb: Callback<S>, ctx: &mut Context<S>, replica_index: u8) {
-        assert!(!ctx.is_active());
-        assert!((replica_index as usize) < constants::REPLICAS_MAX);
-
-        self.replica_index = Some(replica_index);
-
-        ctx.caller = Caller::Open;
-        ctx.callback = Some(cb);
-        ctx.reset_operation_fields();
-
-        self.acquire(ctx);
-    }
-
-    /// Initializes a fresh superblock with the given cluster configuration.
-    ///
-    /// Creates sequence 0 (genesis) in `working`, then sequence 1 with VSR state in `staging`.
-    /// Writes all copies and verifies via read-back. Invokes `cb` on completion.
-    ///
-    /// # Panics
-    /// Panics if `ctx` is already active or options are invalid.
-    pub fn format(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: FormatOptions) {
-        assert!(!ctx.is_active());
-        self.assert_format_options(&opts);
-
-        ctx.caller = Caller::Format;
-        ctx.callback = Some(cb);
-        ctx.reset_operation_fields();
-        ctx.format_opts = Some(opts);
-
-        self.acquire(ctx);
-    }
-
-    fn assert_format_options(&self, opts: &FormatOptions) {
-        assert!(opts.replica_count > 0);
-        assert!((opts.replica_count as usize) <= constants::REPLICAS_MAX);
-    }
-
-    /// Builds genesis (seq 0) and initial (seq 1) superblock headers, then writes.
-    pub(crate) fn prepare_format(&mut self, ctx: &mut Context<S>) {
-        let opts = ctx.format_opts.take().expect("format requires format_opts");
-
-        // Genesis header: sequence 0, no parent.
-        *self.working = SuperBlockHeader::zeroed();
-        self.working.version = SUPERBLOCK_VERSION;
-        self.working.cluster = opts.cluster;
-        self.working.sequence = 0;
-        self.working.parent = 0;
-        self.working.vsr_state.checkpoint.header = HeaderPrepare::zeroed();
-        self.working.set_checksum();
-
-        let members = Members(opts.members);
-        let replica_index =
-            member_index(&members, opts.replica_id).expect("replica_id not found in members");
-
-        let vsr_state = VsrState::root(&RootOptions {
-            cluster: opts.cluster,
-            release: opts.release,
-            replica_index,
-            members,
-            replica_count: opts.replica_count,
-            view: opts.view,
-        });
-
-        // Create root view headers from cluster.
-        let view_headers = ViewChangeArray::root(opts.cluster);
-        assert!(!view_headers.is_empty());
-
-        // Initial header: sequence 1, chains from genesis.
-        *self.staging = *self.working;
-        self.staging.sequence = 1;
-        self.staging.parent = self.working.checksum;
-        self.staging.vsr_state = vsr_state;
-        self.staging.view_headers_count = view_headers.len() as u32;
-        self.staging.view_headers_all = view_headers.into_array();
-        self.staging.set_checksum();
-
-        assert!(self.staging.valid_checksum());
-        self.assert_staging_for_write(Caller::Format);
-
-        ctx.copy = Some(0);
-        self.write_headers(ctx)
-    }
-
-    /// Persists a checkpoint by writing a new superblock with incremented sequence.
-    ///
-    /// Queues the operation if another is in progress; executes immediately if at queue head.
-    /// Only one of {checkpoint, view_change} may be active/queued at once.
-    ///
-    /// # Panics
-    /// Panics if `ctx` is already active (reentrant use) or if checkpoint/view_change already active.
-    pub fn checkpoint(&mut self, cb: Callback<S>, ctx: &mut Context<S>, opts: &CheckpointOptions) {
-        assert!(!ctx.is_active());
-        assert!(!self.updating(Caller::Checkpoint));
-        assert!(!self.updating(Caller::ViewChange));
-
-        ctx.caller = Caller::Checkpoint;
-        ctx.callback = Some(cb);
-        ctx.reset_operation_fields();
-
-        // Calculate VSR state immediately to capture intent.
-        let mut vsr_state = self.staging.vsr_state;
-        vsr_state.update_for_checkpoint(opts);
-        ctx.vsr_state = Some(vsr_state);
-
-        if let Some(view_attrs) = &opts.view_attributes {
-            assert!(!view_attrs.headers.is_empty());
-            ctx.view_headers = Some(*view_attrs.headers);
-        }
-
-        self.acquire(ctx);
-    }
-
-    /// Prepares staging header for checkpoint write.
-    ///
-    /// Chains from working header: copies state, increments sequence, updates parent checksum.
-    pub(crate) fn prepare_checkpoint(&mut self, ctx: &mut Context<S>) {
-        // Chain from current working header.
-        *self.staging = *self.working;
-        self.staging.sequence = self
-            .working
-            .sequence
-            .checked_add(1)
-            .expect("sequence overflow");
-        self.staging.parent = self.working.checksum;
-
-        // Apply captured VSR state.
-        self.staging.vsr_state = ctx.vsr_state.take().expect("checkpoint requires vsr_state");
-
-        // Apply view headers if provided.
-        if let Some(view_headers) = ctx.view_headers.take() {
-            self.staging.view_headers_count = view_headers.len() as u32;
-            self.staging.view_headers_all = view_headers.into_array();
-        }
-
-        self.staging.set_checksum();
-
-        assert!(self.staging.valid_checksum());
-        self.assert_staging_for_write(Caller::Checkpoint);
-
-        ctx.copy = Some(0);
-        self.write_headers(ctx)
-    }
+    // ------------------------------------------------------------------------
+    // I/O state machine
+    // ------------------------------------------------------------------------
 
     /// Reads the next superblock copy into `self.reading[ctx.copy]`.
     ///
@@ -820,7 +832,7 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// Writes staging header to the next copy slot.
     ///
     /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
-    pub(crate) fn write_headers(&mut self, ctx: &mut Context<S>) {
+    fn write_headers(&mut self, ctx: &mut Context<S>) {
         ctx.assert_ready_for_write();
 
         let copy = ctx.copy.expect("copy must be Some for write");
@@ -880,6 +892,10 @@ impl<S: storage::Storage> SuperBlock<S> {
         ctx.copy = None;
         // sb.process_quorum(ctx, threshold);
     }
+
+    // ------------------------------------------------------------------------
+    // Storage callbacks
+    // ------------------------------------------------------------------------
 
     /// Callback invoked after each sector write completes.
     ///
