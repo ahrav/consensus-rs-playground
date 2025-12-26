@@ -409,18 +409,6 @@ impl<S: storage::Storage> Context<S> {
         // self.repairs = None;
     }
 
-    /// Panics if context is not ready to issue a read.
-    pub(super) fn assert_ready_for_read(&self) {
-        assert!(self.caller != Caller::None);
-        assert!(self.caller.expects_read());
-    }
-
-    /// Panics if context is not ready to issue a write.
-    pub(super) fn assert_ready_for_write(&self) {
-        assert!(self.caller != Caller::None);
-        assert!(self.caller.expects_write() || self.caller == Caller::Open);
-    }
-
     /// Panics if `copy` is out of bounds.
     pub(super) fn assert_valid_copy(&self) {
         if let Some(copy) = self.copy {
@@ -616,7 +604,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.staging.set_checksum();
 
         assert!(self.staging.valid_checksum());
-        self.assert_staging_for_write(Caller::Format);
 
         ctx.copy = Some(0);
         self.write_header(ctx)
@@ -647,7 +634,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.staging.set_checksum();
 
         assert!(self.staging.valid_checksum());
-        self.assert_staging_for_write(Caller::Checkpoint);
 
         ctx.copy = Some(0);
         self.write_header(ctx)
@@ -661,19 +647,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         }
         if let Some(idx) = self.replica_index {
             assert!((idx as usize) < constants::REPLICAS_MAX);
-        }
-    }
-
-    /// Validates staging header forms a valid chain from working.
-    ///
-    /// For `Open`: staging equals working (no pending changes).
-    /// For other callers: staging.sequence = working.sequence + 1, parent links correctly.
-    fn assert_staging_for_write(&self, caller: Caller) {
-        if caller == Caller::Open {
-            assert_eq!(self.staging.sequence, self.working.sequence);
-        } else {
-            assert_eq!(self.staging.sequence, self.working.sequence + 1);
-            assert_eq!(self.staging.parent, self.working.checksum);
         }
     }
 
@@ -845,22 +818,38 @@ impl<S: storage::Storage> SuperBlock<S> {
     ///
     /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
     fn write_header(&mut self, ctx: &mut Context<S>) {
-        ctx.assert_ready_for_write();
+        assert!(ctx.caller != Caller::None);
+        assert!(ctx.copy.is_some());
 
-        let copy = ctx.copy.expect("copy must be Some for write");
-        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+        if ctx.caller == Caller::Open {
+            assert_eq!(self.staging.sequence, self.working.sequence);
+        } else {
+            assert_eq!(self.staging.sequence, self.working.sequence + 1);
+            assert_eq!(self.staging.parent, self.working.checksum);
+            assert_eq!(self.staging.cluster, self.working.cluster);
+            assert_eq!(
+                self.staging.vsr_state.replica_id,
+                self.working.vsr_state.replica_id
+            );
+        };
 
-        self.assert_staging_for_write(ctx.caller);
+        assert!(self.staging.vsr_state.checkpoint.storage_size >= constants::DATA_FILE_SIZE_MIN);
+        assert!(
+            self.staging.vsr_state.checkpoint.storage_size <= constants::STORAGE_SIZE_LIMIT_MAX
+        );
+
+        let copy = ctx.copy.expect("copy must be Some for write") as usize;
+        assert!(copy < constants::SUPERBLOCK_COPIES);
 
         self.staging.copy = copy as u16;
         assert!(self.staging.valid_checksum());
 
-        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
-        let buf = unsafe { as_bytes_unchecked_mut(&mut *self.staging) };
         let offset = (SUPERBLOCK_COPY_SIZE as u64)
             .checked_mul(copy as u64)
             .expect("offset overflow");
 
+        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
+        let buf = unsafe { as_bytes_unchecked_mut(&mut *self.staging) };
         assert_bounds(offset, buf.len());
 
         self.storage.write_sectors(
@@ -875,21 +864,30 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// Reads the next superblock copy into `self.reading[ctx.copy]`.
     ///
     /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
-    fn read_working(&mut self, ctx: &mut Context<S>, _threshold: Threshold) {
-        ctx.assert_ready_for_read();
+    fn read_working(&mut self, ctx: &mut Context<S>, threshold: Threshold) {
+        assert!(ctx.caller != Caller::None);
+        assert!(ctx.copy.is_none());
+        assert!(ctx.read_threshold.is_none());
 
-        if ctx.copy.is_none() {
-            ctx.copy = Some(0);
-        }
+        // Clear reading buffer.
+        self.reading.fill(unsafe { core::mem::zeroed() });
 
-        let copy = ctx.copy.expect("copy must be Some after init");
-        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+        ctx.copy = Some(0);
+        ctx.read_threshold = Some(threshold);
+
+        self.read_header(ctx);
+    }
+
+    fn read_header(&mut self, ctx: &mut Context<S>) {
+        let copy = ctx.copy.expect("copy must be Some after init") as usize;
+        assert!(copy < constants::SUPERBLOCK_COPIES);
+        assert!(ctx.read_threshold.is_some());
 
         let offset = (SUPERBLOCK_COPY_SIZE as u64)
             .checked_mul(copy as u64)
             .expect("offset overflow");
 
-        let header_ref = &mut self.reading.as_mut()[copy as usize];
+        let header_ref = &mut self.reading.as_mut()[copy];
         // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
         let buf = unsafe { as_bytes_unchecked_mut(header_ref) };
 
@@ -902,39 +900,6 @@ impl<S: storage::Storage> SuperBlock<S> {
             S::SUPERBLOCK_ZONE,
             offset,
         );
-    }
-
-    /// Callback invoked after each sector read completes.
-    ///
-    /// Continues reading remaining copies or transitions to quorum processing.
-    fn read_header_callback(read: &mut S::Read) {
-        // SAFETY: Storage guarantees context pointer validity for callback duration.
-        let ctx = unsafe { S::context_from_read(read) };
-
-        assert!(!ctx.sb.is_null());
-
-        // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
-        let sb = unsafe { &mut *ctx.sb };
-
-        let threshold = if ctx.caller == Caller::Open {
-            Threshold::Open
-        } else {
-            Threshold::Verify
-        };
-
-        let copy = ctx.copy.expect("copy must be Some in read callback");
-        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
-
-        // Continue reading remaining copies.
-        if (copy as usize) + 1 < constants::SUPERBLOCK_COPIES {
-            ctx.copy = Some(copy + 1);
-            sb.read_working(ctx, threshold);
-            return;
-        }
-
-        // All copies read; proceed to quorum selection.
-        ctx.copy = None;
-        // sb.process_quorum(ctx, threshold);
     }
 
     // ------------------------------------------------------------------------
@@ -953,8 +918,8 @@ impl<S: storage::Storage> SuperBlock<S> {
         // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
         let sb = unsafe { &mut *ctx.sb };
 
-        let copy = ctx.copy.expect("copy must be Some in write callback");
-        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+        let copy = ctx.copy.expect("copy must be Some in write callback") as usize;
+        assert!(copy < constants::SUPERBLOCK_COPIES);
 
         if ctx.caller == Caller::Open {
             // Repair write completed.
@@ -963,14 +928,45 @@ impl<S: storage::Storage> SuperBlock<S> {
             return;
         }
 
-        if (copy as usize) + 1 == constants::SUPERBLOCK_COPIES {
+        if copy + 1 == constants::SUPERBLOCK_COPIES {
             // All copies written; verify by reading back.
             ctx.copy = None;
             sb.read_working(ctx, Threshold::Verify);
         } else {
-            ctx.copy = Some(copy + 1);
+            ctx.copy = Some((copy + 1) as u8);
             sb.write_header(ctx);
         }
+    }
+
+    /// Callback invoked after each sector read completes.
+    ///
+    /// Continues reading remaining copies or transitions to quorum processing.
+    fn read_header_callback(read: &mut S::Read) {
+        // SAFETY: Storage guarantees context pointer validity for callback duration.
+        let ctx = unsafe { S::context_from_read(read) };
+        assert!(!ctx.sb.is_null());
+
+        // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
+        let sb = unsafe { &mut *ctx.sb };
+
+        let _threshold = ctx
+            .read_threshold
+            .expect("missing threshold in read callback");
+        let copy = ctx.copy.expect("missing copy in read callback") as usize;
+        assert!(copy < constants::SUPERBLOCK_COPIES);
+
+        // Continue reading remaining copies.
+        if copy + 1 < constants::SUPERBLOCK_COPIES {
+            ctx.copy = Some((copy + 1) as u8);
+            sb.read_header(ctx);
+            return;
+        }
+
+        // All copies read; proceed to quorum selection.
+        ctx.copy = None;
+        ctx.read_threshold = None;
+
+        // sb.process_quorum(ctx, threshold);
     }
 }
 
@@ -1963,32 +1959,12 @@ mod tests {
         ctx.caller = Caller::Open;
         assert!(ctx.is_active());
 
-        // IO Readiness
-        ctx.assert_ready_for_read();
-        ctx.assert_ready_for_write();
-
         // Copy bounds
         ctx.copy = Some(0);
         ctx.assert_valid_copy();
 
         ctx.copy = Some((constants::SUPERBLOCK_COPIES - 1) as u8);
         ctx.assert_valid_copy();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_context_panic_on_invalid_read_state() {
-        let ctx = Context::<MockStorage>::new(0, 0);
-        // Caller is None
-        ctx.assert_ready_for_read();
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_context_panic_on_invalid_write_state() {
-        let ctx = Context::<MockStorage>::new(0, 0);
-        // Caller is None
-        ctx.assert_ready_for_write();
     }
 
     #[test]
@@ -2078,74 +2054,6 @@ mod tests {
         sb.queue_tail = Some(NonNull::from(&mut ctx));
 
         sb.assert_invariants();
-    }
-
-    // =========================================================================
-    // assert_staging_for_write() Tests
-    // =========================================================================
-
-    #[test]
-    fn test_assert_staging_for_write_open_caller() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-
-        sb.working.sequence = 5;
-        sb.staging.sequence = 5;
-
-        // Should not panic for Open when sequences match.
-        sb.assert_staging_for_write(Caller::Open);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_assert_staging_for_write_open_sequence_mismatch() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-
-        sb.working.sequence = 5;
-        sb.staging.sequence = 6;
-
-        sb.assert_staging_for_write(Caller::Open);
-    }
-
-    #[test]
-    fn test_assert_staging_for_write_format_caller() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-
-        sb.working.sequence = 0;
-        sb.working.set_checksum();
-        sb.staging.sequence = 1;
-        sb.staging.parent = sb.working.checksum;
-
-        // Should not panic for Format with proper chain.
-        sb.assert_staging_for_write(Caller::Format);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_assert_staging_for_write_format_wrong_sequence() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-
-        sb.working.sequence = 0;
-        sb.staging.sequence = 2; // Should be 1.
-
-        sb.assert_staging_for_write(Caller::Format);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_assert_staging_for_write_format_wrong_parent() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-
-        sb.working.sequence = 0;
-        sb.working.set_checksum();
-        sb.staging.sequence = 1;
-        sb.staging.parent = 0xDEADBEEF; // Wrong parent.
-
-        sb.assert_staging_for_write(Caller::Format);
     }
 
     // =========================================================================
