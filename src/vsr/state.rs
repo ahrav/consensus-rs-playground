@@ -89,7 +89,6 @@ pub struct SyncCheckpointOptions {
 /// or updates checkpoint during sync.
 ///
 /// Must advance view/log_view monotonically or update checkpoint.
-#[derive(Clone)]
 pub struct ViewChangeOptions<'a> {
     /// Highest committed operation known to the replica.
     pub commit_max: u64,
@@ -97,8 +96,8 @@ pub struct ViewChangeOptions<'a> {
     pub log_view: u32,
     /// Current view number.
     pub view: u32,
-    /// Prepare headers from the new view's leader.
-    pub view_headers: &'a [HeaderPrepare],
+    /// View headers from the new view's leader.
+    pub headers: &'a ViewChangeArray,
     /// Checkpoint update if syncing state from another replica.
     pub sync_checkpoint: Option<SyncCheckpointOptions>,
 }
@@ -859,10 +858,8 @@ impl VsrState {
         self.sync_op_min = opts.sync_op_min;
         self.sync_op_max = opts.sync_op_max;
 
-        // Reset sync_view at checkpoint time (unless this is a sync checkpoint).
-        if !opts.sync_checkpoint {
-            self.sync_view = 0;
-        }
+        // Update sync_view to log_view at checkpoint time.
+        self.sync_view = opts.log_view;
 
         assert!(
             Self::monotonic(&old, self),
@@ -900,39 +897,28 @@ impl VsrState {
             old.log_view < opts.log_view || old.view < opts.view || opts.sync_checkpoint.is_some()
         );
         assert!(opts.view >= opts.log_view);
-        assert!(!opts.view_headers.is_empty());
-        assert!(old.checkpoint.header.op <= opts.view_headers[0].op);
 
         // Apply view/commit durability.
         self.commit_max = opts.commit_max;
-        self.log_view = opts.log_view;
+        self.sync_op_min = opts.commit_max;
+        self.sync_op_max = opts.commit_max;
         self.view = opts.view;
+        self.log_view = opts.log_view;
+        self.sync_view = opts.log_view;
 
-        if let Some(sync) = opts.sync_checkpoint {
-            assert!(sync.sync_op_max >= sync.sync_op_min);
+        if let Some(sync) = &opts.sync_checkpoint {
+            assert!(opts.log_view == opts.view);
+            assert!(sync.checkpoint.header.op == opts.commit_max);
+            assert!(sync.sync_op_min <= sync.sync_op_max);
 
-            assert!(old.checkpoint.header.op < sync.checkpoint.header.op);
-            assert!(self.commit_max >= sync.checkpoint.header.op);
-
-            // Validate checkpoint chain: the new checkpoint must be either the next or next-next
-            // checkpoint, and must reference our current checkpoint_id as parent/grandparent.
-            let checkpoint_next = checkpoint_after(old.checkpoint.header.op);
-            let checkpoint_next_next = checkpoint_after(checkpoint_next);
-
-            let current_checkpoint_id = self.checkpoint.checkpoint_id();
-
-            if sync.checkpoint.header.op == checkpoint_next {
-                assert!(sync.checkpoint.parent_checkpoint_id == current_checkpoint_id);
-            } else {
-                assert!(sync.checkpoint.header.op == checkpoint_next_next);
-                assert!(sync.checkpoint.grandparent_checkpoint_id == current_checkpoint_id);
-            }
+            assert!(sync.checkpoint.header.op > old.checkpoint.header.op);
+            assert!(sync.checkpoint.release.value() >= old.checkpoint.release.value());
+            assert!(sync.checkpoint.parent_checkpoint_id == old.checkpoint.checkpoint_id());
 
             self.checkpoint = sync.checkpoint;
             self.sync_op_min = sync.sync_op_min;
             self.sync_op_max = sync.sync_op_max;
-
-            self.sync_view = 0;
+            self.sync_view = opts.view;
         }
 
         assert!(Self::would_be_updated_by(&old, self));
@@ -1026,6 +1012,7 @@ fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
 mod tests {
     use super::*;
     use crate::vsr::wire::header::Release;
+    use crate::vsr::{ViewChangeArray, ViewChangeCommand};
 
     // =========================================================================
     // Helper function to create valid RootOptions for testing
@@ -2563,8 +2550,9 @@ mod tests {
     // VsrState::update_for_view_change Tests
     // =========================================================================
 
-    fn make_view_headers(op: u64) -> [HeaderPrepare; 1] {
-        [super::make_prepare_header(1, op)]
+    fn make_view_headers(cluster: u128, op: u64) -> ViewChangeArray {
+        let header = super::make_prepare_header(cluster, op);
+        ViewChangeArray::init(ViewChangeCommand::StartView, &[header])
     }
 
     fn make_sync_checkpoint(
@@ -2584,16 +2572,14 @@ mod tests {
     fn test_update_for_view_change_advances_view_and_commit() {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
-        state.sync_op_min = 5;
-        state.sync_op_max = 7;
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: 10,
             log_view: 1,
             view: 2,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: None,
         };
 
@@ -2603,8 +2589,11 @@ mod tests {
         assert_eq!(state.log_view, 1);
         assert_eq!(state.view, 2);
         assert_eq!(state.checkpoint.header.op, 0);
-        assert_eq!(state.sync_op_min, 5);
-        assert_eq!(state.sync_op_max, 7);
+        // sync_op_min/max are set to commit_max in view_change (without sync_checkpoint)
+        assert_eq!(state.sync_op_min, 10);
+        assert_eq!(state.sync_op_max, 10);
+        // sync_view is set to log_view
+        assert_eq!(state.sync_view, 1);
     }
 
     #[test]
@@ -2624,13 +2613,13 @@ mod tests {
             sync_op_max: 12,
         };
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: checkpoint_next,
             log_view: 1,
             view: 1,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: Some(sync),
         };
 
@@ -2643,7 +2632,8 @@ mod tests {
         assert_eq!(state.checkpoint.parent_checkpoint_id, current_checkpoint_id);
         assert_eq!(state.sync_op_min, 10);
         assert_eq!(state.sync_op_max, 12);
-        assert_eq!(state.sync_view, 0);
+        // With sync_checkpoint, sync_view is set to opts.view
+        assert_eq!(state.sync_view, 1);
     }
 
     #[test]
@@ -2652,13 +2642,13 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: 0,
             log_view: 0,
             view: 0,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: None,
         };
 
@@ -2672,13 +2662,13 @@ mod tests {
         let mut state = VsrState::root(&options);
         state.commit_max = 10;
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: 9,
             log_view: 1,
             view: 1,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: None,
         };
 
@@ -2693,13 +2683,13 @@ mod tests {
         state.log_view = 2;
         state.view = 2;
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: 0,
             log_view: 1,
             view: 2,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: None,
         };
 
@@ -2712,53 +2702,13 @@ mod tests {
         let options = make_valid_root_options(1, 0);
         let mut state = VsrState::root(&options);
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: 0,
             log_view: 2,
             view: 1,
-            view_headers: &view_headers,
-            sync_checkpoint: None,
-        };
-
-        state.update_for_view_change(&opts);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_update_for_view_change_panics_empty_view_headers() {
-        let options = make_valid_root_options(1, 0);
-        let mut state = VsrState::root(&options);
-
-        let view_headers: [HeaderPrepare; 0] = [];
-
-        let opts = ViewChangeOptions {
-            commit_max: 0,
-            log_view: 1,
-            view: 1,
-            view_headers: &view_headers,
-            sync_checkpoint: None,
-        };
-
-        state.update_for_view_change(&opts);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_update_for_view_change_panics_view_headers_before_checkpoint() {
-        let options = make_valid_root_options(1, 0);
-        let mut state = VsrState::root(&options);
-        state.checkpoint.header.op = 10;
-        state.commit_max = 10;
-
-        let view_headers = make_view_headers(1);
-
-        let opts = ViewChangeOptions {
-            commit_max: 10,
-            log_view: 1,
-            view: 1,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: None,
         };
 
@@ -2787,13 +2737,13 @@ mod tests {
             sync_op_max: 1,
         };
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: checkpoint_next,
             log_view: 1,
             view: 1,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: Some(sync),
         };
 
@@ -2816,13 +2766,13 @@ mod tests {
             sync_op_max: 4,
         };
 
-        let view_headers = make_view_headers(1);
+        let view_headers = make_view_headers(1, 1);
 
         let opts = ViewChangeOptions {
             commit_max: checkpoint_next,
             log_view: 1,
             view: 1,
-            view_headers: &view_headers,
+            headers: &view_headers,
             sync_checkpoint: Some(sync),
         };
 

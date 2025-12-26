@@ -41,7 +41,7 @@ const _: () = {
 /// - **96-127**: Frame (Size, Epoch, View, Protocol).
 /// - **128-255**: Prepare-specific log data.
 #[repr(C, align(16))]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct HeaderPrepare {
     // --- Checksum region (offset 0-63) ---
     /// 128-bit checksum of header bytes 16-255.
