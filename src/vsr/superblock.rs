@@ -508,8 +508,9 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// # Panics
     /// Panics if `ctx` is already active or `replica_index` exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX).
     pub fn open(&mut self, cb: Callback<S>, ctx: &mut Context<S>, replica_index: u8) {
+        assert!(!self.opened);
+        assert!(self.replica_index.is_none());
         assert!(!ctx.is_active());
-        assert!((replica_index as usize) < constants::REPLICAS_MAX);
 
         self.replica_index = Some(replica_index);
 
