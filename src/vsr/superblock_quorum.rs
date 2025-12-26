@@ -51,7 +51,7 @@ pub enum Threshold {
 const fn validate_copies<const COPIES: usize>() {
     assert!(COPIES >= MIN_COPIES, "COPIES below minimum");
     assert!(COPIES <= MAX_COPIES, "COPIES exceeds maximum");
-    assert!(COPIES % 2 == 0, "COPIES must be even");
+    assert!(COPIES.is_multiple_of(2), "COPIES must be even");
 
     assert!(
         COPIES == 4 || COPIES == 6 || COPIES == 8,
