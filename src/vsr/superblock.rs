@@ -635,12 +635,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         cb(ctx);
     }
 
-    /// Returns true if `ctx` is at the head of the operation queue.
-    fn is_queue_head(&self, ctx: &Context<S>) -> bool {
-        self.queue_head
-            .is_some_and(|nn| core::ptr::eq(nn.as_ptr(), ctx))
-    }
-
     /// Opens an existing superblock by reading all copies and selecting via quorum.
     ///
     /// Reads all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES), selects the
@@ -1755,7 +1749,6 @@ mod tests {
         // Verification:
         // 1. Context should still be in queue (active) because the operation chain stops
         //    before calling the completion callback.
-        assert!(sb.is_queue_head(&ctx));
         assert!(ctx.is_active());
 
         // 2. Data should have been written to disk (since MockStorage is sync)
@@ -2022,19 +2015,6 @@ mod tests {
     }
 
     // =========================================================================
-    // Queue Operation Tests (is_queue_head)
-    // =========================================================================
-
-    #[test]
-    fn test_is_queue_head_empty_queue() {
-        let storage = MockStorage::new();
-        let sb = SuperBlock::new(storage);
-        let ctx = Context::<MockStorage>::new(0, 0);
-
-        assert!(!sb.is_queue_head(&ctx));
-    }
-
-    // =========================================================================
     // assert_invariants() Tests
     // =========================================================================
 
@@ -2204,7 +2184,6 @@ mod tests {
         let cb: Callback<MockStorage> = |_| {};
         sb.open(cb, &mut ctx, 0);
 
-        assert!(sb.is_queue_head(&ctx));
         assert_eq!(ctx.caller, Caller::Open);
         assert!(ctx.callback.is_some());
     }
@@ -2307,7 +2286,6 @@ mod tests {
         sb.format(cb, &mut ctx, opts);
 
         // Context remains queued (callback not invoked due to incomplete quorum logic).
-        assert!(sb.is_queue_head(&ctx));
         assert_eq!(ctx.caller, Caller::Format);
         // Note: With sync MockStorage, copy advances through write/read cycles.
         // Final state depends on how far the operation progressed.
@@ -2623,8 +2601,6 @@ mod tests {
         let opts = make_checkpoint_options(1, 1);
 
         sb.checkpoint(cb, &mut ctx, &opts);
-
-        assert!(sb.is_queue_head(&ctx));
     }
 
     #[test]
@@ -2918,8 +2894,6 @@ mod tests {
         ctx.sb = &mut sb as *mut _;
         sb.queue_head = Some(NonNull::from(&mut ctx));
 
-        assert!(sb.is_queue_head(&ctx));
-
         // Release should clear head, reset caller, and invoke callback.
         sb.release(&mut ctx);
 
@@ -2995,7 +2969,6 @@ mod tests {
         sb.queue_head = Some(NonNull::from(&mut ctx));
 
         assert!(ctx.is_active());
-        assert!(sb.is_queue_head(&ctx));
     }
 
     proptest! {
