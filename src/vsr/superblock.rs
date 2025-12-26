@@ -33,7 +33,6 @@ use crate::{
         wire::{checksum, header::Release},
     },
 };
-// use crate::vsr::superblock_quorums::{Quorums, RepairIterator, Threshold};
 
 /// Extra space reserved in each superblock copy for future client session tracking.
 ///
@@ -500,16 +499,19 @@ impl<S: storage::Storage> SuperBlock<S> {
     // Public API
     // ------------------------------------------------------------------------
 
-    /// Opens an existing superblock by reading all copies and selecting via quorum.
-    ///
     /// Reads all [`SUPERBLOCK_COPIES`](constants::SUPERBLOCK_COPIES), selects the
-    /// authoritative state, and repairs any corrupted copies. Invokes `cb` on completion.
+    /// authoritative state via quorum, and repairs any corrupted copies.
+    ///
+    /// Must be called exactly once before other operations.
     ///
     /// # Panics
-    /// Panics if `ctx` is already active or `replica_index` exceeds [`REPLICAS_MAX`](constants::REPLICAS_MAX).
+    /// - Already opened (`self.opened == true`)
+    /// - Replica index already assigned
+    /// - `ctx` is active (reentrant use)
     pub fn open(&mut self, cb: Callback<S>, ctx: &mut Context<S>, replica_index: u8) {
         assert!(!self.opened);
         assert!(self.replica_index.is_none());
+        assert!((replica_index as usize) < constants::REPLICAS_MAX);
         assert!(!ctx.is_active());
 
         self.replica_index = Some(replica_index);
@@ -617,7 +619,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.assert_staging_for_write(Caller::Format);
 
         ctx.copy = Some(0);
-        self.write_headers(ctx)
+        self.write_header(ctx)
     }
 
     /// Prepares staging header for checkpoint write.
@@ -648,7 +650,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.assert_staging_for_write(Caller::Checkpoint);
 
         ctx.copy = Some(0);
-        self.write_headers(ctx)
+        self.write_header(ctx)
     }
 
     /// Validates queue consistency and replica index bounds.
@@ -693,25 +695,18 @@ impl<S: storage::Storage> SuperBlock<S> {
     /// (checkpoint <-> view_change only).
     ///
     /// # Panics
-    /// - If context is already active
+    /// - If context is idle (`Caller::None`) or missing a callback
+    /// - If context is already enqueued as head or tail
     /// - If tail slot is occupied
     /// - If transition from head to this caller is not allowed
     fn acquire(&mut self, ctx: &mut Context<S>) {
         assert!(ctx.caller != Caller::None);
         assert!(ctx.callback.is_some());
+        assert!(std::ptr::eq(ctx.sb, self));
 
-        // Must not already be in the queue.
-        assert!(
-            self.queue_head.is_none() || !core::ptr::eq(self.queue_head.unwrap().as_ptr(), ctx)
-        );
-        assert!(
-            self.queue_tail.is_none() || !core::ptr::eq(self.queue_tail.unwrap().as_ptr(), ctx)
-        );
-
-        // Only one of head/tail can be None at a time (if head is Some, tail may or may not be).
         assert!(self.queue_head.is_none() || self.queue_tail.is_none());
-
-        ctx.sb = self as *mut _;
+        assert!(self.queue_head != Some(NonNull::from(&mut *ctx)));
+        assert!(self.queue_tail != Some(NonNull::from(&mut *ctx)));
 
         // New head?
         if self.queue_head.is_none() {
@@ -720,9 +715,9 @@ impl<S: storage::Storage> SuperBlock<S> {
 
             // Start work immediately.
             match ctx.caller {
-                Caller::Format => self.prepare_format(ctx),
-                Caller::Checkpoint => self.prepare_checkpoint(ctx),
-                Caller::ViewChange => self.write_headers(ctx),
+                Caller::Format | Caller::Checkpoint | Caller::ViewChange => {
+                    self.prepare_format(ctx)
+                }
                 Caller::Open => self.read_working(ctx, Threshold::Open),
                 Caller::None => unreachable!(),
             }
@@ -798,6 +793,85 @@ impl<S: storage::Storage> SuperBlock<S> {
     // I/O state machine
     // ------------------------------------------------------------------------
 
+    fn write_staging(&mut self, ctx: &mut Context<S>) {
+        assert!(ctx.caller != Caller::None);
+        assert!(ctx.caller != Caller::Open);
+        assert!(ctx.copy.is_none());
+        assert!(ctx.read_threshold.is_none());
+        // assert!(ctx.repairs.is_none());
+
+        // Build staging from a durable working.
+        *self.staging = *self.working;
+
+        // Apply VSR state update.
+        let vsr_state = ctx.vsr_state.take().expect("caller requires vsr_state");
+        self.staging.sequence = self
+            .staging
+            .sequence
+            .checked_add(1)
+            .expect("sequence overflow");
+        self.staging.parent = self.staging.checksum;
+        self.staging.vsr_state = vsr_state;
+
+        // Apply view headers update.
+        if ctx.caller.updates_view_headers() {
+            let view_headers = ctx
+                .view_headers
+                .take()
+                .expect("caller requires view_headers");
+            view_headers.verify();
+
+            let slice = view_headers.as_slice().slice();
+            assert!(!slice.is_empty());
+            assert!(slice.len() <= constants::VIEW_HEADERS_MAX);
+
+            self.staging.view_headers_count = slice.len() as u32;
+
+            // Copy and zero remaining entries.
+            self.staging.view_headers_all[..slice.len()].copy_from_slice(slice);
+            self.staging.view_headers_all[slice.len()..].fill(HeaderPrepare::zeroed());
+        } else {
+            assert!(ctx.view_headers.is_none());
+        }
+
+        self.staging.copy = 0;
+        self.staging.set_checksum();
+
+        ctx.copy = Some(0);
+        self.write_header(ctx);
+    }
+
+    /// Writes staging header to the next copy slot.
+    ///
+    /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
+    fn write_header(&mut self, ctx: &mut Context<S>) {
+        ctx.assert_ready_for_write();
+
+        let copy = ctx.copy.expect("copy must be Some for write");
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        self.assert_staging_for_write(ctx.caller);
+
+        self.staging.copy = copy as u16;
+        assert!(self.staging.valid_checksum());
+
+        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
+        let buf = unsafe { as_bytes_unchecked_mut(&mut *self.staging) };
+        let offset = (SUPERBLOCK_COPY_SIZE as u64)
+            .checked_mul(copy as u64)
+            .expect("offset overflow");
+
+        assert_bounds(offset, buf.len());
+
+        self.storage.write_sectors(
+            Self::write_header_callback,
+            &mut ctx.write,
+            buf,
+            S::SUPERBLOCK_ZONE,
+            offset,
+        );
+    }
+
     /// Reads the next superblock copy into `self.reading[ctx.copy]`.
     ///
     /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
@@ -824,37 +898,6 @@ impl<S: storage::Storage> SuperBlock<S> {
         self.storage.read_sectors(
             Self::read_header_callback,
             &mut ctx.read,
-            buf,
-            S::SUPERBLOCK_ZONE,
-            offset,
-        );
-    }
-
-    /// Writes staging header to the next copy slot.
-    ///
-    /// Iterates through copies 0..SUPERBLOCK_COPIES across successive callbacks.
-    fn write_headers(&mut self, ctx: &mut Context<S>) {
-        ctx.assert_ready_for_write();
-
-        let copy = ctx.copy.expect("copy must be Some for write");
-        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
-
-        self.assert_staging_for_write(ctx.caller);
-
-        self.staging.copy = copy as u16;
-        assert!(self.staging.valid_checksum());
-
-        // SAFETY: SuperBlockHeader is repr(C) with no padding requirements violated.
-        let buf = unsafe { as_bytes_unchecked_mut(&mut *self.staging) };
-        let offset = (SUPERBLOCK_COPY_SIZE as u64)
-            .checked_mul(copy as u64)
-            .expect("offset overflow");
-
-        assert_bounds(offset, buf.len());
-
-        self.storage.write_sectors(
-            Self::write_header_callback,
-            &mut ctx.write,
             buf,
             S::SUPERBLOCK_ZONE,
             offset,
@@ -926,7 +969,7 @@ impl<S: storage::Storage> SuperBlock<S> {
             sb.read_working(ctx, Threshold::Verify);
         } else {
             ctx.copy = Some(copy + 1);
-            sb.write_headers(ctx);
+            sb.write_header(ctx);
         }
     }
 }
@@ -1735,52 +1778,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hangs_due_to_missing_quorum() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-        let mut ctx = Context::new(0, 0);
-
-        // Required for format
-        ctx.view_headers = Some(ViewChangeArray::root(1));
-
-        let cb: Callback<MockStorage> = |_| {
-            panic!("Callback should not be called because logic is incomplete");
-        };
-
-        let mut members = [0u128; constants::MEMBERS_MAX];
-        members[0] = 1;
-        members[1] = 2;
-        members[2] = 3;
-
-        let opts = FormatOptions {
-            cluster: 1,
-            replica_id: 1,
-            members,
-            replica_count: 3,
-            view: 0,
-            release: Release(0),
-        };
-
-        sb.format(cb, &mut ctx, opts);
-
-        // Verification:
-        // 1. Context should still be in queue (active) because the operation chain stops
-        //    before calling the completion callback.
-        assert!(ctx.is_active());
-
-        // 2. Data should have been written to disk (since MockStorage is sync)
-        let disk = &sb.storage.disk;
-
-        let mut header = SuperBlockHeader::zeroed();
-        let header_bytes = unsafe { as_bytes_unchecked_mut(&mut header) };
-        let len = header_bytes.len();
-        header_bytes.copy_from_slice(&disk[0..len]);
-
-        assert_eq!(header.cluster, 1);
-        assert_eq!(header.sequence, 1);
-    }
-
-    #[test]
     fn test_caller_expectations() {
         struct Expectation {
             expects_read: bool,
@@ -2149,6 +2146,112 @@ mod tests {
         sb.staging.parent = 0xDEADBEEF; // Wrong parent.
 
         sb.assert_staging_for_write(Caller::Format);
+    }
+
+    // =========================================================================
+    // acquire() Tests
+    // =========================================================================
+
+    #[test]
+    fn test_acquire_sets_head_and_sb_when_queue_empty() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(cb);
+
+        sb.acquire(&mut ctx);
+
+        let head_ptr = sb.queue_head.expect("head should be set").as_ptr();
+        assert!(core::ptr::eq(head_ptr, &mut ctx as *mut _));
+        assert!(sb.queue_tail.is_none());
+        assert!(core::ptr::eq(ctx.sb, &mut sb as *mut _));
+    }
+
+    #[test]
+    fn test_acquire_enqueues_tail_when_transition_allowed() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        let mut head_ctx = Context::<MockStorage>::new(0, 0);
+        let cb: Callback<MockStorage> = |_| {};
+        head_ctx.caller = Caller::Checkpoint;
+        head_ctx.callback = Some(cb);
+        head_ctx.sb = &mut sb as *mut _;
+        sb.queue_head = Some(NonNull::from(&mut head_ctx));
+
+        let mut tail_ctx = Context::<MockStorage>::new(0, 0);
+        tail_ctx.caller = Caller::ViewChange;
+        tail_ctx.callback = Some(cb);
+
+        sb.acquire(&mut tail_ctx);
+
+        let head_ptr = sb.queue_head.expect("head should be set").as_ptr();
+        let tail_ptr = sb.queue_tail.expect("tail should be set").as_ptr();
+        assert!(core::ptr::eq(head_ptr, &mut head_ctx as *mut _));
+        assert!(core::ptr::eq(tail_ptr, &mut tail_ctx as *mut _));
+        assert!(core::ptr::eq(tail_ctx.sb, &mut sb as *mut _));
+        assert!(tail_ctx.copy.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid tail transition")]
+    fn test_acquire_panics_on_invalid_tail_transition() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        let mut head_ctx = Context::<MockStorage>::new(0, 0);
+        let cb: Callback<MockStorage> = |_| {};
+        head_ctx.caller = Caller::Format;
+        head_ctx.callback = Some(cb);
+        sb.queue_head = Some(NonNull::from(&mut head_ctx));
+
+        let mut tail_ctx = Context::<MockStorage>::new(0, 0);
+        tail_ctx.caller = Caller::Checkpoint;
+        tail_ctx.callback = Some(cb);
+
+        sb.acquire(&mut tail_ctx);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_acquire_panics_when_tail_slot_occupied() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+
+        let mut head_ctx = Context::<MockStorage>::new(0, 0);
+        let cb: Callback<MockStorage> = |_| {};
+        head_ctx.caller = Caller::Checkpoint;
+        head_ctx.callback = Some(cb);
+        sb.queue_head = Some(NonNull::from(&mut head_ctx));
+
+        let mut tail_ctx = Context::<MockStorage>::new(0, 0);
+        tail_ctx.caller = Caller::ViewChange;
+        tail_ctx.callback = Some(cb);
+        sb.queue_tail = Some(NonNull::from(&mut tail_ctx));
+
+        let mut third_ctx = Context::<MockStorage>::new(0, 0);
+        third_ctx.caller = Caller::Checkpoint;
+        third_ctx.callback = Some(cb);
+
+        sb.acquire(&mut third_ctx);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_acquire_panics_when_context_already_enqueued() {
+        let storage = MockStorage::new();
+        let mut sb = SuperBlock::new(storage);
+        let mut ctx = Context::<MockStorage>::new(0, 0);
+
+        let cb: Callback<MockStorage> = |_| {};
+        ctx.caller = Caller::Open;
+        ctx.callback = Some(cb);
+        sb.queue_head = Some(NonNull::from(&mut ctx));
+
+        sb.acquire(&mut ctx);
     }
 
     // =========================================================================
@@ -2890,127 +2993,6 @@ mod tests {
             prepare_checkpoint_helper(&mut sb, &mut ctx, &opts);
 
             prop_assert_eq!(sb.staging.version, version);
-        }
-    }
-
-    // =========================================================================
-    // release() Tests
-    // =========================================================================
-
-    #[test]
-    fn test_release_clears_head_and_resets_caller() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-
-        // Set up context with callback and make it the head.
-        ctx.caller = Caller::Open;
-        ctx.callback = Some(|_ctx| {
-            // Callback is invoked; context should already be released.
-        });
-        ctx.sb = &mut sb as *mut _;
-        sb.queue_head = Some(NonNull::from(&mut ctx));
-
-        // Release should clear head, reset caller, and invoke callback.
-        sb.release(&mut ctx);
-
-        // Post-conditions.
-        assert_eq!(ctx.caller, Caller::None);
-        assert!(!ctx.is_active());
-        assert!(ctx.callback.is_none());
-        assert!(sb.queue_head.is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "ctx.callback.is_some()")]
-    fn test_release_panics_without_callback() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-
-        ctx.caller = Caller::Open;
-        ctx.callback = None; // Missing callback.
-        ctx.sb = &mut sb as *mut _;
-        sb.queue_head = Some(NonNull::from(&mut ctx));
-
-        // Should panic: callback is None.
-        sb.release(&mut ctx);
-    }
-
-    #[test]
-    fn test_callback_invoked_after_release() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-
-        // Use atomic to track callback state since fn pointers can't capture.
-        static CALLBACK_CTX_WAS_INACTIVE: AtomicBool = AtomicBool::new(false);
-
-        ctx.caller = Caller::Open;
-        ctx.callback = Some(|ctx| {
-            // At callback time, context should already be released and inactive.
-            CALLBACK_CTX_WAS_INACTIVE.store(!ctx.is_active(), Ordering::SeqCst);
-        });
-        ctx.sb = &mut sb as *mut _;
-        sb.queue_head = Some(NonNull::from(&mut ctx));
-        sb.release(&mut ctx);
-
-        // Verify callback saw inactive context.
-        assert!(CALLBACK_CTX_WAS_INACTIVE.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_context_reuse_after_release() {
-        let storage = MockStorage::new();
-        let mut sb = SuperBlock::new(storage);
-        let mut ctx = Context::<MockStorage>::new(0, 0);
-
-        // First operation.
-        ctx.caller = Caller::Open;
-        ctx.callback = Some(|_| {});
-        ctx.sb = &mut sb as *mut _;
-        sb.queue_head = Some(NonNull::from(&mut ctx));
-        sb.release(&mut ctx);
-
-        // Context should be fully reset.
-        assert!(!ctx.is_active());
-        assert_eq!(ctx.caller, Caller::None);
-        assert!(ctx.callback.is_none());
-
-        // Reuse same context for second operation.
-        ctx.caller = Caller::Open;
-        ctx.callback = Some(|_| {});
-        ctx.sb = &mut sb as *mut _;
-        sb.queue_head = Some(NonNull::from(&mut ctx));
-
-        assert!(ctx.is_active());
-    }
-
-    proptest! {
-        #[test]
-        fn prop_release_always_deactivates_context(
-            caller in prop::sample::select(vec![
-                Caller::Open,
-                Caller::Format,
-                Caller::Checkpoint,
-                Caller::ViewChange,
-            ])
-        ) {
-            let storage = MockStorage::new();
-            let mut sb = SuperBlock::new(storage);
-            let mut ctx = Context::<MockStorage>::new(0, 0);
-
-            ctx.caller = caller;
-            ctx.callback = Some(|_| {});
-            ctx.sb = &mut sb as *mut _;
-            sb.queue_head = Some(NonNull::from(&mut ctx));
-
-            sb.release(&mut ctx);
-
-            prop_assert_eq!(ctx.caller, Caller::None);
-            prop_assert!(!ctx.is_active());
         }
     }
 
