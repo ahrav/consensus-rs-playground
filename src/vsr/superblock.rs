@@ -320,6 +320,26 @@ pub enum Caller {
 }
 
 impl Caller {
+    fn updates_view_headers(&self) -> bool {
+        match self {
+            Caller::Format | Caller::Checkpoint | Caller::ViewChange => true,
+            Caller::Open => false,
+            Caller::None => false,
+        }
+    }
+
+    /// Allowed tail caller transitions.
+    /// checkpoint -> view_change
+    /// view_change -> checkpoint
+    fn tail_allowed(&self) -> &'static [Caller] {
+        match self {
+            Caller::Checkpoint => &[Caller::ViewChange],
+            Caller::ViewChange => &[Caller::Checkpoint],
+            Caller::Format | Caller::Open => &[],
+            Caller::None => &[],
+        }
+    }
+
     /// Returns `true` if this operation writes superblock copies.
     pub(super) fn expects_write(&self) -> bool {
         matches!(
@@ -353,12 +373,11 @@ pub type Callback<S> = fn(&mut Context<S>);
 /// heap allocation for the callback context.
 #[repr(C)]
 pub struct Context<S: storage::Storage> {
+    pub(super) sb: *mut SuperBlock<S>,
     /// Which operation owns this context, or `None` if idle.
     pub(super) caller: Caller,
     /// Invoked when the operation completes (success or failure).
     pub(super) callback: Option<Callback<S>>,
-    /// Which superblock copy (0..SUPERBLOCK_COPIES) is being accessed.
-    pub(super) copy: Option<u8>,
 
     /// Embedded read iocb for `container_of!` recovery.
     pub(super) read: S::Read,
@@ -367,6 +386,8 @@ pub struct Context<S: storage::Storage> {
 
     /// Updated VSR state to persist (for write operations).
     pub(super) vsr_state: Option<VsrState>,
+    /// Which superblock copy (0..SUPERBLOCK_COPIES) is being accessed.
+    pub(super) copy: Option<u8>,
     /// View change headers to persist (for view change operations).
     pub(super) view_headers: Option<ViewChangeArray>,
     /// Format options to persist (for format operations).
@@ -374,7 +395,6 @@ pub struct Context<S: storage::Storage> {
     // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
     /// Intrusive linked list pointer for context pooling.
     pub(super) next: Option<NonNull<Context<S>>>,
-    pub(super) sb: *mut SuperBlock<S>,
 }
 
 impl<S: storage::Storage> Context<S> {
@@ -1821,21 +1841,171 @@ mod tests {
 
     #[test]
     fn test_caller_expectations() {
-        // None expects nothing
-        assert!(!Caller::None.expects_read());
-        assert!(!Caller::None.expects_write());
+        struct Expectation {
+            expects_read: bool,
+            expects_write: bool,
+            updates_view_headers: bool,
+            tail_allowed: &'static [Caller],
+        }
 
-        // Open expects read
-        assert!(Caller::Open.expects_read());
-        // Open does not "expect" write (in the sense of being a write op),
-        // but can write (repair).
-        assert!(!Caller::Open.expects_write());
+        let cases = [
+            (
+                Caller::Open,
+                Expectation {
+                    expects_read: true,
+                    expects_write: false,
+                    updates_view_headers: false,
+                    tail_allowed: &[],
+                },
+            ),
+            (
+                Caller::Format,
+                Expectation {
+                    expects_read: true,
+                    expects_write: true,
+                    updates_view_headers: true,
+                    tail_allowed: &[],
+                },
+            ),
+            (
+                Caller::Checkpoint,
+                Expectation {
+                    expects_read: true,
+                    expects_write: true,
+                    updates_view_headers: true,
+                    tail_allowed: &[Caller::ViewChange],
+                },
+            ),
+            (
+                Caller::ViewChange,
+                Expectation {
+                    expects_read: true,
+                    expects_write: true,
+                    updates_view_headers: true,
+                    tail_allowed: &[Caller::Checkpoint],
+                },
+            ),
+        ];
 
-        // Write operations
-        for caller in [Caller::Format, Caller::Checkpoint, Caller::ViewChange] {
-            // Updated behavior: write operations verify their writes by reading back
-            assert!(caller.expects_read());
-            assert!(caller.expects_write());
+        for (caller, expect) in cases {
+            assert_eq!(
+                caller.expects_read(),
+                expect.expects_read,
+                "{:?} expects_read mismatch",
+                caller
+            );
+            assert_eq!(
+                caller.expects_write(),
+                expect.expects_write,
+                "{:?} expects_write mismatch",
+                caller
+            );
+            assert_eq!(
+                caller.updates_view_headers(),
+                expect.updates_view_headers,
+                "{:?} updates_view_headers mismatch",
+                caller
+            );
+            assert_eq!(
+                caller.tail_allowed(),
+                expect.tail_allowed,
+                "{:?} tail_allowed mismatch",
+                caller
+            );
+        }
+    }
+
+    /// Helper to generate arbitrary Caller values for proptest.
+    fn arb_caller() -> impl proptest::strategy::Strategy<Value = Caller> {
+        prop::sample::select(vec![
+            Caller::None,
+            Caller::Open,
+            Caller::Format,
+            Caller::Checkpoint,
+            Caller::ViewChange,
+        ])
+    }
+
+    proptest! {
+        #[test]
+        fn prop_expects_write_implies_expects_read(caller in arb_caller()) {
+            // Invariant: write operations always verify via read-back.
+            if caller.expects_write() {
+                prop_assert!(
+                    caller.expects_read(),
+                    "{:?} expects write but not read",
+                    caller
+                );
+            }
+        }
+
+        #[test]
+        fn prop_updates_view_headers_implies_expects_write(caller in arb_caller()) {
+            // Invariant: updating view headers requires a write operation.
+            if caller.updates_view_headers() {
+                prop_assert!(
+                    caller.expects_write(),
+                    "{:?} updates view headers but doesn't write",
+                    caller
+                );
+            }
+        }
+
+        #[test]
+        fn prop_tail_allowed_implies_expects_write(caller in arb_caller()) {
+            // Invariant: only write operations can have tail transitions.
+            if !caller.tail_allowed().is_empty() {
+                prop_assert!(
+                    caller.expects_write(),
+                    "{:?} has tail transitions but doesn't write",
+                    caller
+                );
+            }
+        }
+
+        #[test]
+        fn prop_no_self_transition(caller in arb_caller()) {
+            // Invariant: no caller can transition to itself.
+            prop_assert!(
+                !caller.tail_allowed().contains(&caller),
+                "{:?} allows self-transition",
+                caller
+            );
+        }
+
+        #[test]
+        fn prop_none_is_completely_idle(caller in Just(Caller::None)) {
+            // Invariant: None has no expectations or transitions.
+            prop_assert!(!caller.expects_read());
+            prop_assert!(!caller.expects_write());
+            prop_assert!(!caller.updates_view_headers());
+            prop_assert!(caller.tail_allowed().is_empty());
+        }
+
+        #[test]
+        fn prop_tail_allowed_targets_are_write_operations(caller in arb_caller()) {
+            // Invariant: tail transitions target only write operations.
+            for target in caller.tail_allowed() {
+                prop_assert!(
+                    target.expects_write(),
+                    "{:?} -> {:?} but target doesn't expect write",
+                    caller,
+                    target
+                );
+            }
+        }
+
+        #[test]
+        fn prop_write_operations_update_view_headers(caller in arb_caller()) {
+            // Current design: all write operations update view headers.
+            // This test documents the current behavior.
+            if caller.expects_write() {
+                prop_assert!(
+                    caller.updates_view_headers(),
+                    "{:?} expects write but doesn't update view headers",
+                    caller
+                );
+            }
         }
     }
 
