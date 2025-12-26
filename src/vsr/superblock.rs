@@ -564,7 +564,7 @@ impl<S: storage::Storage> SuperBlock<S> {
 
         let allowed = head.caller.tail_allowed();
         assert!(
-            allowed.iter().any(|&c| c == ctx.caller),
+            allowed.contains(&ctx.caller),
             "invalid tail transition: {:?} -> {:?}",
             head.caller,
             ctx.caller
@@ -795,7 +795,7 @@ impl<S: storage::Storage> SuperBlock<S> {
 
             // Reverse transition check (matches superblock.zig's `transitions()` assertion).
             assert!(
-                tail_ctx.caller.tail_allowed().iter().any(|&c| c == caller),
+                tail_ctx.caller.tail_allowed().contains(&caller),
                 "invalid queued transition at release: {:?} -> {:?}",
                 caller,
                 tail_ctx.caller
