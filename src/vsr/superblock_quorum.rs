@@ -880,6 +880,127 @@ mod tests {
             repairs.sort();
             assert_eq!(repairs, vec![0, 2, 3]);
         }
+
+        // =====================================================================
+        // Quorum.repairs() Integration Tests
+        // =====================================================================
+
+        #[test]
+        fn quorum_repairs_all_correct_slots() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [Some(0), Some(1), Some(2), Some(3)],
+            };
+            for i in 0..4 {
+                q.copies.set(i);
+            }
+
+            let repairs: Vec<u8> = q.repairs().collect();
+            assert_eq!(repairs.len(), 0, "No repairs needed when all slots correct");
+        }
+
+        #[test]
+        fn quorum_repairs_sparse_slots() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [Some(0), None, Some(2), None],
+            };
+            q.copies.set(0);
+            q.copies.set(2);
+
+            let mut repairs: Vec<u8> = q.repairs().collect();
+            repairs.sort();
+            assert_eq!(repairs, vec![1, 3], "Should repair empty slots");
+        }
+
+        #[test]
+        fn quorum_repairs_with_misdirected_copies() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                // All copies present but in wrong slots (cycle)
+                slots: [Some(1), Some(0), Some(3), Some(2)],
+            };
+            q.copies.set(0);
+            q.copies.set(1);
+            q.copies.set(2);
+            q.copies.set(3);
+
+            let repairs: Vec<u8> = q.repairs().collect();
+            // All copies exist, just misdirected - no repairs possible
+            assert_eq!(repairs.len(), 0);
+        }
+
+        #[test]
+        fn quorum_repairs_with_duplicates_and_missing() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                // Slot 0 and 1 both have copy 0; copy 1 missing
+                slots: [Some(0), Some(0), Some(2), Some(3)],
+            };
+            q.copies.set(0);
+            q.copies.set(2);
+            q.copies.set(3);
+
+            let repairs: Vec<u8> = q.repairs().collect();
+            assert_eq!(repairs, vec![1], "Should repair slot 1 (duplicate)");
+        }
+
+        #[test]
+        fn quorum_repairs_6_copies() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<6> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [Some(0), Some(1), None, Some(3), None, Some(5)],
+            };
+            q.copies.set(0);
+            q.copies.set(1);
+            q.copies.set(3);
+            q.copies.set(5);
+
+            let mut repairs: Vec<u8> = q.repairs().collect();
+            repairs.sort();
+            assert_eq!(repairs, vec![2, 4], "Should repair empty slots 2 and 4");
+        }
+
+        #[test]
+        fn quorum_repairs_8_copies() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<8> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [
+                    Some(0),
+                    Some(1),
+                    Some(2),
+                    Some(3),
+                    Some(4),
+                    Some(5),
+                    Some(6),
+                    Some(7),
+                ],
+            };
+            for i in 0..8 {
+                q.copies.set(i);
+            }
+
+            let repairs: Vec<u8> = q.repairs().collect();
+            assert_eq!(repairs.len(), 0, "No repairs needed when all slots correct");
+        }
     }
 
     // =========================================================================
@@ -1053,6 +1174,219 @@ mod tests {
 
             // Should repair missing copies.
             assert_eq!(repairs, vec![0, 1, 2, 3, 7]);
+        }
+
+        #[test]
+        fn all_empty_slots() {
+            let slots: [Option<u8>; 4] = [None, None, None, None];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 4);
+            for i in 0..4u8 {
+                assert!(repairs.contains(&i));
+            }
+        }
+
+        #[test]
+        fn all_empty_slots_6_copies() {
+            let slots: [Option<u8>; 6] = [None, None, None, None, None, None];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 6);
+            for i in 0..6u8 {
+                assert!(repairs.contains(&i));
+            }
+        }
+
+        #[test]
+        fn all_empty_slots_8_copies() {
+            let slots: [Option<u8>; 8] = [None, None, None, None, None, None, None, None];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 8);
+            for i in 0..8u8 {
+                assert!(repairs.contains(&i));
+            }
+        }
+
+        #[test]
+        fn disjoint_swap_cycles_no_repairs() {
+            // Two independent swap cycles: 0↔1 and 2↔3
+            let slots = [Some(1), Some(0), Some(3), Some(2)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 0);
+
+            let (copies_any, _) = RepairIterator::new(slots).compute_copy_sets();
+            for i in 0..4u8 {
+                assert!(copies_any.is_set(i));
+            }
+        }
+
+        #[test]
+        fn missing_copy_repaired_before_misdirected() {
+            // Slot 0: empty, copy 0 exists in slot 2
+            // Slot 1: empty, copy 1 missing entirely
+            // Slot 2: has copy 0 (misdirected)
+            // Slot 3: correct
+            let slots = [None, None, Some(0), Some(3)];
+            let mut iter = RepairIterator::new(slots);
+
+            // Missing copy repaired first
+            let first = iter.next().unwrap();
+            assert_eq!(first, 1);
+
+            // Then misdirected
+            let second = iter.next().unwrap();
+            assert_eq!(second, 0);
+
+            // Copy 0 now duplicated, slot 2 repaired
+            let third = iter.next().unwrap();
+            assert_eq!(third, 2);
+
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn repair_creates_duplicate_enabling_next_repair() {
+            // [None, Some(0), Some(2), Some(3)]
+            // Repairing slot 0 creates duplicate of copy 0, enabling slot 1 repair
+            let slots = [None, Some(0), Some(2), Some(3)];
+            let mut iter = RepairIterator::new(slots);
+
+            let first = iter.next().unwrap();
+            assert_eq!(first, 0);
+            assert_eq!(iter.slots[0], Some(0));
+
+            let second = iter.next().unwrap();
+            assert_eq!(second, 1);
+
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn multi_step_repair_sequence() {
+            // [Some(2), Some(0), None, None]
+            // Sequence: slot 3 (missing), slot 2 (misdirected), slot 0 (dup), slot 1 (dup)
+            let slots = [Some(2), Some(0), None, None];
+            let mut iter = RepairIterator::new(slots);
+
+            assert_eq!(iter.next().unwrap(), 3);
+            assert_eq!(iter.next().unwrap(), 2);
+            assert_eq!(iter.next().unwrap(), 0);
+            assert_eq!(iter.next().unwrap(), 1);
+            assert_eq!(iter.next(), None);
+
+            let (copies_any, _) = iter.compute_copy_sets();
+            assert!(copies_any.full::<4>());
+        }
+
+        #[test]
+        fn single_duplicate_repair() {
+            let slots = [Some(0), Some(0), Some(2), Some(3)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs, vec![1]);
+        }
+
+        #[test]
+        fn single_empty_slot_repair() {
+            let slots = [Some(0), None, Some(2), Some(3)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs, vec![1]);
+        }
+
+        #[test]
+        fn swapped_pair_no_repair() {
+            // Slots 0 and 1 swapped, all copies present
+            let slots = [Some(1), Some(0), Some(2), Some(3)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 0);
+        }
+
+        #[test]
+        fn triple_duplicate() {
+            let slots = [None, Some(1), Some(1), Some(1)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 3);
+            assert!(repairs.contains(&0));
+            assert!(repairs.contains(&2));
+            assert!(repairs.contains(&3));
+            assert!(!repairs.contains(&1));
+        }
+
+        #[test]
+        fn quadruple_duplicate_copies_8() {
+            let slots = [None, None, None, None, Some(7), Some(7), Some(7), Some(7)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 7);
+            for i in 0..7u8 {
+                assert!(repairs.contains(&i));
+            }
+            assert!(!repairs.contains(&7));
+        }
+
+        #[test]
+        fn all_same_copy_non_zero() {
+            let slots = [Some(2), Some(2), Some(2), Some(2)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 3);
+            assert!(repairs.contains(&0));
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&3));
+            assert!(!repairs.contains(&2));
+        }
+
+        #[test]
+        fn copies_6_mixed_duplicates_and_missing() {
+            // Slot 0: correct, Slot 1: dup of 0, Slot 2: empty
+            // Slot 3-4: dup of 5, Slot 5: correct
+            let slots = [Some(0), Some(0), None, Some(5), Some(5), Some(5)];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 4);
+            assert!(!repairs.contains(&0));
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&2));
+            assert!(repairs.contains(&3));
+            assert!(repairs.contains(&4));
+            assert!(!repairs.contains(&5));
+        }
+
+        #[test]
+        fn copies_8_mixed_scenario() {
+            // Correct: 0, 1, 5. Duplicates of 1: slots 2, 3. Empty: 4, 6, 7.
+            let slots = [
+                Some(0),
+                Some(1),
+                Some(1),
+                Some(1),
+                None,
+                Some(5),
+                None,
+                None,
+            ];
+            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+
+            assert_eq!(repairs.len(), 5);
+            assert!(repairs.contains(&4));
+            assert!(repairs.contains(&6));
+            assert!(repairs.contains(&7));
+            assert!(repairs.contains(&2));
+            assert!(repairs.contains(&3));
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn panics_on_out_of_bounds_copy() {
+            let slots = [Some(0), Some(5), Some(2), Some(3)];
+            let mut iter = RepairIterator::new(slots);
+            let _ = iter.next();
         }
 
         mod compute_copy_sets {
