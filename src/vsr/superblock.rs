@@ -3263,7 +3263,10 @@ mod tests {
     }
 
     /// Creates N valid headers with the same sequence (for quorum testing).
-    fn make_quorum_headers(sequence: u64, cluster: u128) -> [SuperBlockHeader; constants::SUPERBLOCK_COPIES] {
+    fn make_quorum_headers(
+        sequence: u64,
+        cluster: u128,
+    ) -> [SuperBlockHeader; constants::SUPERBLOCK_COPIES] {
         let mut headers = [SuperBlockHeader::zeroed(); constants::SUPERBLOCK_COPIES];
         for (i, header) in headers.iter_mut().enumerate() {
             header.version = constants::SUPERBLOCK_VERSION;
@@ -3512,7 +3515,10 @@ mod tests {
             assert_eq!(disk_header.sequence, 1); // Format creates sequence 1.
             assert_eq!(disk_header.copy, copy_idx as u16);
             // Checksum should match working (except copy field is normalized).
-            assert_eq!(disk_header.calculate_checksum(), sb.working.calculate_checksum());
+            assert_eq!(
+                disk_header.calculate_checksum(),
+                sb.working.calculate_checksum()
+            );
         }
 
         // Verify working state.
@@ -3589,7 +3595,10 @@ mod tests {
             let disk_header = read_header_from_disk(&sb.storage, copy_idx);
             assert!(disk_header.valid_checksum());
             assert_eq!(disk_header.sequence, initial_sequence + 1);
-            assert_eq!(disk_header.calculate_checksum(), sb.working.calculate_checksum());
+            assert_eq!(
+                disk_header.calculate_checksum(),
+                sb.working.calculate_checksum()
+            );
         }
     }
 
@@ -3729,7 +3738,10 @@ mod tests {
         let repaired = read_header_from_disk(&sb.storage, 2);
         assert_eq!(repaired.sequence, sb.working.sequence);
         assert_eq!(repaired.cluster, sb.working.cluster);
-        assert_eq!(repaired.calculate_checksum(), sb.working.calculate_checksum());
+        assert_eq!(
+            repaired.calculate_checksum(),
+            sb.working.calculate_checksum()
+        );
     }
 
     // =========================================================================
