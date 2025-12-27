@@ -253,9 +253,24 @@ impl<const COPIES: usize> Quorum<COPIES> {
         RepairIterator::new(self.slots)
     }
 }
+
+/// Workspace for grouping superblock copies by content and selecting a valid quorum.
+///
+/// During recovery or verification, we read all `COPIES` superblock slots and need
+/// to determine which (if any) form a valid quorum. Copies with identical checksums
+/// are grouped together, then ranked by validity, sequence, and count.
+///
+/// Uses a fixed-size array because at most `COPIES` distinct versions can exist
+/// (one per slot in worst-case divergence), and heap allocation is avoided in
+/// the recovery path.
+///
+/// The contained [`Quorum`] entries hold raw pointers to superblock headers.
+/// This struct must not outlive the superblock data buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Quorums<const COPIES: usize> {
+    /// Quorum groups found during analysis. Only `array[..count]` are valid.
     array: [Quorum<COPIES>; COPIES],
+    /// Number of distinct quorum groups discovered.
     count: u8,
 }
 
@@ -270,6 +285,7 @@ impl<const COPIES: usize> Default for Quorums<COPIES> {
 }
 
 impl<const COPIES: usize> Quorums<COPIES> {
+    /// Returns the active quorum groups (only the first `count` entries are valid).
     #[inline]
     fn slice(&self) -> &[Quorum<COPIES>] {
         &self.array[..self.count as usize]
@@ -280,11 +296,22 @@ impl<const COPIES: usize> Quorums<COPIES> {
         &mut self.array[..self.count as usize]
     }
 
-    fn assert_invariants(&self) {
-        assert!((self.count as usize) <= COPIES);
-        self.array.iter().for_each(|q| q.assert_invariants());
-    }
-
+    /// Identifies a valid, connected superblock quorum from the given copies.
+    ///
+    /// Groups copies by checksum, validates against threshold, sorts by priority,
+    /// and verifies parent chain connectivity. Returns the best quorum on success.
+    ///
+    /// If a copy with `sequence = best.sequence - 1` exists from the same replica,
+    /// its checksum must match `best.parent`—this detects interrupted writes.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::NotFound`]: No copies have valid checksums
+    /// - [`Error::QuorumLost`]: Best group doesn't meet threshold
+    /// - [`Error::Fork`]: Same sequence, different checksums
+    /// - [`Error::ParentSkipped`]: Gap in sequence numbers (e.g., 2,2,2,4)
+    /// - [`Error::ParentNotConnected`]: Immediate parent exists but doesn't chain
+    /// - [`Error::VsrStateNotMonotonic`]: VSR state regressed between parent and child
     pub fn working(
         &mut self,
         copies: &[SuperBlockHeader; COPIES],
@@ -321,11 +348,14 @@ impl<const COPIES: usize> Quorums<COPIES> {
             return Err(Error::QuorumLost);
         }
 
-        // Parent connectivity check.
+        // Parent connectivity check: compare best quorum against all others.
+        // We only check headers from the same cluster and replica—cross-cluster
+        // or cross-replica headers are irrelevant to our chain.
         for a in &self.slice()[1..] {
             assert!(a.has_header());
             let a_h = unsafe { &*a.header };
 
+            // Skip headers from different clusters or replicas.
             if a_h.cluster != b_h.cluster {
                 continue;
             }
@@ -334,27 +364,31 @@ impl<const COPIES: usize> Quorums<COPIES> {
                 continue;
             }
 
+            // Same sequence, different checksum = fork (unrecoverable divergence).
             if a_h.sequence == b_h.sequence {
                 assert_ne!(a_h.checksum, b_h.checksum);
                 return Err(Error::Fork);
             }
 
-            // Evidence of a newer sequence with a gap (e.g. 2,2,2,4).
-            let b_plus_1 = b_h.sequence.checked_add(1).expect("seuqence overflow");
+            // Sequence beyond b+1 means we're missing intermediate states.
+            // Example: copies show sequences [2, 2, 2, 4]—where is 3?
+            let b_plus_1 = b_h.sequence.checked_add(1).expect("sequence overflow");
             if a_h.sequence > b_plus_1 {
                 return Err(Error::ParentSkipped);
             }
 
-            // If a is immediate parent of b, it must connect and be monotonic.
+            // `a` is the immediate parent of `b`. Verify the chain is intact.
             if a_h.sequence.checked_add(1) == Some(b_h.sequence) {
                 assert_ne!(a_h.checksum, b_h.checksum);
                 assert_eq!(a_h.cluster, b_h.cluster);
                 assert_eq!(a_h.vsr_state.replica_id, b_h.vsr_state.replica_id);
 
+                // Parent's checksum must match what `b` recorded as its parent.
                 if a_h.checksum != b_h.parent {
                     return Err(Error::ParentNotConnected);
                 }
 
+                // VSR state must never regress (view, commit op, etc.).
                 if !VsrState::monotonic(&a_h.vsr_state, &b_h.vsr_state) {
                     return Err(Error::VsrStateNotMonotonic);
                 }
@@ -365,11 +399,17 @@ impl<const COPIES: usize> Quorums<COPIES> {
             }
         }
 
+        // No immediate parent found among other quorums—this is fine.
+        // The parent may have been fully overwritten by subsequent updates.
         assert!(b_h.valid_checksum());
         b.assert_invariants();
         Ok(b)
     }
 
+    /// Comparator for sorting quorums by selection priority (best first).
+    ///
+    /// Ordering: valid > invalid, then higher sequence, then more copies,
+    /// then higher checksum (deterministic tie-breaker for reproducible recovery).
     fn sort_priority_descending(a: &Quorum<COPIES>, b: &Quorum<COPIES>) -> Ordering {
         assert!(a.has_header());
         assert!(b.has_header());
@@ -391,10 +431,22 @@ impl<const COPIES: usize> Quorums<COPIES> {
             return b_count.cmp(&a_count);
         }
 
-        // Stable and deterministic.
+        // Deterministic tie-breaker: higher checksum wins.
         b_h.checksum.cmp(&a_h.checksum)
     }
 
+    /// Processes a single superblock copy, adding it to its quorum group.
+    ///
+    /// Copies are grouped by checksum. Within a group, we track which copy indices
+    /// are present to determine if we have quorum.
+    ///
+    /// The header's `copy` field indicates which slot it *should* occupy; `slot`
+    /// is where we actually *found* it. These may differ due to misdirected writes.
+    ///
+    /// Edge cases:
+    /// - Corrupt copy index (`>= COPIES`): fall back to slot position
+    /// - Duplicate copy index: ignore (already counted)
+    /// - Misdirected write: trust the header's copy field over slot position
     fn count_copy(&mut self, copy: &SuperBlockHeader, slot: usize, threshold: Threshold) {
         assert!(slot < COPIES);
 
@@ -411,15 +463,15 @@ impl<const COPIES: usize> Quorums<COPIES> {
         assert_eq!(q_h.checksum, copy.checksum);
         assert!(q_h.equal(copy));
 
-        // - If copy.copy is corrupt (>= COPIES), assume slot is correct; count as slot.
-        // - Else if we already counted this copy index, ignore duplicate.
-        // - Else count by copy.copy (copy index), even if the read was misdirected.
+        // Handle the three cases: corrupt index, duplicate, or normal.
         if (copy.copy as usize) >= COPIES {
+            // Corrupt copy index—fall back to slot position.
             quorum.slots[slot] = Some(slot as u8);
             quorum.copies.set(slot as u8);
         } else if quorum.copies.is_set(copy.copy as u8) {
-            // Ignore duplicate copy index.
+            // Already have this copy index—ignore duplicate.
         } else {
+            // Normal case: record by the header's copy field.
             quorum.slots[slot] = Some(copy.copy as u8);
             quorum.copies.set(copy.copy as u8);
         }
@@ -427,10 +479,18 @@ impl<const COPIES: usize> Quorums<COPIES> {
         quorum.valid = quorum.copies.count() >= threshold_count
     }
 
+    /// Returns a mutable reference to the quorum for this copy, creating one if needed.
+    ///
+    /// Quorums are identified by checksum—all copies with the same checksum belong
+    /// to the same quorum group. Uses two-phase lookup (find then insert) to
+    /// satisfy the borrow checker.
+    ///
+    /// Panics if the copy has an invalid checksum or if we exceed `COPIES` quorums
+    /// (impossible: can't have more distinct superblocks than slots).
     fn find_or_insert_quorum_for_copy(&mut self, copy: &SuperBlockHeader) -> &mut Quorum<COPIES> {
         assert!(copy.valid_checksum());
 
-        // Phase 1: Find existing quorum by index (no mutable borrow held across iterations)
+        // Phase 1: Search for existing quorum by checksum.
         let existing_idx = (0..self.count as usize).find(|&i| {
             let q = &self.array[i];
             assert!(q.has_header());
@@ -443,7 +503,7 @@ impl<const COPIES: usize> Quorums<COPIES> {
             return &mut self.array[idx];
         }
 
-        // Phase 2: Insert a new quorum
+        // Phase 2: No match found—insert new quorum group.
         let idx = self.count as usize;
         assert!(idx < COPIES);
 
