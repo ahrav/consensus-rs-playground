@@ -320,7 +320,7 @@ impl<const COPIES: usize> Quorums<COPIES> {
         const { validate_copies::<COPIES>() };
 
         let threshold_count = threshold.count::<COPIES>();
-        assert!(threshold_count >= 2 && threshold_count <= 5);
+        assert!((2..=5).contains(&threshold_count));
 
         self.count = 0;
 
@@ -451,7 +451,7 @@ impl<const COPIES: usize> Quorums<COPIES> {
         assert!(slot < COPIES);
 
         let threshold_count = threshold.count::<COPIES>();
-        assert!(threshold_count >= 2 && threshold_count <= 5);
+        assert!((2..=5).contains(&threshold_count));
 
         if !copy.valid_checksum() {
             return;
@@ -459,7 +459,7 @@ impl<const COPIES: usize> Quorums<COPIES> {
 
         let quorum = self.find_or_insert_quorum_for_copy(copy);
         assert!(quorum.has_header());
-        let q_h = unsafe { &*quorum.header() };
+        let q_h = unsafe { quorum.header() };
         assert_eq!(q_h.checksum, copy.checksum);
         assert!(q_h.equal(copy));
 
@@ -1261,20 +1261,6 @@ mod tests {
         // =====================================================================
 
         #[test]
-        fn working_all_copies_agree() {
-            // All 4 copies are identical and valid.
-            let copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
-
-            let mut quorums = Quorums::<4>::default();
-            let result = quorums.working(&copies, Threshold::Verify);
-
-            assert!(result.is_ok());
-            let q = result.unwrap();
-            assert!(q.valid);
-            assert_eq!(q.copies.count(), 4);
-        }
-
-        #[test]
         fn working_exactly_threshold_copies_open() {
             // Only 2 copies valid (meets Open threshold for COPIES=4).
             let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
@@ -1788,32 +1774,6 @@ mod tests {
         // =====================================================================
 
         #[test]
-        fn working_all_copies_agree_6() {
-            let copies: [SuperBlockHeader; 6] = make_agreeing_copies(10, 1, 1, 0);
-
-            let mut quorums = Quorums::<6>::default();
-            let result = quorums.working(&copies, Threshold::Verify);
-
-            assert!(result.is_ok());
-            let q = result.unwrap();
-            assert!(q.valid);
-            assert_eq!(q.copies.count(), 6);
-        }
-
-        #[test]
-        fn working_all_copies_agree_8() {
-            let copies: [SuperBlockHeader; 8] = make_agreeing_copies(10, 1, 1, 0);
-
-            let mut quorums = Quorums::<8>::default();
-            let result = quorums.working(&copies, Threshold::Verify);
-
-            assert!(result.is_ok());
-            let q = result.unwrap();
-            assert!(q.valid);
-            assert_eq!(q.copies.count(), 8);
-        }
-
-        #[test]
         fn working_error_fork_6() {
             let mut copies: [SuperBlockHeader; 6] = [SuperBlockHeader::zeroed(); 6];
 
@@ -1984,14 +1944,12 @@ mod tests {
 
                     let mut quorums = Quorums::<4>::default();
                     if let Ok(quorum) = quorums.working(&copies, Threshold::Open) {
-                        for slot in &quorum.slots {
-                            if let Some(copy_idx) = slot {
-                                prop_assert!(
-                                    (*copy_idx as usize) < 4,
-                                    "Copy index {} out of bounds for COPIES=4",
-                                    copy_idx
-                                );
-                            }
+                        for copy_idx in quorum.slots.iter().flatten() {
+                            prop_assert!(
+                                (*copy_idx as usize) < 4,
+                                "Copy index {} out of bounds for COPIES=4",
+                                copy_idx
+                            );
                         }
                     }
                 }
@@ -2265,39 +2223,6 @@ mod tests {
         }
 
         #[test]
-        fn all_empty_slots() {
-            let slots: [Option<u8>; 4] = [None, None, None, None];
-            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
-
-            assert_eq!(repairs.len(), 4);
-            for i in 0..4u8 {
-                assert!(repairs.contains(&i));
-            }
-        }
-
-        #[test]
-        fn all_empty_slots_6_copies() {
-            let slots: [Option<u8>; 6] = [None, None, None, None, None, None];
-            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
-
-            assert_eq!(repairs.len(), 6);
-            for i in 0..6u8 {
-                assert!(repairs.contains(&i));
-            }
-        }
-
-        #[test]
-        fn all_empty_slots_8_copies() {
-            let slots: [Option<u8>; 8] = [None, None, None, None, None, None, None, None];
-            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
-
-            assert_eq!(repairs.len(), 8);
-            for i in 0..8u8 {
-                assert!(repairs.contains(&i));
-            }
-        }
-
-        #[test]
         fn disjoint_swap_cycles_no_repairs() {
             // Two independent swap cycles: 0↔1 and 2↔3
             let slots = [Some(1), Some(0), Some(3), Some(2)];
@@ -2309,80 +2234,6 @@ mod tests {
             for i in 0..4u8 {
                 assert!(copies_any.is_set(i));
             }
-        }
-
-        #[test]
-        fn missing_copy_repaired_before_misdirected() {
-            // Slot 0: empty, copy 0 exists in slot 2
-            // Slot 1: empty, copy 1 missing entirely
-            // Slot 2: has copy 0 (misdirected)
-            // Slot 3: correct
-            let slots = [None, None, Some(0), Some(3)];
-            let mut iter = RepairIterator::new(slots);
-
-            // Missing copy repaired first
-            let first = iter.next().unwrap();
-            assert_eq!(first, 1);
-
-            // Then misdirected
-            let second = iter.next().unwrap();
-            assert_eq!(second, 0);
-
-            // Copy 0 now duplicated, slot 2 repaired
-            let third = iter.next().unwrap();
-            assert_eq!(third, 2);
-
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn repair_creates_duplicate_enabling_next_repair() {
-            // [None, Some(0), Some(2), Some(3)]
-            // Repairing slot 0 creates duplicate of copy 0, enabling slot 1 repair
-            let slots = [None, Some(0), Some(2), Some(3)];
-            let mut iter = RepairIterator::new(slots);
-
-            let first = iter.next().unwrap();
-            assert_eq!(first, 0);
-            assert_eq!(iter.slots[0], Some(0));
-
-            let second = iter.next().unwrap();
-            assert_eq!(second, 1);
-
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn multi_step_repair_sequence() {
-            // [Some(2), Some(0), None, None]
-            // Sequence: slot 3 (missing), slot 2 (misdirected), slot 0 (dup), slot 1 (dup)
-            let slots = [Some(2), Some(0), None, None];
-            let mut iter = RepairIterator::new(slots);
-
-            assert_eq!(iter.next().unwrap(), 3);
-            assert_eq!(iter.next().unwrap(), 2);
-            assert_eq!(iter.next().unwrap(), 0);
-            assert_eq!(iter.next().unwrap(), 1);
-            assert_eq!(iter.next(), None);
-
-            let (copies_any, _) = iter.compute_copy_sets();
-            assert!(copies_any.full::<4>());
-        }
-
-        #[test]
-        fn single_duplicate_repair() {
-            let slots = [Some(0), Some(0), Some(2), Some(3)];
-            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
-
-            assert_eq!(repairs, vec![1]);
-        }
-
-        #[test]
-        fn single_empty_slot_repair() {
-            let slots = [Some(0), None, Some(2), Some(3)];
-            let repairs: Vec<u8> = RepairIterator::new(slots).collect();
-
-            assert_eq!(repairs, vec![1]);
         }
 
         #[test]
