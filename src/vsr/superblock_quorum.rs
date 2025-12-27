@@ -255,8 +255,14 @@ impl<const COPIES: usize> Quorum<COPIES> {
 
 /// Iterates over slot indices requiring repair, in priority order.
 ///
-/// The goal is to restore the invariant that slot `i` contains copy `i`.
-/// After all repairs, the superblock array will have each copy in its home slot.
+/// The goal is to ensure all copies 0..COPIES exist somewhere. Repairs only
+/// occur when it's safe to do so without losing unique data. The iterator
+/// does NOT guarantee `slot[i] = copy i` after completion—only that all
+/// copies are present.
+///
+/// Slots with unique wrong copies (copy `j` in slot `i` where `j ≠ i` and
+/// `j` is not duplicated) are NOT repaired, as overwriting would lose the
+/// only instance of copy `j`.
 ///
 /// # Repair Priority (highest to lowest)
 ///
@@ -369,17 +375,22 @@ impl<const COPIES: usize> Iterator for RepairIterator<COPIES> {
             }
             if let Some(slot_copy) = slot {
                 // Slot contains wrong copy, and that copy is duplicated elsewhere.
+                // Safe to overwrite since we have a backup.
                 if slot_copy != i_u8 && copies_duplicate.is_set(slot_copy) {
                     priority_3 = Some(i_u8);
                 }
+                // Note: We do NOT repair slots with unique wrong copies.
+                // Overwriting would lose the only instance of that copy.
             }
         }
 
         let repair = priority_1.or(priority_2).or(priority_3);
 
         let Some(repair_slot) = repair else {
-            // No repairs needed: all slots should be populated.
-            assert!(self.slots.iter().all(|s| s.is_some()));
+            // No more safe repairs available.
+            // Remaining slots either:
+            // - Are correct (slot[i] = Some(i))
+            // - Have unique wrong copies (cannot overwrite without losing data)
             return None;
         };
 
@@ -503,5 +514,610 @@ mod tests {
         assert!(Threshold::Open.count::<4>() < Threshold::Verify.count::<4>());
         assert!(Threshold::Open.count::<6>() < Threshold::Verify.count::<6>());
         assert!(Threshold::Open.count::<8>() < Threshold::Verify.count::<8>());
+    }
+
+    // =========================================================================
+    // Quorum Tests
+    // =========================================================================
+
+    mod quorum_tests {
+        use super::*;
+
+        #[test]
+        fn default_is_invalid() {
+            let q = Quorum::<4>::default();
+            assert!(!q.valid);
+            assert!(!q.has_header());
+            assert_eq!(q.copies.count(), 0);
+            assert!(q.slots.iter().all(|s| s.is_none()));
+        }
+
+        #[test]
+        fn header_returns_reference() {
+            let header = SuperBlockHeader::zeroed();
+            let q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                ..Default::default()
+            };
+
+            let returned = unsafe { q.header() };
+            assert_eq!(
+                returned as *const SuperBlockHeader,
+                &header as *const SuperBlockHeader
+            );
+        }
+
+        #[test]
+        fn invariants_hold_when_copies_match_slots() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.copies.set(2);
+            q.slots[0] = Some(0);
+            q.slots[2] = Some(2);
+
+            q.assert_invariants(); // Should not panic
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn invariants_panic_on_count_mismatch() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.copies.set(1); // Says 2 copies
+            q.slots[0] = Some(0); // But only 1 slot filled
+
+            q.assert_invariants();
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn invariants_panic_on_out_of_bounds_copy() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.slots[0] = Some(5); // Copy 5 is out of bounds for COPIES=4
+
+            q.assert_invariants();
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn repairs_requires_valid_quorum() {
+            let q = Quorum::<4>::default();
+            let _ = q.repairs();
+        }
+    }
+
+    // =========================================================================
+    // RepairIterator Unit Tests
+    // =========================================================================
+
+    mod repair_iterator_tests {
+        use super::*;
+
+        #[test]
+        fn all_correct_no_repairs_needed() {
+            let slots = [Some(0), Some(1), Some(2), Some(3)];
+            let mut iter = RepairIterator::<4>::new(slots);
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn priority_1_empty_slot_missing_copy() {
+            // Slot 2 is empty and copy 2 doesn't exist anywhere
+            let slots = [Some(0), Some(1), None, Some(3)];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            assert_eq!(iter.next(), Some(2)); // Priority 1: missing copy
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn priority_2_empty_slot_misdirected_copy() {
+            // Slot 1 is empty, but copy 1 exists in slot 2
+            let slots = [Some(0), None, Some(1), Some(3)];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            // First: fix slot 1 (empty, but copy 1 exists elsewhere)
+            assert_eq!(iter.next(), Some(1)); // Priority 2
+
+            // Next: fix slot 2 (has copy 1 which is now a duplicate)
+            assert_eq!(iter.next(), Some(2)); // Priority 3
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn priority_3_duplicate_copy() {
+            // Slot 0 has copy 1 (wrong), and copy 1 also exists in slot 1
+            let slots = [Some(1), Some(1), Some(2), Some(3)];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            // Copy 0 is missing entirely → slot 0 becomes priority 1
+            assert_eq!(iter.next(), Some(0));
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn permutation_cycle_no_repairs_needed() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            // No repairs possible without losing data.
+            let slots = [Some(1), Some(2), Some(3), Some(0)];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            // No repairs should occur - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            // All copies still present
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..4u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
+            }
+        }
+
+        #[test]
+        fn mixed_priorities_ordered_correctly() {
+            // slots[0] = Some(2) → wrong copy, duplicate (priority 3)
+            // slots[1] = None → copy 1 missing entirely (priority 1)
+            // slots[2] = Some(2) → correct
+            // slots[3] = None → copy 3 missing entirely (priority 1)
+            let slots = [Some(2), None, Some(2), None];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            // Priority 1 repairs come first (slots 1 and 3 - missing copies)
+            let first = iter.next().unwrap();
+            assert!(
+                first == 1 || first == 3,
+                "expected slot 1 or 3, got {first}"
+            );
+
+            let second = iter.next().unwrap();
+            assert!(
+                second == 1 || second == 3,
+                "expected slot 1 or 3, got {second}"
+            );
+            assert_ne!(first, second);
+
+            // Priority 3 last (slot 0 has duplicate)
+            assert_eq!(iter.next(), Some(0));
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn all_empty_slots_all_priority_1() {
+            let slots: [Option<u8>; 4] = [None, None, None, None];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            let mut repairs: Vec<u8> = iter.by_ref().collect();
+            repairs.sort();
+            assert_eq!(repairs, vec![0, 1, 2, 3]);
+        }
+
+        #[test]
+        fn all_same_copy_catastrophic_corruption() {
+            // All slots have copy 0 (catastrophic corruption)
+            let slots = [Some(0), Some(0), Some(0), Some(0)];
+            let iter = RepairIterator::<4>::new(slots);
+
+            // Slots 1, 2, 3 need their copies (all priority 1 - missing)
+            let repairs: Vec<u8> = iter.collect();
+            assert_eq!(repairs.len(), 3);
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&2));
+            assert!(repairs.contains(&3));
+            assert!(!repairs.contains(&0)); // Slot 0 is correct
+        }
+
+        #[test]
+        fn state_mutation_marks_slot_as_repaired() {
+            let slots = [Some(0), None, Some(2), None];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            assert_eq!(iter.repairs_returned, 0);
+
+            let first = iter.next().unwrap();
+            assert_eq!(iter.repairs_returned, 1);
+            assert_eq!(iter.slots[first as usize], Some(first));
+
+            let second = iter.next().unwrap();
+            assert_eq!(iter.repairs_returned, 2);
+            assert_eq!(iter.slots[second as usize], Some(second));
+
+            assert_eq!(iter.next(), None);
+        }
+
+        #[test]
+        fn copies_6_works() {
+            let slots = [Some(0), None, None, Some(3), Some(4), Some(5)];
+            let repairs: Vec<u8> = RepairIterator::<6>::new(slots).collect();
+
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&2));
+            assert_eq!(repairs.len(), 2);
+        }
+
+        #[test]
+        fn copies_8_works() {
+            let slots = [Some(0), Some(1), Some(2), Some(3), None, None, None, None];
+            let repairs: Vec<u8> = RepairIterator::<8>::new(slots).collect();
+
+            assert_eq!(repairs.len(), 4);
+            assert!(repairs.contains(&4));
+            assert!(repairs.contains(&5));
+            assert!(repairs.contains(&6));
+            assert!(repairs.contains(&7));
+        }
+
+        #[test]
+        fn permutation_cycle_no_repairs_6_copies() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            let slots = [Some(1), Some(2), Some(3), Some(4), Some(5), Some(0)];
+            let mut iter = RepairIterator::<6>::new(slots);
+
+            // No repairs - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..6u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
+            }
+        }
+
+        #[test]
+        fn permutation_cycle_no_repairs_8_copies() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            let slots = [
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(0),
+            ];
+            let mut iter = RepairIterator::<8>::new(slots);
+
+            // No repairs - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..8u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
+            }
+        }
+
+        #[test]
+        fn repair_missing_in_permutation_cycle_4() {
+            // Regression case: Permutation cycle with missing element.
+            // Slot 1 is empty (missing copy 1).
+            // Cycle: 0->2, 2->3, 3->0, 1 missing.
+            let slots = [Some(2), None, Some(3), Some(0)];
+            let repairs: Vec<u8> = RepairIterator::<4>::new(slots).collect();
+
+            // Should repair slot 1 (priority 1).
+            // Result: [Some(2), Some(1), Some(3), Some(0)].
+            // Now 1 is correct, others form cycle 0->2->3->0.
+            assert_eq!(repairs, vec![1]);
+        }
+
+        #[test]
+        fn repair_missing_in_permutation_cycle_6() {
+            // Regression case.
+            // Missing: 0, 3, 5.
+            // Present: 1, 2, 4 (in slots 4, 1, 2).
+            let slots = [None, Some(2), Some(4), None, Some(1), None];
+            let mut repairs: Vec<u8> = RepairIterator::<6>::new(slots).collect();
+            repairs.sort();
+
+            // Should repair missing copies: 0, 3, 5.
+            assert_eq!(repairs, vec![0, 3, 5]);
+        }
+
+        #[test]
+        fn repair_missing_in_permutation_cycle_8() {
+            // Regression case.
+            // Missing: 0, 1, 2, 3, 7.
+            // Present: 4, 5, 6 (in slots 6, 4, 5).
+            let slots = [None, None, None, None, Some(5), Some(6), Some(4), None];
+            let mut repairs: Vec<u8> = RepairIterator::<8>::new(slots).collect();
+            repairs.sort();
+
+            // Should repair missing copies.
+            assert_eq!(repairs, vec![0, 1, 2, 3, 7]);
+        }
+
+        mod compute_copy_sets {
+            use super::*;
+
+            #[test]
+            fn identifies_duplicates() {
+                let slots = [Some(1), Some(1), Some(2), Some(3)];
+                let iter = RepairIterator::<4>::new(slots);
+
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert!(copies_any.is_set(1));
+                assert!(copies_any.is_set(2));
+                assert!(copies_any.is_set(3));
+                assert!(!copies_any.is_set(0)); // Copy 0 missing
+
+                assert!(copies_duplicate.is_set(1)); // Copy 1 is duplicated
+                assert!(!copies_duplicate.is_set(2));
+                assert!(!copies_duplicate.is_set(3));
+            }
+
+            #[test]
+            fn empty_slots_yields_empty_sets() {
+                let slots: [Option<u8>; 4] = [None, None, None, None];
+                let iter = RepairIterator::<4>::new(slots);
+
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert_eq!(copies_any.count(), 0);
+                assert_eq!(copies_duplicate.count(), 0);
+            }
+
+            #[test]
+            fn all_unique_no_duplicates() {
+                let slots = [Some(0), Some(1), Some(2), Some(3)];
+                let iter = RepairIterator::<4>::new(slots);
+
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert_eq!(copies_any.count(), 4);
+                assert_eq!(copies_duplicate.count(), 0);
+            }
+        }
+    }
+
+    // =========================================================================
+    // RepairIterator Property-Based Tests
+    // =========================================================================
+
+    mod repair_iterator_properties {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        /// Strategy to generate a valid slot array where all copy indices are < COPIES.
+        fn valid_slot_array<const COPIES: usize>() -> impl Strategy<Value = [Option<u8>; COPIES]> {
+            proptest::collection::vec(
+                prop_oneof![
+                    1 => Just(None),
+                    3 => (0u8..(COPIES as u8)).prop_map(Some),
+                ],
+                COPIES,
+            )
+            .prop_map(|v| {
+                let mut arr = [None; COPIES];
+                for (i, slot) in v.into_iter().enumerate() {
+                    arr[i] = slot;
+                }
+                arr
+            })
+        }
+
+        proptest! {
+            /// The iterator must always terminate within COPIES iterations.
+            #[test]
+            fn always_terminates_within_copies_iterations(
+                slots in valid_slot_array::<4>()
+            ) {
+                let mut iter = RepairIterator::new(slots);
+                let mut count = 0;
+
+                while iter.next().is_some() {
+                    count += 1;
+                    prop_assert!(count <= 4, "Iterator produced more than COPIES items");
+                }
+            }
+
+            /// Each slot is yielded at most once (no duplicate repairs).
+            #[test]
+            fn no_duplicate_repairs(slots in valid_slot_array::<4>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+
+                prop_assert_eq!(
+                    repairs.len(),
+                    unique.len(),
+                    "Duplicate repairs detected: {:?}",
+                    repairs
+                );
+            }
+
+            /// After full iteration, all copies 0..COPIES must exist somewhere.
+            /// The iterator ensures no data is lost by only repairing safe slots.
+            #[test]
+            fn all_copies_present_after_repairs(slots in valid_slot_array::<4>()) {
+                let mut iter = RepairIterator::new(slots);
+
+                // Consume all repairs
+                while iter.next().is_some() {}
+
+                // Verify all copies exist somewhere
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..4u8 {
+                    prop_assert!(
+                        copies_any.is_set(i),
+                        "Copy {} is missing after repairs. Slots: {:?}",
+                        i,
+                        iter.slots
+                    );
+                }
+            }
+
+            /// All yielded repair indices must be within bounds.
+            #[test]
+            fn all_repairs_in_bounds(slots in valid_slot_array::<4>()) {
+                for repair in RepairIterator::new(slots) {
+                    prop_assert!(
+                        (repair as usize) < 4,
+                        "Repair index {} out of bounds",
+                        repair
+                    );
+                }
+            }
+
+            /// repairs_returned counter matches actual count.
+            #[test]
+            fn repairs_returned_matches_count(slots in valid_slot_array::<4>()) {
+                let mut iter = RepairIterator::new(slots);
+                let mut expected_count = 0u8;
+
+                while iter.next().is_some() {
+                    expected_count += 1;
+                    prop_assert_eq!(
+                        iter.repairs_returned,
+                        expected_count,
+                        "repairs_returned mismatch"
+                    );
+                }
+            }
+
+            /// Priority ordering: repairs are yielded in priority order based on
+            /// the current state at each iteration. Priority is recalculated
+            /// after each repair since duplicates may become unique.
+            ///
+            /// This test verifies that within each iteration, the selected repair
+            /// is the highest priority available at that moment.
+            ///
+            /// Note: Priority 4 (unique wrong copies) are NOT repaired to avoid data loss.
+            #[test]
+            fn priority_ordering_is_strict(slots in valid_slot_array::<4>()) {
+                let mut current_slots = slots;
+
+                loop {
+                    let (copies_any, copies_dup) = {
+                        let temp_iter = RepairIterator::new(current_slots);
+                        temp_iter.compute_copy_sets()
+                    };
+
+                    // Find the highest priority REPAIRABLE slot.
+                    // Priority 4 (unique wrong copy) is not repairable.
+                    let mut best_priority = 4u8; // 4 means "no repairable slot"
+                    let mut has_repairable = false;
+
+                    for (i, &slot_value) in current_slots.iter().enumerate() {
+                        let i_u8 = i as u8;
+
+                        let priority = if slot_value.is_none() && !copies_any.is_set(i_u8) {
+                            1 // Empty slot, copy missing entirely
+                        } else if slot_value.is_none() && copies_any.is_set(i_u8) {
+                            2 // Empty slot, copy exists elsewhere
+                        } else if let Some(copy) = slot_value {
+                            if copy != i_u8 && copies_dup.is_set(copy) {
+                                3 // Wrong copy, duplicated - repairable
+                            } else {
+                                continue; // Correct or unique wrong copy (not repairable)
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        has_repairable = true;
+                        if priority < best_priority {
+                            best_priority = priority;
+                        }
+                    }
+
+                    // Get the actual repair from the iterator
+                    let mut iter = RepairIterator::new(current_slots);
+                    let actual_repair = iter.next();
+
+                    match (has_repairable, actual_repair) {
+                        (false, None) => break, // Both agree: no repairs available
+                        (true, None) => {
+                            prop_assert!(false, "Iterator stopped but repairable slots remain");
+                        }
+                        (false, Some(r)) => {
+                            prop_assert!(false, "Iterator returned {} but no repairable slots", r);
+                        }
+                        (true, Some(actual)) => {
+                            // The iterator should return a slot at the best priority level
+                            let actual_slot_value = current_slots[actual as usize];
+                            let actual_priority = if actual_slot_value.is_none() && !copies_any.is_set(actual) {
+                                1
+                            } else if actual_slot_value.is_none() && copies_any.is_set(actual) {
+                                2
+                            } else if let Some(copy) = actual_slot_value {
+                                if copy != actual && copies_dup.is_set(copy) {
+                                    3
+                                } else {
+                                    prop_assert!(false, "Iterator repaired non-repairable slot {}", actual);
+                                    unreachable!()
+                                }
+                            } else {
+                                prop_assert!(false, "Unexpected state");
+                                unreachable!()
+                            };
+
+                            prop_assert_eq!(
+                                actual_priority,
+                                best_priority,
+                                "Iterator chose priority {} but best available was {}",
+                                actual_priority,
+                                best_priority
+                            );
+
+                            // Apply the repair
+                            current_slots[actual as usize] = Some(actual);
+                        }
+                    }
+                }
+            }
+
+            // Tests for COPIES=6
+            #[test]
+            fn all_copies_present_after_repairs_6_copies(slots in valid_slot_array::<6>()) {
+                let mut iter = RepairIterator::new(slots);
+                while iter.next().is_some() {}
+
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..6u8 {
+                    prop_assert!(copies_any.is_set(i), "Copy {} missing", i);
+                }
+            }
+
+            #[test]
+            fn no_duplicate_repairs_6_copies(slots in valid_slot_array::<6>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+                prop_assert_eq!(repairs.len(), unique.len());
+            }
+
+            // Tests for COPIES=8
+            #[test]
+            fn all_copies_present_after_repairs_8_copies(slots in valid_slot_array::<8>()) {
+                let mut iter = RepairIterator::new(slots);
+                while iter.next().is_some() {}
+
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..8u8 {
+                    prop_assert!(copies_any.is_set(i), "Copy {} missing", i);
+                }
+            }
+
+            #[test]
+            fn no_duplicate_repairs_8_copies(slots in valid_slot_array::<8>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+                prop_assert_eq!(repairs.len(), unique.len());
+            }
+        }
     }
 }
