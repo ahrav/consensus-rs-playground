@@ -13,7 +13,7 @@
 //! operation is in flight. Buffers are caller-owned; this layer stores raw pointers and
 //! identifies completions via `user_data` (`Completion*` cast to `u64`).
 
-pub mod iops;
+pub mod intrusive_iops;
 
 mod io_core;
 

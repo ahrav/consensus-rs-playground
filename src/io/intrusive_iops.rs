@@ -18,7 +18,7 @@
 //! # Example
 //!
 //! ```
-//! use consensus::io::iops::Iops;
+//! use consensus::io::intrusive_iops::Iops;
 //!
 //! let mut pool: Iops<u32, 4> = Iops::new(|i| i as u32);
 //!
