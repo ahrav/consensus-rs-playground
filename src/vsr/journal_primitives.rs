@@ -195,6 +195,43 @@ impl Slot {
     }
 }
 
+/// Inclusive range of slots in the circular buffer.
+///
+/// Represents a contiguous segment when `head <= tail`, or a wrap-around
+/// segment when `head > tail`. Excludes `head == tail` since it's ambiguous
+/// in circular buffers—could mean "one slot" or "all slots after full wrap".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotRange {
+    pub head: Slot,
+    pub tail: Slot,
+}
+
+impl SlotRange {
+    /// Checks if `slot` falls within this range.
+    ///
+    /// Visual (`·`=included, ` `=excluded):
+    ///
+    /// * `head < tail` → `  head··tail  `
+    /// * `head > tail` → `··tail  head··` (wraps around)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `head == tail`. For single-slot checks, compare `slot == head` directly.
+    #[inline]
+    pub fn contains(&self, slot: Slot) -> bool {
+        assert!(self.head.0 != self.tail.0);
+
+        if self.head.index() < self.tail.index() {
+            return self.head.index() <= slot.index() && slot.index() <= self.tail.index();
+        }
+        if self.head.index() > self.tail.index() {
+            return slot.index() <= self.tail.index() || self.head.index() <= slot.index();
+        }
+
+        unreachable!("head == tail is handled by assertion above");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +364,37 @@ mod tests {
     #[should_panic]
     fn div_exact_u64_panics_on_non_exact() {
         div_exact_u64(100, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // SlotRange unit tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn slotrange_panics_when_head_equals_tail() {
+        let range = SlotRange {
+            head: Slot::new(42),
+            tail: Slot::new(42),
+        };
+        range.contains(Slot::new(0));
+    }
+
+    #[test]
+    fn slotrange_contains_wrapping_at_extreme_boundaries() {
+        // Wrapping range: slots 1023 (head) through 0 (tail).
+        let range = SlotRange {
+            head: Slot::new(SLOT_COUNT - 1),
+            tail: Slot::new(0),
+        };
+
+        // Included: head (1023) and tail (0).
+        assert!(range.contains(Slot::new(SLOT_COUNT - 1)));
+        assert!(range.contains(Slot::new(0)));
+
+        // Excluded: middle slots.
+        assert!(!range.contains(Slot::new(1)));
+        assert!(!range.contains(Slot::new(SLOT_COUNT - 2)));
     }
 }
 
@@ -496,6 +564,109 @@ mod proptests {
             let once = sector_floor(offset);
             let twice = sector_floor(once);
             prop_assert_eq!(once, twice);
+        }
+
+        // ---------------------------------------------------------------------
+        // SlotRange property tests
+        // ---------------------------------------------------------------------
+
+        #[test]
+        fn slotrange_non_wrapping_is_inclusive(
+            head in 0usize..SLOT_COUNT,
+            tail in 0usize..SLOT_COUNT,
+            slot in 0usize..SLOT_COUNT
+        ) {
+            prop_assume!(head < tail);
+
+            let range = SlotRange {
+                head: Slot::new(head),
+                tail: Slot::new(tail),
+            };
+            let slot = Slot::new(slot);
+
+            let expected = head <= slot.index() && slot.index() <= tail;
+            prop_assert_eq!(range.contains(slot), expected);
+        }
+
+        #[test]
+        fn slotrange_wrapping_splits_at_boundary(
+            head in 0usize..SLOT_COUNT,
+            tail in 0usize..SLOT_COUNT,
+            slot in 0usize..SLOT_COUNT
+        ) {
+            prop_assume!(head > tail);
+
+            let range = SlotRange {
+                head: Slot::new(head),
+                tail: Slot::new(tail),
+            };
+            let slot = Slot::new(slot);
+
+            let expected = slot.index() <= tail || head <= slot.index();
+            prop_assert_eq!(range.contains(slot), expected);
+        }
+
+        #[test]
+        fn slotrange_endpoints_always_included(
+            head in 0usize..SLOT_COUNT,
+            tail in 0usize..SLOT_COUNT
+        ) {
+            prop_assume!(head != tail);
+
+            let range = SlotRange {
+                head: Slot::new(head),
+                tail: Slot::new(tail),
+            };
+
+            prop_assert!(range.contains(range.head));
+            prop_assert!(range.contains(range.tail));
+        }
+
+        #[test]
+        fn slotrange_contains_at_least_two_slots(
+            head in 0usize..SLOT_COUNT,
+            tail in 0usize..SLOT_COUNT
+        ) {
+            prop_assume!(head != tail);
+
+            let range = SlotRange {
+                head: Slot::new(head),
+                tail: Slot::new(tail),
+            };
+
+            let contained_count = (0..SLOT_COUNT)
+                .map(Slot::new)
+                .filter(|&slot| range.contains(slot))
+                .count();
+
+            prop_assert!(contained_count >= 2);
+        }
+
+        #[test]
+        fn slotrange_containment_partitions_slot_space(
+            head in 0usize..SLOT_COUNT,
+            tail in 0usize..SLOT_COUNT,
+            slot in 0usize..SLOT_COUNT
+        ) {
+            prop_assume!(head != tail);
+
+            let range = SlotRange {
+                head: Slot::new(head),
+                tail: Slot::new(tail),
+            };
+            let slot = Slot::new(slot);
+
+            let in_range = range.contains(slot);
+
+            if head < tail {
+                // Non-wrapping: gap is [0, head) ∪ (tail, SLOT_COUNT)
+                let in_gap = slot.index() < head || slot.index() > tail;
+                prop_assert_eq!(in_range, !in_gap);
+            } else {
+                // Wrapping: gap is (tail, head)
+                let in_gap = slot.index() > tail && slot.index() < head;
+                prop_assert_eq!(in_range, !in_gap);
+            }
         }
     }
 }
