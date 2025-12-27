@@ -220,22 +220,20 @@ impl<const COPIES: usize> Quorum<COPIES> {
     /// # Invariants checked
     ///
     /// - Valid quorums have a header
-    /// - `copies.count()` equals the number of `Some` entries in `slots`
+    /// - `copies` matches the set of unique copy indices found in `slots`
     /// - All copy indices in `slots` are within bounds
     fn assert_invariants(&self) {
         if self.valid {
             assert!(self.has_header());
         }
 
-        let slot_count = self.slots.iter().filter(|slot| slot.is_some()).count();
-        assert_eq!(self.copies.count() as usize, slot_count);
+        let mut slot_copies = QuorumCount::empty();
+        for &copy in self.slots.iter().flatten() {
+            assert!((copy as usize) < COPIES);
+            slot_copies.set(copy);
+        }
 
-        assert!(
-            self.slots
-                .iter()
-                .flatten()
-                .all(|&copy| (copy as usize) < COPIES)
-        );
+        assert_eq!(self.copies, slot_copies);
     }
 
     /// Returns an iterator yielding slot indices that need repair.
@@ -358,7 +356,7 @@ impl<const COPIES: usize> Iterator for RepairIterator<COPIES> {
         let (copies_any, copies_duplicate) = self.compute_copy_sets();
 
         // Find candidates at each priority level.
-        // We take the first match at the highest priority that has one.
+        // We take a match at the highest priority that has one.
         let mut priority_1: Option<u8> = None; // Empty slot, copy missing entirely
         let mut priority_2: Option<u8> = None; // Empty slot, copy exists elsewhere
         let mut priority_3: Option<u8> = None; // Wrong copy, but it's a duplicate
@@ -559,12 +557,23 @@ mod tests {
         }
 
         #[test]
+        fn invariants_allow_duplicate_copies() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(1);
+            q.slots[0] = Some(1);
+            q.slots[1] = Some(1);
+
+            q.assert_invariants();
+        }
+
+        #[test]
         #[should_panic(expected = "assertion")]
-        fn invariants_panic_on_count_mismatch() {
+        fn invariants_panic_on_copy_set_mismatch() {
             let mut q = Quorum::<4>::default();
             q.copies.set(0);
-            q.copies.set(1); // Says 2 copies
-            q.slots[0] = Some(0); // But only 1 slot filled
+            q.copies.set(1);
+            q.slots[0] = Some(0);
+            q.slots[1] = Some(2); // Count matches, but set differs
 
             q.assert_invariants();
         }
@@ -584,6 +593,24 @@ mod tests {
         fn repairs_requires_valid_quorum() {
             let q = Quorum::<4>::default();
             let _ = q.repairs();
+        }
+
+        #[test]
+        fn repairs_allow_duplicate_slots() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+            q.copies.set(1);
+            q.slots[0] = Some(1);
+            q.slots[1] = Some(1);
+
+            let mut repairs: Vec<u8> = q.repairs().collect();
+            repairs.sort();
+            assert_eq!(repairs, vec![0, 2, 3]);
         }
     }
 
