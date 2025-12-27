@@ -5,6 +5,7 @@
 
 use std::cmp::Ordering;
 
+use crate::vsr::state::VsrState;
 use crate::vsr::superblock::SuperBlockHeader;
 
 /// Maximum superblock copies. Bounded by practical storage constraints.
@@ -284,6 +285,91 @@ impl<const COPIES: usize> Quorums<COPIES> {
         self.array.iter().for_each(|q| q.assert_invariants());
     }
 
+    pub fn working(
+        &mut self,
+        copies: &[SuperBlockHeader; COPIES],
+        threshold: Threshold,
+    ) -> Result<Quorum<COPIES>, Error> {
+        const { validate_copies::<COPIES>() };
+
+        let threshold_count = threshold.count::<COPIES>();
+        assert!(threshold_count >= 2 && threshold_count <= 5);
+
+        self.count = 0;
+
+        copies
+            .iter()
+            .enumerate()
+            .for_each(|(i, copy)| self.count_copy(copy, i, threshold));
+
+        self.slice_mut().sort_by(Self::sort_priority_descending);
+
+        if self.slice().is_empty() {
+            return Err(Error::NotFound);
+        }
+
+        let b = self.slice()[0];
+        assert!(b.has_header());
+        let b_h = unsafe { &*b.header };
+
+        for a in &self.slice()[1..] {
+            assert!(Self::sort_priority_descending(&b, a) == Ordering::Less);
+            assert!(unsafe { &*a.header }.valid_checksum());
+        }
+
+        if !b.valid {
+            return Err(Error::QuorumLost);
+        }
+
+        // Parent connectivity check.
+        for a in &self.slice()[1..] {
+            assert!(a.has_header());
+            let a_h = unsafe { &*a.header };
+
+            if a_h.cluster != b_h.cluster {
+                continue;
+            }
+
+            if a_h.vsr_state.replica_id != b_h.vsr_state.replica_id {
+                continue;
+            }
+
+            if a_h.sequence == b_h.sequence {
+                assert_ne!(a_h.checksum, b_h.checksum);
+                return Err(Error::Fork);
+            }
+
+            // Evidence of a newer sequence with a gap (e.g. 2,2,2,4).
+            let b_plus_1 = b_h.sequence.checked_add(1).expect("seuqence overflow");
+            if a_h.sequence > b_plus_1 {
+                return Err(Error::ParentSkipped);
+            }
+
+            // If a is immediate parent of b, it must connect and be monotonic.
+            if a_h.sequence.checked_add(1) == Some(b_h.sequence) {
+                assert_ne!(a_h.checksum, b_h.checksum);
+                assert_eq!(a_h.cluster, b_h.cluster);
+                assert_eq!(a_h.vsr_state.replica_id, b_h.vsr_state.replica_id);
+
+                if a_h.checksum != b_h.parent {
+                    return Err(Error::ParentNotConnected);
+                }
+
+                if !VsrState::monotonic(&a_h.vsr_state, &b_h.vsr_state) {
+                    return Err(Error::VsrStateNotMonotonic);
+                }
+
+                assert!(b_h.valid_checksum());
+                b.assert_invariants();
+                return Ok(b);
+            }
+        }
+
+        assert!(b_h.valid_checksum());
+        b.assert_invariants();
+        Ok(b)
+    }
+
     fn sort_priority_descending(a: &Quorum<COPIES>, b: &Quorum<COPIES>) -> Ordering {
         assert!(a.has_header());
         assert!(b.has_header());
@@ -307,6 +393,38 @@ impl<const COPIES: usize> Quorums<COPIES> {
 
         // Stable and deterministic.
         b_h.checksum.cmp(&a_h.checksum)
+    }
+
+    fn count_copy(&mut self, copy: &SuperBlockHeader, slot: usize, threshold: Threshold) {
+        assert!(slot < COPIES);
+
+        let threshold_count = threshold.count::<COPIES>();
+        assert!(threshold_count >= 2 && threshold_count <= 5);
+
+        if !copy.valid_checksum() {
+            return;
+        }
+
+        let quorum = self.find_or_insert_quorum_for_copy(copy);
+        assert!(quorum.has_header());
+        let q_h = unsafe { &*quorum.header() };
+        assert_eq!(q_h.checksum, copy.checksum);
+        assert!(q_h.equal(copy));
+
+        // - If copy.copy is corrupt (>= COPIES), assume slot is correct; count as slot.
+        // - Else if we already counted this copy index, ignore duplicate.
+        // - Else count by copy.copy (copy index), even if the read was misdirected.
+        if (copy.copy as usize) >= COPIES {
+            quorum.slots[slot] = Some(slot as u8);
+            quorum.copies.set(slot as u8);
+        } else if quorum.copies.is_set(copy.copy as u8) {
+            // Ignore duplicate copy index.
+        } else {
+            quorum.slots[slot] = Some(copy.copy as u8);
+            quorum.copies.set(copy.copy as u8);
+        }
+
+        quorum.valid = quorum.copies.count() >= threshold_count
     }
 
     fn find_or_insert_quorum_for_copy(&mut self, copy: &SuperBlockHeader) -> &mut Quorum<COPIES> {
