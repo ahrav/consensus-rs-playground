@@ -195,6 +195,43 @@ impl Slot {
     }
 }
 
+/// Inclusive range of slots in the circular buffer.
+///
+/// Represents a contiguous segment when `head <= tail`, or a wrap-around
+/// segment when `head > tail`. Excludes `head == tail` since it's ambiguous
+/// in circular buffers—could mean "one slot" or "all slots after full wrap".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SlotRange {
+    pub head: Slot,
+    pub tail: Slot,
+}
+
+impl SlotRange {
+    /// Checks if `slot` falls within this range.
+    ///
+    /// Visual (`·`=included, ` `=excluded):
+    ///
+    /// * `head < tail` → `  head··tail  `
+    /// * `head > tail` → `··tail  head··` (wraps around)
+    ///
+    /// # Panics
+    ///
+    /// Panics if `head == tail`. For single-slot checks, compare `slot == head` directly.
+    #[inline]
+    pub fn contains(&self, slot: Slot) -> bool {
+        assert!(self.head.0 != self.tail.0);
+
+        if self.head.index() < self.tail.index() {
+            return self.head.index() <= slot.index() && slot.index() <= self.tail.index();
+        }
+        if self.head.index() > self.tail.index() {
+            return slot.index() <= self.tail.index() || self.head.index() <= slot.index();
+        }
+
+        unreachable!("head == tail is handled by assertion above");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
