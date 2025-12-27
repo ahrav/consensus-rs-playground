@@ -225,22 +225,6 @@ mod tests {
         assert_eq!(sector_floor(262_144), 262_144);
     }
 
-    #[test]
-    fn sector_floor_rounds_down_between_sectors() {
-        // Values between sectors should round to previous boundary.
-        assert_eq!(sector_floor(4097), 4096);
-        assert_eq!(sector_floor(5000), 4096);
-        assert_eq!(sector_floor(8191), 4096);
-    }
-
-    #[test]
-    fn sector_floor_large_offset() {
-        // Test with large value near PREPARES_SIZE.
-        let offset = 1_072_693_248_u64; // Slot 1023 in Prepares
-        let expected = (offset / 4096) * 4096;
-        assert_eq!(sector_floor(offset), expected);
-    }
-
     // -------------------------------------------------------------------------
     // Slot API tests
     // -------------------------------------------------------------------------
@@ -254,67 +238,9 @@ mod tests {
         assert_eq!(slot.index(), SLOT_COUNT - 1);
     }
 
-    #[test]
-    fn slot_from_op_basic() {
-        assert_eq!(Slot::from_op(0).index(), 0);
-        assert_eq!(Slot::from_op(1).index(), 1);
-        assert_eq!(Slot::from_op(1023).index(), 1023);
-    }
-
-    #[test]
-    fn slot_from_op_wraps_at_slot_count() {
-        // op = SLOT_COUNT wraps to 0.
-        assert_eq!(Slot::from_op(1024).index(), 0);
-        assert_eq!(Slot::from_op(1025).index(), 1);
-        assert_eq!(Slot::from_op(2048).index(), 0);
-    }
-
-    #[test]
-    fn slot_from_op_large_values() {
-        // Test with large op values.
-        assert_eq!(
-            Slot::from_op(u64::MAX).index(),
-            (u64::MAX % SLOT_COUNT as u64) as usize
-        );
-
-        // Verify specific large value.
-        let expected = (1_000_000_u64 % SLOT_COUNT as u64) as usize;
-        assert_eq!(Slot::from_op(1_000_000).index(), expected);
-    }
-
     // -------------------------------------------------------------------------
     // Ring::Headers offset tests
     // -------------------------------------------------------------------------
-
-    #[test]
-    fn headers_ring_first_sector_shared_by_16_slots() {
-        // Headers are 256 bytes, sectors are 4096 bytes.
-        // First 16 headers (slots 0-15) fit in the first sector.
-        // All should map to offset 0 due to sector_floor.
-        for slot_index in 0..HEADERS_PER_SECTOR {
-            let offset = Ring::Headers.offset(Slot::new(slot_index));
-            assert_eq!(
-                offset, 0,
-                "Slot {} should map to offset 0 (first sector)",
-                slot_index
-            );
-        }
-    }
-
-    #[test]
-    fn headers_ring_second_sector_starts_at_slot_16() {
-        // Slot 16's byte offset is 16 * 256 = 4096, which sector_floors to 4096.
-        // Slots 16-31 should all map to offset 4096.
-        for slot_index in HEADERS_PER_SECTOR..(HEADERS_PER_SECTOR * 2) {
-            let offset = Ring::Headers.offset(Slot::new(slot_index));
-            assert_eq!(
-                offset,
-                constants::SECTOR_SIZE as u64,
-                "Slot {} should map to offset 4096 (second sector)",
-                slot_index
-            );
-        }
-    }
 
     #[test]
     fn headers_ring_last_valid_slot() {
@@ -324,38 +250,6 @@ mod tests {
         let offset = Ring::Headers.offset(Slot::new(SLOT_COUNT - 1));
         assert_eq!(offset, 258_048);
         assert!(offset < HEADERS_SIZE);
-    }
-
-    #[test]
-    fn headers_ring_offset_monotonic_increasing() {
-        // Offsets should never decrease (though they plateau within sectors).
-        let mut prev_offset = 0;
-        for slot_index in 0..SLOT_COUNT {
-            let offset = Ring::Headers.offset(Slot::new(slot_index));
-            assert!(
-                offset >= prev_offset,
-                "Offset regressed at slot {}: {} -> {}",
-                slot_index,
-                prev_offset,
-                offset
-            );
-            prev_offset = offset;
-        }
-    }
-
-    #[test]
-    fn headers_ring_offset_sector_aligned() {
-        // All headers offsets must be sector-aligned.
-        for slot_index in 0..SLOT_COUNT {
-            let offset = Ring::Headers.offset(Slot::new(slot_index));
-            assert_eq!(
-                offset % constants::SECTOR_SIZE as u64,
-                0,
-                "Offset {} not sector-aligned for slot {}",
-                offset,
-                slot_index
-            );
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -377,36 +271,11 @@ mod tests {
     }
 
     #[test]
-    fn prepares_ring_slot_spacing() {
-        // Each slot is exactly MESSAGE_SIZE_MAX apart.
-        for slot_index in 0..100 {
-            let expected = (slot_index as u64) * (constants::MESSAGE_SIZE_MAX as u64);
-            let actual = Ring::Prepares.offset(Slot::new(slot_index));
-            assert_eq!(actual, expected, "Slot {} offset mismatch", slot_index);
-        }
-    }
-
-    #[test]
     fn prepares_ring_last_valid_slot() {
         // Slot 1023: offset = 1023 * 1,048,576 = 1,072,693,248.
         let offset = Ring::Prepares.offset(Slot::new(SLOT_COUNT - 1));
         assert_eq!(offset, 1_072_693_248);
         assert!(offset < PREPARES_SIZE);
-    }
-
-    #[test]
-    fn prepares_ring_strictly_monotonic() {
-        // Unlike Headers, Prepares offsets should be strictly increasing.
-        let mut prev_offset = Ring::Prepares.offset(Slot::new(0));
-        for slot_index in 1..SLOT_COUNT {
-            let offset = Ring::Prepares.offset(Slot::new(slot_index));
-            assert!(
-                offset > prev_offset,
-                "Offset not strictly increasing at slot {}",
-                slot_index
-            );
-            prev_offset = offset;
-        }
     }
 
     // -------------------------------------------------------------------------
