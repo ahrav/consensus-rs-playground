@@ -80,7 +80,28 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     /// Returns `true` when every bit in `[0, N)` is set.
     #[inline]
     pub const fn is_full(&self) -> bool {
-        self.count() == N
+        let mut i = 0;
+        // Check all complete words.
+        while i + 1 < WORDS {
+            if self.words[i] != u64::MAX {
+                return false;
+            }
+            i += 1;
+        }
+
+        // Check last word with proper mask for remaining bits.
+        if WORDS > 0 {
+            let remaining_bits = N % 64;
+            let mask = if remaining_bits == 0 {
+                u64::MAX
+            } else {
+                (1u64 << remaining_bits) - 1
+            };
+            if self.words[WORDS - 1] != mask {
+                return false;
+            }
+        }
+        true
     }
 
     /// Creates a bitset with all bits set.
@@ -191,11 +212,14 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     #[inline]
     pub const fn set_value(&mut self, idx: usize, value: bool) {
         assert!(idx < N, "bit index out of bounds");
-        if value {
-            self.set(idx)
-        } else {
-            self.unset(idx);
-        }
+        let word_idx = idx / 64;
+        let bit_idx = idx % 64;
+        let bit_mask = 1u64 << bit_idx;
+
+        // Branchless: clear the bit, then OR in the new value.
+        let val_mask = (value as u64) << bit_idx;
+        self.words[word_idx] = (self.words[word_idx] & !bit_mask) | val_mask;
+
         debug_assert!(self.is_set(idx) == value);
     }
 
