@@ -1102,7 +1102,7 @@ mod tests {
                 copy,
                 parent.cluster,
                 parent.vsr_state.replica_id,
-                parent.checksum, // Link to parent
+                parent.checksum,       // Link to parent
                 parent.vsr_state.view, // Same view (monotonic)
             );
             // Copy parent's members and replica_count for matching.
@@ -1583,10 +1583,7 @@ mod tests {
             };
 
             // Equal quorums should compare as Equal.
-            assert_eq!(
-                Quorums::sort_priority_descending(&q, &q),
-                Ordering::Equal
-            );
+            assert_eq!(Quorums::sort_priority_descending(&q, &q), Ordering::Equal);
         }
 
         #[test]
@@ -1669,7 +1666,10 @@ mod tests {
 
             // More copies beats fewer copies.
             assert_eq!(
-                Quorums::sort_priority_descending(&valid_high_seq_many_low_cksum, &valid_high_seq_few),
+                Quorums::sort_priority_descending(
+                    &valid_high_seq_many_low_cksum,
+                    &valid_high_seq_few
+                ),
                 Ordering::Less
             );
 
