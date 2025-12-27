@@ -3,6 +3,8 @@
 //! The superblock is replicated across multiple copies to survive disk failures.
 //! This module determines how many copies must agree (quorum) for safe operations.
 
+use std::cmp::Ordering;
+
 use crate::vsr::superblock::SuperBlockHeader;
 
 /// Maximum superblock copies. Bounded by practical storage constraints.
@@ -248,6 +250,94 @@ impl<const COPIES: usize> Quorum<COPIES> {
         assert!(self.valid);
         self.assert_invariants();
         RepairIterator::new(self.slots)
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Quorums<const COPIES: usize> {
+    array: [Quorum<COPIES>; COPIES],
+    count: u8,
+}
+
+impl<const COPIES: usize> Default for Quorums<COPIES> {
+    fn default() -> Self {
+        const { validate_copies::<COPIES>() };
+        Self {
+            array: [Quorum::default(); COPIES],
+            count: 0,
+        }
+    }
+}
+
+impl<const COPIES: usize> Quorums<COPIES> {
+    #[inline]
+    fn slice(&self) -> &[Quorum<COPIES>] {
+        &self.array[..self.count as usize]
+    }
+
+    #[inline]
+    fn slice_mut(&mut self) -> &mut [Quorum<COPIES>] {
+        &mut self.array[..self.count as usize]
+    }
+
+    fn assert_invariants(&self) {
+        assert!((self.count as usize) <= COPIES);
+        self.array.iter().for_each(|q| q.assert_invariants());
+    }
+
+    fn sort_priority_descending(a: &Quorum<COPIES>, b: &Quorum<COPIES>) -> Ordering {
+        assert!(a.has_header());
+        assert!(b.has_header());
+
+        let a_h = unsafe { &*a.header };
+        let b_h = unsafe { &*b.header };
+
+        if a.valid != b.valid {
+            return b.valid.cmp(&a.valid);
+        }
+
+        if a_h.sequence != b_h.sequence {
+            return b_h.sequence.cmp(&a_h.sequence);
+        }
+
+        let a_count = a.copies.count();
+        let b_count = b.copies.count();
+        if a_count != b_count {
+            return b_count.cmp(&a_count);
+        }
+
+        // Stable and deterministic.
+        b_h.checksum.cmp(&a_h.checksum)
+    }
+
+    fn find_or_insert_quorum_for_copy(&mut self, copy: &SuperBlockHeader) -> &mut Quorum<COPIES> {
+        assert!(copy.valid_checksum());
+
+        // Phase 1: Find existing quorum by index (no mutable borrow held across iterations)
+        let existing_idx = (0..self.count as usize).find(|&i| {
+            let q = &self.array[i];
+            assert!(q.has_header());
+
+            let q_h = unsafe { &*q.header };
+            q_h.checksum == copy.checksum
+        });
+
+        if let Some(idx) = existing_idx {
+            return &mut self.array[idx];
+        }
+
+        // Phase 2: Insert a new quorum
+        let idx = self.count as usize;
+        assert!(idx < COPIES);
+
+        self.array[idx] = Quorum {
+            header: copy as *const _,
+            valid: false,
+            copies: QuorumCount::empty(),
+            slots: [None; COPIES],
+        };
+        self.count += 1;
+
+        &mut self.array[idx]
     }
 }
 
