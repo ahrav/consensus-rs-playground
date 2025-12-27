@@ -207,6 +207,40 @@ impl<const COPIES: usize> Quorum<COPIES> {
     // }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct RepairIterator<const COPIES: usize> {
+    slots: [Option<u8>; COPIES],
+    repairs_returned: u8,
+}
+
+impl<const COPIES: usize> RepairIterator<COPIES> {
+    pub fn new(slots: [Option<u8>; COPIES]) -> Self {
+        const { validate_copies::<COPIES>() };
+        Self {
+            slots,
+            repairs_returned: 0,
+        }
+    }
+
+    fn compute_copy_sets(&self) -> (QuorumCount, QuorumCount) {
+        let mut copies_any = QuorumCount::empty();
+        let mut copies_duplicate = QuorumCount::empty();
+
+        for slot in self.slots.iter() {
+            if let Some(copy) = *slot {
+                assert!((copy as usize) < COPIES);
+
+                if copies_any.is_set(copy) {
+                    copies_duplicate.set(copy);
+                }
+                copies_any.set(copy);
+            }
+        }
+
+        (copies_any, copies_duplicate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
