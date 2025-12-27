@@ -106,6 +106,19 @@ pub const VIEW_HEADERS_MAX: usize = VIEW_CHANGE_HEADERS_SUFFIX_MAX + 2;
 /// Number of slots in the journal ring.
 pub const JOURNAL_SLOT_COUNT: usize = 1024;
 
+/// Size of the journal headers section in bytes.
+pub const JOURNAL_SIZE_HEADERS: u64 = (JOURNAL_SLOT_COUNT as u64) * (HEADER_SIZE as u64);
+
+/// Size of the journal prepares section in bytes.
+pub const JOURNAL_SIZE_PREPARES: u64 = (JOURNAL_SLOT_COUNT as u64) * (MESSAGE_SIZE_MAX as u64);
+
+/// The maximum number of concurrent WAL read I/O operations to allow at once.
+pub const JOURNAL_IOPS_READ_MAX: u32 = 8;
+
+/// The maximum number of concurrent WAL write I/O operations to allow at once.
+/// Ideally this is at least as high as PIPELINE_PREPARE_QUEUE_MAX, but it is safe to be lower.
+pub const JOURNAL_IOPS_WRITE_MAX: u32 = 32;
+
 /// Maximum operations between checkpoints. Derived from journal size minus:
 /// - One full LSM compaction cycle (32 ops)
 /// - Space for in-flight pipeline prepares (doubled for view-change safety, rounded to compaction boundary)
