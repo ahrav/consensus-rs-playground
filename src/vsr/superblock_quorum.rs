@@ -148,16 +148,37 @@ impl QuorumCount {
     }
 }
 
+/// Result of quorum analysis across superblock copies.
+///
+/// After reading all `COPIES` superblock slots, this struct captures which copies
+/// agreed on the same header content. The quorum is "valid" when enough copies
+/// match to meet the [`Threshold`] requirement.
+///
+/// # Slot Mapping
+///
+/// Physical storage has `COPIES` slots numbered 0..COPIES. Each valid superblock
+/// contains a "copy index" field indicating which slot it *should* occupy.
+/// Misdirected writes (copy in wrong slot) and duplicates are tracked here
+/// to enable repair decisions.
+///
+/// # Lifetime
+///
+/// The `header` pointer is borrowed from the caller's buffer. This struct must
+/// not outlive the superblock data it references.
 #[derive(Clone, Copy, Debug)]
 pub struct Quorum<const COPIES: usize> {
-    /// Pointer to the representative header for this quorum (first encountered).
+    /// First-seen header for this quorum group. Used as the canonical reference
+    /// when multiple copies agree. Null until a valid header is encountered.
     header: *const SuperBlockHeader,
 
+    /// `true` if this quorum meets the threshold for the intended operation.
     pub valid: bool,
+
+    /// Bitset tracking which copy indices are present in this quorum.
     pub copies: QuorumCount,
 
-    /// For each physical slot `i`, `slots[i]` contains the *copy index* found in that slot,
-    /// or `None` if the slot is invalid or ignored (e.g. duplicate).
+    /// Slot-to-copy mapping. `slots[i] = Some(c)` means physical slot `i`
+    /// contains copy index `c`. `None` indicates invalid/missing/ignored.
     pub slots: [Option<u8>; COPIES],
 }
 
@@ -178,12 +199,29 @@ impl<const COPIES: usize> Quorum<COPIES> {
         !self.header.is_null()
     }
 
+    /// Returns the representative header for this quorum.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the original superblock buffer outlives this reference.
+    /// The pointer was set during quorum construction from caller-provided data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no header was ever recorded (quorum is empty).
     #[inline]
     pub unsafe fn header(&self) -> &SuperBlockHeader {
         assert!(self.has_header());
         unsafe { &*self.header }
     }
 
+    /// Validates internal consistency. Used defensively before operations.
+    ///
+    /// # Invariants checked
+    ///
+    /// - Valid quorums have a header
+    /// - `copies.count()` equals the number of `Some` entries in `slots`
+    /// - All copy indices in `slots` are within bounds
     fn assert_invariants(&self) {
         if self.valid {
             assert!(self.has_header());
@@ -200,20 +238,68 @@ impl<const COPIES: usize> Quorum<COPIES> {
         );
     }
 
-    // pub fn repairs(&self) -> RepairIterator<COPIES> {
-    //     assert!(self.valid);
-    //     self.assert_invariants();
-    //     RepairIterator::new(self.slots);
-    // }
+    /// Returns an iterator yielding slot indices that need repair.
+    ///
+    /// Repairs restore each slot to contain its "home" copy (slot `i` should
+    /// hold copy `i`). See [`RepairIterator`] for priority ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the quorum is not valid.
+    pub fn repairs(&self) -> RepairIterator<COPIES> {
+        assert!(self.valid);
+        self.assert_invariants();
+        RepairIterator::new(self.slots)
+    }
 }
 
+/// Iterates over slot indices requiring repair, in priority order.
+///
+/// The goal is to restore the invariant that slot `i` contains copy `i`.
+/// After all repairs, the superblock array will have each copy in its home slot.
+///
+/// # Repair Priority (highest to lowest)
+///
+/// 1. **Empty slot, missing copy**: Slot `i` is empty AND copy `i` doesn't exist
+///    anywhere. This is the most critical—we're missing data entirely.
+///
+/// 2. **Empty slot, misdirected copy**: Slot `i` is empty but copy `i` exists
+///    in some other slot. We can recover by copying from the misdirected location.
+///
+/// 3. **Duplicate in wrong slot**: Slot `i` contains copy `j` (where `j ≠ i`)
+///    and copy `j` also exists elsewhere. Safe to overwrite since we have a backup.
+///
+/// # Mutation
+///
+/// Each call to `next()` updates internal state as if the repair succeeded,
+/// marking `slots[repair_slot] = Some(repair_slot)`. This prevents returning
+/// the same slot twice and allows priority recalculation.
+///
+/// # Example
+///
+/// ```ignore
+/// // slots: [Some(1), None, Some(1), Some(3)]
+/// // - slot 0 has copy 1 (misdirected)
+/// // - slot 1 is empty, copy 1 exists elsewhere (priority 2)
+/// // - slot 2 has copy 1 (duplicate of slot 0)
+/// // - slot 3 has copy 3 (correct)
+/// //
+/// // Iterator yields: 1 (empty, copy exists), 0 (has duplicate), 2 (has duplicate)
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct RepairIterator<const COPIES: usize> {
+    /// Current slot state, mutated as repairs are "applied" during iteration.
     slots: [Option<u8>; COPIES],
+    /// Count of repairs yielded so far. Bounded by `COPIES`.
     repairs_returned: u8,
 }
 
 impl<const COPIES: usize> RepairIterator<COPIES> {
+    /// Creates a new repair iterator from the given slot mapping.
+    ///
+    /// # Compile-time constraint
+    ///
+    /// `COPIES` must be 4, 6, or 8.
     pub fn new(slots: [Option<u8>; COPIES]) -> Self {
         const { validate_copies::<COPIES>() };
         Self {
@@ -222,6 +308,11 @@ impl<const COPIES: usize> RepairIterator<COPIES> {
         }
     }
 
+    /// Computes two sets: all copies present, and copies appearing more than once.
+    ///
+    /// Returns `(copies_any, copies_duplicate)` where:
+    /// - `copies_any`: bitset of all copy indices found in any slot
+    /// - `copies_duplicate`: subset of `copies_any` appearing in 2+ slots
     fn compute_copy_sets(&self) -> (QuorumCount, QuorumCount) {
         let mut copies_any = QuorumCount::empty();
         let mut copies_duplicate = QuorumCount::empty();
@@ -238,6 +329,69 @@ impl<const COPIES: usize> RepairIterator<COPIES> {
         }
 
         (copies_any, copies_duplicate)
+    }
+}
+
+impl<const COPIES: usize> Iterator for RepairIterator<COPIES> {
+    type Item = u8;
+
+    /// Returns the next slot index to repair, or `None` when all slots are correct.
+    ///
+    /// Internally marks the returned slot as repaired (sets `slots[i] = Some(i)`)
+    /// so subsequent calls see updated state.
+    fn next(&mut self) -> Option<Self::Item> {
+        const { validate_copies::<COPIES>() };
+
+        // Precondition: all copy indices are in bounds.
+        assert!(
+            self.slots
+                .iter()
+                .all(|slot| slot.is_none() || (slot.unwrap() as usize) < COPIES)
+        );
+
+        let (copies_any, copies_duplicate) = self.compute_copy_sets();
+
+        // Find candidates at each priority level.
+        // We take the first match at the highest priority that has one.
+        let mut priority_1: Option<u8> = None; // Empty slot, copy missing entirely
+        let mut priority_2: Option<u8> = None; // Empty slot, copy exists elsewhere
+        let mut priority_3: Option<u8> = None; // Wrong copy, but it's a duplicate
+
+        for i in 0..COPIES {
+            let i_u8 = i as u8;
+            let slot = self.slots[i];
+
+            if slot.is_none() && !copies_any.is_set(i_u8) {
+                priority_1 = Some(i_u8);
+            }
+            if slot.is_none() && copies_any.is_set(i_u8) {
+                priority_2 = Some(i_u8);
+            }
+            if let Some(slot_copy) = slot {
+                // Slot contains wrong copy, and that copy is duplicated elsewhere.
+                if slot_copy != i_u8 && copies_duplicate.is_set(slot_copy) {
+                    priority_3 = Some(i_u8);
+                }
+            }
+        }
+
+        let repair = priority_1.or(priority_2).or(priority_3);
+
+        let Some(repair_slot) = repair else {
+            // No repairs needed: all slots should be populated.
+            assert!(self.slots.iter().all(|s| s.is_some()));
+            return None;
+        };
+
+        assert!((repair_slot as usize) < COPIES);
+
+        // Mark as repaired: slot now contains its home copy.
+        self.slots[repair_slot as usize] = Some(repair_slot);
+
+        self.repairs_returned += 1;
+        assert!((self.repairs_returned as usize) <= COPIES);
+
+        Some(repair_slot)
     }
 }
 
