@@ -3455,9 +3455,9 @@ mod tests {
         let mut headers = make_quorum_headers(5, 42);
 
         // Override copies 2,3 with higher sequence.
-        for i in 2..4 {
-            headers[i].sequence = 10;
-            headers[i].set_checksum();
+        for header in &mut headers[2..4] {
+            header.sequence = 10;
+            header.set_checksum();
         }
         populate_disk_with_headers(&mut storage, &headers);
 
