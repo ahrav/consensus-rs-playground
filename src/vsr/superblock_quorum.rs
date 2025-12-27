@@ -1147,6 +1147,26 @@ mod tests {
         }
 
         #[test]
+        fn working_error_quorum_lost_with_duplicate_copy_indices() {
+            // Two valid headers with the same copy index should count once.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            let header = make_header(10, 0, 1, 1, 0);
+            copies[0] = header;
+            copies[1] = header; // Duplicate copy index 0 in a different slot.
+
+            copies[2] = make_header(10, 2, 1, 1, 0);
+            copies[3] = make_header(10, 3, 1, 1, 0);
+            corrupt_checksum(&mut copies[2]);
+            corrupt_checksum(&mut copies[3]);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::QuorumLost);
+        }
+
+        #[test]
         fn working_error_fork() {
             // Two quorums with same sequence, different checksums, same cluster/replica.
             // Quorum A: copies 0, 1 with one checksum.
@@ -1311,6 +1331,28 @@ mod tests {
             let q = result.unwrap();
             let header = unsafe { q.header() };
             assert_eq!(header.sequence, 10);
+        }
+
+        #[test]
+        fn working_prefers_valid_over_invalid_higher_sequence() {
+            // Valid quorum at seq=10 should beat invalid quorum at seq=11.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            copies[0] = make_header(10, 0, 1, 1, 0);
+            copies[1] = make_header(10, 1, 1, 1, 0);
+
+            copies[2] = make_header(11, 2, 1, 1, 0); // Higher sequence, but only 1 copy.
+            copies[3] = make_header(11, 3, 1, 1, 0);
+            corrupt_checksum(&mut copies[3]); // Keep quorum invalid.
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            let header = unsafe { q.header() };
+            assert_eq!(header.sequence, 10);
+            assert!(q.valid);
         }
 
         #[test]
@@ -1705,6 +1747,21 @@ mod tests {
         }
 
         #[test]
+        fn count_copy_misdirected_write_uses_header_index() {
+            // Header copy index should be trusted over the slot position.
+            let header = make_header(10, 3, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 0, Threshold::Open);
+
+            assert_eq!(quorums.count, 1);
+            let q = &quorums.array[0];
+            assert!(q.copies.is_set(3));
+            assert!(!q.copies.is_set(0));
+            assert_eq!(q.slots[0], Some(3));
+        }
+
+        #[test]
         fn count_copy_duplicate_ignored() {
             // Two headers with same checksum, same copy index.
             let header = make_header(10, 1, 1, 1, 0);
@@ -1772,6 +1829,70 @@ mod tests {
         // =====================================================================
         // Multi-COPIES Variants
         // =====================================================================
+
+        #[test]
+        fn working_exactly_threshold_copies_open_6() {
+            // Open threshold for COPIES=6 is 3.
+            let mut copies: [SuperBlockHeader; 6] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[3]);
+            corrupt_checksum(&mut copies[4]);
+            corrupt_checksum(&mut copies[5]);
+
+            let mut quorums = Quorums::<6>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 3);
+        }
+
+        #[test]
+        fn working_verify_requires_more_6() {
+            // Verify threshold for COPIES=6 is 4; only 3 valid copies present.
+            let mut copies: [SuperBlockHeader; 6] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[3]);
+            corrupt_checksum(&mut copies[4]);
+            corrupt_checksum(&mut copies[5]);
+
+            let mut quorums = Quorums::<6>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert_eq!(result.unwrap_err(), Error::QuorumLost);
+        }
+
+        #[test]
+        fn working_exactly_threshold_copies_open_8() {
+            // Open threshold for COPIES=8 is 4.
+            let mut copies: [SuperBlockHeader; 8] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[4]);
+            corrupt_checksum(&mut copies[5]);
+            corrupt_checksum(&mut copies[6]);
+            corrupt_checksum(&mut copies[7]);
+
+            let mut quorums = Quorums::<8>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 4);
+        }
+
+        #[test]
+        fn working_verify_requires_more_8() {
+            // Verify threshold for COPIES=8 is 5; only 4 valid copies present.
+            let mut copies: [SuperBlockHeader; 8] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[4]);
+            corrupt_checksum(&mut copies[5]);
+            corrupt_checksum(&mut copies[6]);
+            corrupt_checksum(&mut copies[7]);
+
+            let mut quorums = Quorums::<8>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert_eq!(result.unwrap_err(), Error::QuorumLost);
+        }
 
         #[test]
         fn working_error_fork_6() {
