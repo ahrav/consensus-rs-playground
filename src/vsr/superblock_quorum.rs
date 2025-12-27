@@ -1004,6 +1004,1094 @@ mod tests {
     }
 
     // =========================================================================
+    // Quorums Tests
+    // =========================================================================
+
+    mod quorums_tests {
+        use super::*;
+        use crate::vsr::members::Members;
+        use crate::vsr::wire::checksum::checksum;
+
+        // =====================================================================
+        // Test Helpers
+        // =====================================================================
+
+        /// Creates a SuperBlockHeader with specified values and valid checksum.
+        fn make_header(
+            sequence: u64,
+            copy: u16,
+            cluster: u128,
+            replica_id: u128,
+            parent: u128,
+        ) -> SuperBlockHeader {
+            let mut h = SuperBlockHeader::zeroed();
+            h.sequence = sequence;
+            h.copy = copy;
+            h.cluster = cluster;
+            h.parent = parent;
+            h.vsr_state.replica_id = replica_id;
+            h.checksum = h.calculate_checksum();
+            h
+        }
+
+        /// Creates a header with a VsrState that passes assert_internally_consistent().
+        /// Use this for tests that involve VsrState::monotonic() checks.
+        fn make_header_with_valid_vsr(
+            sequence: u64,
+            copy: u16,
+            cluster: u128,
+            replica_id: u128,
+            parent: u128,
+            view: u32,
+        ) -> SuperBlockHeader {
+            use crate::constants;
+
+            let mut h = SuperBlockHeader::zeroed();
+            h.sequence = sequence;
+            h.copy = copy;
+            h.cluster = cluster;
+            h.parent = parent;
+
+            // Set up a minimal valid VsrState.
+            h.vsr_state.replica_id = replica_id;
+            h.vsr_state.replica_count = 1;
+            h.vsr_state.view = view;
+            h.vsr_state.log_view = view; // view >= log_view
+
+            // Members must contain replica_id.
+            let mut members = Members::zeroed();
+            members.0[0] = replica_id;
+            h.vsr_state.members = members;
+
+            // Checksum fields must be checksum(&[]) for empty block references.
+            let empty_checksum = checksum(&[]);
+            h.vsr_state.checkpoint.free_set_blocks_acquired_checksum = empty_checksum;
+            h.vsr_state.checkpoint.free_set_blocks_released_checksum = empty_checksum;
+            h.vsr_state.checkpoint.client_sessions_checksum = empty_checksum;
+
+            // Storage size must be >= DATA_FILE_SIZE_MIN.
+            h.vsr_state.checkpoint.storage_size = constants::DATA_FILE_SIZE_MIN;
+
+            // Set non-zero checkpoint header checksum to avoid root baseline constraints
+            // (which require view=0 and log_view=0 when checksum=0 and op=0).
+            h.vsr_state.checkpoint.header.checksum = 0xDEADBEEF;
+
+            h.checksum = h.calculate_checksum();
+            h
+        }
+
+        /// Creates COPIES agreeing headers (different copy indices, same content).
+        fn make_agreeing_copies<const COPIES: usize>(
+            sequence: u64,
+            cluster: u128,
+            replica_id: u128,
+            parent: u128,
+        ) -> [SuperBlockHeader; COPIES] {
+            std::array::from_fn(|i| make_header(sequence, i as u16, cluster, replica_id, parent))
+        }
+
+        /// Corrupts a header's checksum to make it invalid.
+        fn corrupt_checksum(h: &mut SuperBlockHeader) {
+            h.checksum ^= 1;
+        }
+
+        /// Creates a child header with valid VsrState for monotonicity checks.
+        fn make_child_with_valid_vsr(parent: &SuperBlockHeader, copy: u16) -> SuperBlockHeader {
+            let mut child = make_header_with_valid_vsr(
+                parent.sequence + 1,
+                copy,
+                parent.cluster,
+                parent.vsr_state.replica_id,
+                parent.checksum, // Link to parent
+                parent.vsr_state.view, // Same view (monotonic)
+            );
+            // Copy parent's members and replica_count for matching.
+            child.vsr_state.members = parent.vsr_state.members;
+            child.vsr_state.replica_count = parent.vsr_state.replica_count;
+            child.checksum = child.calculate_checksum();
+            child
+        }
+
+        // =====================================================================
+        // working() Error Cases
+        // =====================================================================
+
+        #[test]
+        fn working_error_not_found() {
+            // All copies have invalid checksums.
+            let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+            for c in &mut copies {
+                corrupt_checksum(c);
+            }
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::NotFound);
+        }
+
+        #[test]
+        fn working_error_quorum_lost() {
+            // Best group has threshold-1 copies (1 for Open with COPIES=4).
+            let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+            // Corrupt all but one copy.
+            corrupt_checksum(&mut copies[1]);
+            corrupt_checksum(&mut copies[2]);
+            corrupt_checksum(&mut copies[3]);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            // Open threshold for 4 copies is 2, we only have 1.
+            assert_eq!(result.unwrap_err(), Error::QuorumLost);
+        }
+
+        #[test]
+        fn working_error_fork() {
+            // Two quorums with same sequence, different checksums, same cluster/replica.
+            // Quorum A: copies 0, 1 with one checksum.
+            // Quorum B: copies 2, 3 with different checksum (different parent).
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            // Quorum A: sequence 10, parent = 100.
+            copies[0] = make_header(10, 0, 1, 1, 100);
+            copies[1] = make_header(10, 1, 1, 1, 100);
+
+            // Quorum B: sequence 10, parent = 200 (different parent -> different checksum).
+            copies[2] = make_header(10, 2, 1, 1, 200);
+            copies[3] = make_header(10, 3, 1, 1, 200);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::Fork);
+        }
+
+        #[test]
+        fn working_error_parent_skipped() {
+            // Best quorum seq=10 (valid), other quorum seq=12 (invalid, 1 copy).
+            // The ParentSkipped error is triggered when another quorum has
+            // sequence > best.sequence + 1, indicating missing intermediate states.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            // Best quorum: 3 copies at sequence 10 (valid).
+            copies[0] = make_header(10, 0, 1, 1, 0);
+            copies[1] = make_header(10, 1, 1, 1, 0);
+            copies[2] = make_header(10, 2, 1, 1, 0);
+
+            // Other quorum: 1 copy at sequence 12 (invalid, but has valid checksum).
+            // Since it's invalid, seq=10 is best. But 12 > 10+1=11, so ParentSkipped.
+            copies[3] = make_header(12, 3, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::ParentSkipped);
+        }
+
+        #[test]
+        fn working_error_parent_not_connected() {
+            // Parent seq=9, child seq=10 with child.parent != parent.checksum.
+            let parent = make_header(9, 2, 1, 1, 0);
+
+            // Child with WRONG parent checksum.
+            let mut child0 = make_header(10, 0, 1, 1, 0xDEADBEEF);
+            child0.vsr_state.view = parent.vsr_state.view;
+            child0.checksum = child0.calculate_checksum();
+
+            let mut child1 = make_header(10, 1, 1, 1, 0xDEADBEEF);
+            child1.vsr_state.view = parent.vsr_state.view;
+            child1.checksum = child1.calculate_checksum();
+
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+            // Child quorum: 2 copies at sequence 10 with DIFFERENT copy indices.
+            copies[0] = child0;
+            copies[1] = child1;
+
+            // Parent quorum: 2 copies at sequence 9.
+            copies[2] = parent;
+            let mut parent2 = make_header(9, 3, 1, 1, 0);
+            parent2.checksum = parent2.calculate_checksum();
+            copies[3] = parent2;
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::ParentNotConnected);
+        }
+
+        #[test]
+        fn working_error_vsr_state_not_monotonic() {
+            // Parent view=5, child view=4 (regression).
+            // Use valid VsrState so monotonic() can run without panicking.
+            let parent = make_header_with_valid_vsr(9, 2, 1, 1, 0, 5);
+
+            // Child with correct parent link but regressed view.
+            let mut child0 = make_header_with_valid_vsr(10, 0, 1, 1, parent.checksum, 4);
+            child0.vsr_state.members = parent.vsr_state.members;
+            child0.vsr_state.replica_count = parent.vsr_state.replica_count;
+            child0.checksum = child0.calculate_checksum();
+
+            let mut child1 = make_header_with_valid_vsr(10, 1, 1, 1, parent.checksum, 4);
+            child1.vsr_state.members = parent.vsr_state.members;
+            child1.vsr_state.replica_count = parent.vsr_state.replica_count;
+            child1.checksum = child1.calculate_checksum();
+
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+            // Child quorum: 2 copies at sequence 10 with DIFFERENT copy indices.
+            copies[0] = child0;
+            copies[1] = child1;
+
+            // Parent quorum: 2 copies at sequence 9.
+            copies[2] = parent;
+            let mut parent2 = make_header_with_valid_vsr(9, 3, 1, 1, 0, 5);
+            parent2.vsr_state.members = parent.vsr_state.members;
+            parent2.vsr_state.replica_count = parent.vsr_state.replica_count;
+            parent2.checksum = parent2.calculate_checksum();
+            copies[3] = parent2;
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::VsrStateNotMonotonic);
+        }
+
+        // =====================================================================
+        // working() Success Cases
+        // =====================================================================
+
+        #[test]
+        fn working_all_copies_agree() {
+            // All 4 copies are identical and valid.
+            let copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 4);
+        }
+
+        #[test]
+        fn working_exactly_threshold_copies_open() {
+            // Only 2 copies valid (meets Open threshold for COPIES=4).
+            let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[2]);
+            corrupt_checksum(&mut copies[3]);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 2);
+        }
+
+        #[test]
+        fn working_exactly_threshold_copies_verify() {
+            // Only 3 copies valid (meets Verify threshold for COPIES=4).
+            let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[3]);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 3);
+        }
+
+        #[test]
+        fn working_highest_sequence_wins() {
+            // Multiple quorums with different sequences.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            // Low sequence quorum (2 copies).
+            copies[0] = make_header(5, 0, 1, 1, 0);
+            copies[1] = make_header(5, 1, 1, 1, 0);
+
+            // High sequence quorum (2 copies).
+            copies[2] = make_header(10, 2, 1, 1, 0);
+            copies[3] = make_header(10, 3, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            let header = unsafe { q.header() };
+            assert_eq!(header.sequence, 10);
+        }
+
+        #[test]
+        fn working_parent_chains_correctly() {
+            // Parent seq=9, child seq=10 with correct parent checksum.
+            // Use valid VsrState for monotonicity check.
+            let parent = make_header_with_valid_vsr(9, 2, 1, 1, 0, 0);
+
+            // Child with correct parent link and valid VsrState.
+            let child0 = make_child_with_valid_vsr(&parent, 0);
+            let child1 = make_child_with_valid_vsr(&parent, 1);
+
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+            // Child quorum: 2 copies with DIFFERENT copy indices.
+            copies[0] = child0;
+            copies[1] = child1;
+
+            // Parent quorum: 2 copies.
+            copies[2] = parent;
+            let mut parent2 = make_header_with_valid_vsr(9, 3, 1, 1, 0, 0);
+            parent2.vsr_state.members = parent.vsr_state.members;
+            parent2.vsr_state.replica_count = parent.vsr_state.replica_count;
+            parent2.checksum = parent2.calculate_checksum();
+            copies[3] = parent2;
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            let header = unsafe { q.header() };
+            assert_eq!(header.sequence, 10); // Returns child, not parent.
+        }
+
+        #[test]
+        fn working_no_parent_found_is_valid() {
+            // Single quorum, no parent among others.
+            let copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            // Parent absence is acceptable (may have been overwritten).
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn working_ignores_different_cluster() {
+            // Quorums from different clusters should not trigger Fork error.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            // Cluster 1 quorum: 2 copies at sequence 10.
+            copies[0] = make_header(10, 0, 1, 1, 0);
+            copies[1] = make_header(10, 1, 1, 1, 0);
+
+            // Cluster 2 quorum: 2 copies at same sequence 10.
+            copies[2] = make_header(10, 2, 2, 1, 0); // Different cluster!
+            copies[3] = make_header(10, 3, 2, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            // Should NOT be Fork—different clusters are ignored.
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn working_ignores_different_replica() {
+            // Quorums from different replicas should not trigger Fork error.
+            let mut copies: [SuperBlockHeader; 4] = [SuperBlockHeader::zeroed(); 4];
+
+            // Replica 1 quorum: 2 copies at sequence 10.
+            copies[0] = make_header(10, 0, 1, 1, 0);
+            copies[1] = make_header(10, 1, 1, 1, 0);
+
+            // Replica 2 quorum: 2 copies at same sequence 10.
+            copies[2] = make_header(10, 2, 1, 2, 0); // Different replica!
+            copies[3] = make_header(10, 3, 1, 2, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            // Should NOT be Fork—different replicas are ignored.
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn working_threshold_open_vs_verify() {
+            // 2 copies: Valid for Open, QuorumLost for Verify.
+            let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(10, 1, 1, 0);
+            corrupt_checksum(&mut copies[2]);
+            corrupt_checksum(&mut copies[3]);
+
+            let mut quorums = Quorums::<4>::default();
+            let result_open = quorums.working(&copies, Threshold::Open);
+            assert!(result_open.is_ok());
+
+            let mut quorums = Quorums::<4>::default();
+            let result_verify = quorums.working(&copies, Threshold::Verify);
+            assert_eq!(result_verify.unwrap_err(), Error::QuorumLost);
+        }
+
+        // =====================================================================
+        // sort_priority_descending() Tests
+        // =====================================================================
+
+        #[test]
+        fn sort_valid_before_invalid() {
+            let h1 = make_header(10, 0, 1, 1, 0);
+            let h2 = make_header(10, 0, 1, 1, 0);
+
+            let valid_q = Quorum::<4> {
+                header: &h1 as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            let invalid_q = Quorum::<4> {
+                header: &h2 as *const SuperBlockHeader,
+                valid: false,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            // Valid should sort before invalid (Less in descending order).
+            assert_eq!(
+                Quorums::sort_priority_descending(&valid_q, &invalid_q),
+                Ordering::Less
+            );
+            assert_eq!(
+                Quorums::sort_priority_descending(&invalid_q, &valid_q),
+                Ordering::Greater
+            );
+        }
+
+        #[test]
+        fn sort_higher_sequence_first() {
+            let h_low = make_header(5, 0, 1, 1, 0);
+            let h_high = make_header(10, 0, 1, 1, 0);
+
+            let low_q = Quorum::<4> {
+                header: &h_low as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            let high_q = Quorum::<4> {
+                header: &h_high as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            // Higher sequence should sort first.
+            assert_eq!(
+                Quorums::sort_priority_descending(&high_q, &low_q),
+                Ordering::Less
+            );
+            assert_eq!(
+                Quorums::sort_priority_descending(&low_q, &high_q),
+                Ordering::Greater
+            );
+        }
+
+        #[test]
+        fn sort_more_copies_first() {
+            let h = make_header(10, 0, 1, 1, 0);
+
+            let mut few_copies = QuorumCount::empty();
+            few_copies.set(0);
+            few_copies.set(1);
+
+            let mut many_copies = QuorumCount::empty();
+            many_copies.set(0);
+            many_copies.set(1);
+            many_copies.set(2);
+            many_copies.set(3);
+
+            let few_q = Quorum::<4> {
+                header: &h as *const SuperBlockHeader,
+                valid: true,
+                copies: few_copies,
+                slots: [None; 4],
+            };
+
+            let many_q = Quorum::<4> {
+                header: &h as *const SuperBlockHeader,
+                valid: true,
+                copies: many_copies,
+                slots: [None; 4],
+            };
+
+            // More copies should sort first.
+            assert_eq!(
+                Quorums::sort_priority_descending(&many_q, &few_q),
+                Ordering::Less
+            );
+            assert_eq!(
+                Quorums::sort_priority_descending(&few_q, &many_q),
+                Ordering::Greater
+            );
+        }
+
+        #[test]
+        fn sort_higher_checksum_tiebreaker() {
+            // Same sequence, same validity, same copy count—checksum decides.
+            let h1 = make_header(10, 0, 1, 1, 100);
+            let h2 = make_header(10, 0, 1, 1, 200);
+
+            // Determine which actually has higher checksum (AEGIS-128L is not predictable).
+            let (h_high, h_low) = if h1.checksum > h2.checksum {
+                (h1, h2)
+            } else {
+                (h2, h1)
+            };
+
+            let low_q = Quorum::<4> {
+                header: &h_low as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            let high_q = Quorum::<4> {
+                header: &h_high as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            // Different checksums should produce deterministic ordering.
+            assert_ne!(h_high.checksum, h_low.checksum);
+
+            // Higher checksum should sort first.
+            assert_eq!(
+                Quorums::sort_priority_descending(&high_q, &low_q),
+                Ordering::Less
+            );
+            assert_eq!(
+                Quorums::sort_priority_descending(&low_q, &high_q),
+                Ordering::Greater
+            );
+        }
+
+        #[test]
+        fn sort_equal_quorums() {
+            let h = make_header(10, 0, 1, 1, 0);
+
+            let q = Quorum::<4> {
+                header: &h as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+
+            // Equal quorums should compare as Equal.
+            assert_eq!(
+                Quorums::sort_priority_descending(&q, &q),
+                Ordering::Equal
+            );
+        }
+
+        #[test]
+        fn sort_full_precedence_chain() {
+            // Test that validity > sequence > count > checksum.
+            let h_invalid_high_seq = make_header(100, 0, 1, 1, 0);
+            let h_valid_low_seq = make_header(5, 0, 1, 1, 0);
+            let h_valid_high_seq_few = make_header(10, 0, 1, 1, 0);
+            let h_cksum_a = make_header(10, 0, 1, 1, 100);
+            let h_cksum_b = make_header(10, 0, 1, 1, 200);
+
+            // Determine which actually has higher checksum.
+            let (h_valid_high_seq_many_high_cksum, h_valid_high_seq_many_low_cksum) =
+                if h_cksum_a.checksum > h_cksum_b.checksum {
+                    (h_cksum_a, h_cksum_b)
+                } else {
+                    (h_cksum_b, h_cksum_a)
+                };
+
+            let mut few_copies = QuorumCount::empty();
+            few_copies.set(0);
+
+            let mut many_copies = QuorumCount::empty();
+            many_copies.set(0);
+            many_copies.set(1);
+
+            let invalid_high_seq = Quorum::<4> {
+                header: &h_invalid_high_seq as *const SuperBlockHeader,
+                valid: false,
+                copies: many_copies,
+                slots: [None; 4],
+            };
+
+            let valid_low_seq = Quorum::<4> {
+                header: &h_valid_low_seq as *const SuperBlockHeader,
+                valid: true,
+                copies: many_copies,
+                slots: [None; 4],
+            };
+
+            let valid_high_seq_few = Quorum::<4> {
+                header: &h_valid_high_seq_few as *const SuperBlockHeader,
+                valid: true,
+                copies: few_copies,
+                slots: [None; 4],
+            };
+
+            let valid_high_seq_many_low_cksum = Quorum::<4> {
+                header: &h_valid_high_seq_many_low_cksum as *const SuperBlockHeader,
+                valid: true,
+                copies: many_copies,
+                slots: [None; 4],
+            };
+
+            let valid_high_seq_many_high_cksum = Quorum::<4> {
+                header: &h_valid_high_seq_many_high_cksum as *const SuperBlockHeader,
+                valid: true,
+                copies: many_copies,
+                slots: [None; 4],
+            };
+
+            // Expected order (best first):
+            // 1. valid_high_seq_many_high_cksum (valid, seq=10, 2 copies, high checksum)
+            // 2. valid_high_seq_many_low_cksum (valid, seq=10, 2 copies, low checksum)
+            // 3. valid_high_seq_few (valid, seq=10, 1 copy)
+            // 4. valid_low_seq (valid, seq=5)
+            // 5. invalid_high_seq (invalid)
+
+            // Valid beats invalid (even with higher sequence).
+            assert_eq!(
+                Quorums::sort_priority_descending(&valid_low_seq, &invalid_high_seq),
+                Ordering::Less
+            );
+
+            // Higher sequence beats lower sequence.
+            assert_eq!(
+                Quorums::sort_priority_descending(&valid_high_seq_few, &valid_low_seq),
+                Ordering::Less
+            );
+
+            // More copies beats fewer copies.
+            assert_eq!(
+                Quorums::sort_priority_descending(&valid_high_seq_many_low_cksum, &valid_high_seq_few),
+                Ordering::Less
+            );
+
+            // Higher checksum is tie-breaker.
+            assert_eq!(
+                Quorums::sort_priority_descending(
+                    &valid_high_seq_many_high_cksum,
+                    &valid_high_seq_many_low_cksum
+                ),
+                Ordering::Less
+            );
+        }
+
+        // =====================================================================
+        // count_copy() Tests
+        // =====================================================================
+
+        #[test]
+        fn count_copy_normal() {
+            let header = make_header(10, 1, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 1, Threshold::Open);
+
+            assert_eq!(quorums.count, 1);
+            let q = &quorums.array[0];
+            assert!(q.copies.is_set(1));
+            assert_eq!(q.slots[1], Some(1));
+        }
+
+        #[test]
+        fn count_copy_corrupt_index_fallback() {
+            // Copy index >= COPIES should fall back to slot position.
+            let mut header = SuperBlockHeader::zeroed();
+            header.sequence = 10;
+            header.copy = 100; // Invalid for COPIES=4.
+            header.checksum = header.calculate_checksum();
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 2, Threshold::Open);
+
+            assert_eq!(quorums.count, 1);
+            let q = &quorums.array[0];
+            // Falls back to slot position.
+            assert!(q.copies.is_set(2));
+            assert_eq!(q.slots[2], Some(2));
+        }
+
+        #[test]
+        fn count_copy_duplicate_ignored() {
+            // Two headers with same checksum, same copy index.
+            let header = make_header(10, 1, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 0, Threshold::Open);
+            quorums.count_copy(&header, 1, Threshold::Open); // Same copy index.
+
+            // Should only count once.
+            assert_eq!(quorums.count, 1);
+            let q = &quorums.array[0];
+            assert_eq!(q.copies.count(), 1);
+        }
+
+        #[test]
+        fn count_copy_invalid_checksum_skipped() {
+            let mut header = make_header(10, 0, 1, 1, 0);
+            corrupt_checksum(&mut header);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 0, Threshold::Open);
+
+            // Should be skipped.
+            assert_eq!(quorums.count, 0);
+        }
+
+        #[test]
+        fn count_copy_threshold_exactly_met() {
+            // Add exactly 2 copies (Open threshold for COPIES=4).
+            let h1 = make_header(10, 0, 1, 1, 0);
+            let h2 = make_header(10, 1, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&h1, 0, Threshold::Open);
+            assert!(!quorums.array[0].valid);
+
+            quorums.count_copy(&h2, 1, Threshold::Open);
+            assert!(quorums.array[0].valid);
+        }
+
+        #[test]
+        fn count_copy_threshold_minus_one() {
+            // Add only 1 copy (threshold-1 for Open with COPIES=4).
+            let header = make_header(10, 0, 1, 1, 0);
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&header, 0, Threshold::Open);
+
+            assert!(!quorums.array[0].valid);
+        }
+
+        #[test]
+        fn count_copy_different_checksums_separate_quorums() {
+            // Two headers with different checksums create separate quorums.
+            let h1 = make_header(10, 0, 1, 1, 100);
+            let h2 = make_header(10, 1, 1, 1, 200); // Different parent -> different checksum.
+
+            let mut quorums = Quorums::<4>::default();
+            quorums.count_copy(&h1, 0, Threshold::Open);
+            quorums.count_copy(&h2, 1, Threshold::Open);
+
+            assert_eq!(quorums.count, 2);
+        }
+
+        // =====================================================================
+        // Multi-COPIES Variants
+        // =====================================================================
+
+        #[test]
+        fn working_all_copies_agree_6() {
+            let copies: [SuperBlockHeader; 6] = make_agreeing_copies(10, 1, 1, 0);
+
+            let mut quorums = Quorums::<6>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 6);
+        }
+
+        #[test]
+        fn working_all_copies_agree_8() {
+            let copies: [SuperBlockHeader; 8] = make_agreeing_copies(10, 1, 1, 0);
+
+            let mut quorums = Quorums::<8>::default();
+            let result = quorums.working(&copies, Threshold::Verify);
+
+            assert!(result.is_ok());
+            let q = result.unwrap();
+            assert!(q.valid);
+            assert_eq!(q.copies.count(), 8);
+        }
+
+        #[test]
+        fn working_error_fork_6() {
+            let mut copies: [SuperBlockHeader; 6] = [SuperBlockHeader::zeroed(); 6];
+
+            // Quorum A: 3 copies at sequence 10.
+            copies[0] = make_header(10, 0, 1, 1, 100);
+            copies[1] = make_header(10, 1, 1, 1, 100);
+            copies[2] = make_header(10, 2, 1, 1, 100);
+
+            // Quorum B: 3 copies at same sequence, different checksum.
+            copies[3] = make_header(10, 3, 1, 1, 200);
+            copies[4] = make_header(10, 4, 1, 1, 200);
+            copies[5] = make_header(10, 5, 1, 1, 200);
+
+            let mut quorums = Quorums::<6>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::Fork);
+        }
+
+        #[test]
+        fn working_error_fork_8() {
+            let mut copies: [SuperBlockHeader; 8] = [SuperBlockHeader::zeroed(); 8];
+
+            // Quorum A: 4 copies at sequence 10.
+            copies[0] = make_header(10, 0, 1, 1, 100);
+            copies[1] = make_header(10, 1, 1, 1, 100);
+            copies[2] = make_header(10, 2, 1, 1, 100);
+            copies[3] = make_header(10, 3, 1, 1, 100);
+
+            // Quorum B: 4 copies at same sequence, different checksum.
+            copies[4] = make_header(10, 4, 1, 1, 200);
+            copies[5] = make_header(10, 5, 1, 1, 200);
+            copies[6] = make_header(10, 6, 1, 1, 200);
+            copies[7] = make_header(10, 7, 1, 1, 200);
+
+            let mut quorums = Quorums::<8>::default();
+            let result = quorums.working(&copies, Threshold::Open);
+
+            assert_eq!(result.unwrap_err(), Error::Fork);
+        }
+
+        // =====================================================================
+        // Property-Based Tests for Quorums
+        // =====================================================================
+
+        mod quorums_properties {
+            use super::*;
+            use proptest::prelude::*;
+
+            /// Generates a corruption mask (which copies to corrupt).
+            fn corruption_mask<const COPIES: usize>() -> impl Strategy<Value = [bool; COPIES]> {
+                proptest::collection::vec(prop::bool::ANY, COPIES).prop_map(|v| {
+                    let mut arr = [false; COPIES];
+                    for (i, &val) in v.iter().enumerate().take(COPIES) {
+                        arr[i] = val;
+                    }
+                    arr
+                })
+            }
+
+            /// Generates a corruption mask with at most `max_faults` errors.
+            fn limited_corruption_mask<const COPIES: usize>(
+                max_faults: usize,
+            ) -> impl Strategy<Value = [bool; COPIES]> {
+                // Select a random subset of indices to corrupt, size 0..=max_faults
+                prop::collection::vec(0..COPIES, 0..=max_faults).prop_map(|indices| {
+                    let mut mask = [false; COPIES];
+                    for i in indices {
+                        mask[i] = true;
+                    }
+                    mask
+                })
+            }
+
+            /// Helper: apply corruption mask to copies.
+            fn apply_corruption<const COPIES: usize>(
+                copies: &mut [SuperBlockHeader; COPIES],
+                mask: &[bool; COPIES],
+            ) {
+                for (i, should_corrupt) in mask.iter().enumerate() {
+                    if *should_corrupt {
+                        corrupt_checksum(&mut copies[i]);
+                    }
+                }
+            }
+
+            proptest! {
+                /// If working(Open) succeeds, the returned quorum is valid/sufficient.
+                #[test]
+                fn working_open_success_implies_valid_quorum(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<4>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    if let Ok(quorum) = quorums.working(&copies, Threshold::Open) {
+                        prop_assert!(quorum.valid, "Successful quorum must be valid");
+                        prop_assert!(
+                            quorum.copies.count() >= 2,
+                            "Open threshold requires at least 2 copies, got {}",
+                            quorum.copies.count()
+                        );
+                    }
+                }
+
+                /// If working(Verify) succeeds, the returned quorum is valid/sufficient.
+                #[test]
+                fn working_verify_success_implies_valid_quorum(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<4>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    if let Ok(quorum) = quorums.working(&copies, Threshold::Verify) {
+                        prop_assert!(quorum.valid, "Successful quorum must be valid");
+                        prop_assert!(
+                            quorum.copies.count() >= 3,
+                            "Verify threshold requires at least 3 copies, got {}",
+                            quorum.copies.count()
+                        );
+                    }
+                }
+
+                /// Liveness: working(Open) MUST succeed if faults <= 2 (for COPIES=4).
+                #[test]
+                fn working_open_liveness(
+                    seq in 1u64..100u64,
+                    mask in limited_corruption_mask::<4>(2)
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    prop_assert!(
+                        quorums.working(&copies, Threshold::Open).is_ok(),
+                        "Open threshold must tolerate 2 faults"
+                    );
+                }
+
+                /// Liveness: working(Verify) MUST succeed if faults <= 1 (for COPIES=4).
+                #[test]
+                fn working_verify_liveness(
+                    seq in 1u64..100u64,
+                    mask in limited_corruption_mask::<4>(1)
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    prop_assert!(
+                        quorums.working(&copies, Threshold::Verify).is_ok(),
+                        "Verify threshold must tolerate 1 fault"
+                    );
+                }
+
+                /// All slot copy indices in a successful quorum are within bounds.
+                #[test]
+                fn working_slots_in_bounds(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<4>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    if let Ok(quorum) = quorums.working(&copies, Threshold::Open) {
+                        for slot in &quorum.slots {
+                            if let Some(copy_idx) = slot {
+                                prop_assert!(
+                                    (*copy_idx as usize) < 4,
+                                    "Copy index {} out of bounds for COPIES=4",
+                                    copy_idx
+                                );
+                            }
+                        }
+                    }
+                }
+
+                /// The returned quorum is the best according to the sort order.
+                #[test]
+                fn working_returns_best_quorum(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<4>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<4>::default();
+                    // Process all copies first.
+                    for (slot, copy) in copies.iter().enumerate() {
+                        quorums.count_copy(copy, slot, Threshold::Open);
+                    }
+
+                    if quorums.count > 0 {
+                        quorums.slice_mut().sort_by(Quorums::<4>::sort_priority_descending);
+                        let best = &quorums.array[0];
+
+                        // The best quorum should be >= all others by sort order.
+                        for i in 1..quorums.count as usize {
+                            let other = &quorums.array[i];
+                            let cmp = Quorums::<4>::sort_priority_descending(best, other);
+                            prop_assert!(
+                                cmp != std::cmp::Ordering::Greater,
+                                "Best quorum is not actually best"
+                            );
+                        }
+                    }
+                }
+
+                /// Calling working() twice with the same input yields the same result.
+                #[test]
+                fn working_is_deterministic(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<4>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 4] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums1 = Quorums::<4>::default();
+                    let result1 = quorums1.working(&copies, Threshold::Open);
+
+                    let mut quorums2 = Quorums::<4>::default();
+                    let result2 = quorums2.working(&copies, Threshold::Open);
+
+                    match (&result1, &result2) {
+                        (Ok(q1), Ok(q2)) => {
+                            prop_assert_eq!(q1.copies.count(), q2.copies.count());
+                            prop_assert_eq!(q1.valid, q2.valid);
+                        }
+                        (Err(e1), Err(e2)) => {
+                            prop_assert_eq!(e1, e2);
+                        }
+                        _ => {
+                            prop_assert!(false, "Results differ");
+                        }
+                    }
+                }
+
+                /// For COPIES=6, if working() succeeds, quorum is valid.
+                #[test]
+                fn working_6_copies_valid(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<6>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 6] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<6>::default();
+                    if let Ok(quorum) = quorums.working(&copies, Threshold::Open) {
+                        prop_assert!(quorum.valid);
+                        prop_assert!(quorum.copies.count() >= 3); // Open threshold for COPIES=6.
+                    }
+                }
+
+                /// For COPIES=8, if working() succeeds, quorum is valid.
+                #[test]
+                fn working_8_copies_valid(
+                    seq in 1u64..100u64,
+                    mask in corruption_mask::<8>()
+                ) {
+                    let mut copies: [SuperBlockHeader; 8] = make_agreeing_copies(seq, 1, 1, 0);
+                    apply_corruption(&mut copies, &mask);
+
+                    let mut quorums = Quorums::<8>::default();
+                    if let Ok(quorum) = quorums.working(&copies, Threshold::Open) {
+                        prop_assert!(quorum.valid);
+                        prop_assert!(quorum.copies.count() >= 4); // Open threshold for COPIES=8.
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
     // RepairIterator Unit Tests
     // =========================================================================
 
