@@ -29,7 +29,7 @@ use crate::{
         HeaderPrepare,
         members::{Members, member_index},
         state::{CheckpointOptions, RootOptions, ViewChangeOptions},
-        superblock_quorum::Threshold,
+        superblock_quorum::{Quorums, RepairIterator, Threshold},
         wire::{checksum, header::Release},
     },
 };
@@ -390,7 +390,8 @@ pub struct Context<S: storage::Storage> {
     pub(super) vsr_state: Option<VsrState>,
     /// View change headers to persist (for view change operations).
     pub(super) view_headers: Option<ViewChangeArray>,
-    // pub(super) repairs: Option<RepairIterator< { constants::SUPERBLOCK_COPIES }>>,
+    /// Iterator over slots needing repair during open. See [`SuperBlock::repair`].
+    pub(super) repairs: Option<RepairIterator<{ constants::SUPERBLOCK_COPIES }>>,
 }
 
 impl<S: storage::Storage> Context<S> {
@@ -406,6 +407,7 @@ impl<S: storage::Storage> Context<S> {
             vsr_state: None,
             view_headers: None,
             sb: core::ptr::null_mut(),
+            repairs: None,
         }
     }
 
@@ -414,7 +416,7 @@ impl<S: storage::Storage> Context<S> {
         self.copy = None;
         self.vsr_state = None;
         self.view_headers = None;
-        // self.repairs = None;
+        self.repairs = None;
     }
 
     /// Panics if `copy` is out of bounds.
@@ -450,7 +452,8 @@ pub struct SuperBlock<S: storage::Storage> {
 
     /// Buffer for reading all copies during open/verification.
     reading: AlignedBox<[SuperBlockHeader; constants::SUPERBLOCK_COPIES]>,
-    // quorums: Quorums< {constants::SUPERBLOCK_COPIES}>,
+    /// Workspace for grouping copies by checksum and selecting the valid quorum.
+    quorums: Quorums<{ constants::SUPERBLOCK_COPIES }>,
     /// Whether the superblock has been successfully opened.
     opened: bool,
     /// This replica's index in the cluster, set during `open`.
@@ -480,7 +483,7 @@ impl<S: storage::Storage> SuperBlock<S> {
             working,
             staging,
             reading,
-            // quorums: Quorums::default(),
+            quorums: Quorums::default(),
             opened: false,
             replica_index: None,
             queue_head: None,
@@ -1006,14 +1009,132 @@ impl<S: storage::Storage> SuperBlock<S> {
         );
     }
 
+    /// Selects the authoritative superblock from read copies and commits it.
+    ///
+    /// After reading all copies into `self.reading`, this method uses quorum
+    /// logic to identify the valid, highest-sequence header. The selected
+    /// header becomes both `working` and `staging`.
+    ///
+    /// # Behavior by caller
+    ///
+    /// - [`Caller::Open`]: Recovery path. Validates replica membership, then
+    ///   initiates [`repair`](Self::repair) if any copies are missing/corrupt.
+    /// - [`Caller::Checkpoint`]/[`Caller::ViewChange`]: Verification path.
+    ///   Asserts the quorum matches what we just wrote (read-after-write check).
+    ///
+    /// # Panics
+    ///
+    /// - Quorum selection fails (unrecoverable data loss)
+    /// - `threshold == Verify` but quorum doesn't match staging
+    /// - `replica_index` not set during open
+    /// - Replica ID missing from member list
+    fn process_quorum(&mut self, ctx: &mut Context<S>, threshold: Threshold) {
+        let quorum = self
+            .quorums
+            .working(&self.reading, threshold)
+            .expect("superblock quorum selection failed");
+
+        // SAFETY: Quorum guarantees header pointer validity; we hold &mut self.reading.
+        let working = unsafe { quorum.header() };
+        assert!(working.valid_checksum());
+
+        // Read-after-write verification: confirm disk matches what we staged.
+        if threshold == Threshold::Verify {
+            assert_eq!(working.checksum, self.staging.checksum);
+            assert_eq!(working.sequence, self.staging.sequence);
+        }
+
+        // Commit quorum-selected header as authoritative state.
+        *self.working = *working;
+        *self.staging = *working;
+
+        // Normalize copy index: working/staging represent logical state, not physical location.
+        self.working.copy = 0;
+        self.staging.copy = 0;
+
+        if ctx.caller == Caller::Open {
+            // Validate replica identity matches expected index.
+            let replica_index = self
+                .replica_index
+                .expect("replica_index must be set to open");
+            let idx = member_index(
+                &self.working.vsr_state.members,
+                self.working.vsr_state.replica_id,
+            )
+            .expect("replica_id missing from members") as u8;
+            assert_eq!(idx, replica_index);
+
+            // Repair missing/corrupt copies to restore full redundancy.
+            if !quorum.copies.full::<{ constants::SUPERBLOCK_COPIES }>() {
+                ctx.repairs = Some(quorum.repairs());
+                ctx.copy = None;
+                self.repair(ctx);
+            } else {
+                self.release(ctx);
+            }
+        } else {
+            assert_eq!(threshold, Threshold::Verify);
+            self.release(ctx);
+        }
+    }
+
+    /// Restores redundancy by writing the authoritative header to damaged slots.
+    ///
+    /// Called during open when quorum succeeds but some copies are missing or
+    /// corrupt. Deferred repair risks cascading failure if another copy fails
+    /// before the next checkpoint.
+    ///
+    /// Each call writes one copy; the write callback re-invokes this method
+    /// until [`RepairIterator`] is exhausted.
+    ///
+    /// # Preconditions
+    ///
+    /// - `ctx.caller == Caller::Open`
+    /// - `ctx.copy` is `None`
+    fn repair(&mut self, ctx: &mut Context<S>) {
+        assert_eq!(ctx.caller, Caller::Open);
+        assert!(ctx.copy.is_none());
+
+        let Some(repairs) = ctx.repairs.as_mut() else {
+            self.release(ctx);
+            return;
+        };
+
+        let Some(copy) = repairs.next() else {
+            // All repairs complete; clear iterator and finish.
+            ctx.repairs = None;
+            self.release(ctx);
+            return;
+        };
+
+        assert!((copy as usize) < constants::SUPERBLOCK_COPIES);
+
+        // Write the authoritative working header to the damaged slot.
+        *self.staging = *self.working;
+        ctx.copy = Some(copy);
+        self.write_header(ctx);
+    }
+
     // ------------------------------------------------------------------------
     // Storage callbacks
     // ------------------------------------------------------------------------
 
-    /// Callback invoked after each sector write completes.
+    /// Callback invoked after each superblock copy write completes.
     ///
-    /// For format/update: writes remaining copies, then verifies via read-back.
-    /// For open (repair): transitions to repair completion.
+    /// # State machine transitions
+    ///
+    /// ```text
+    /// Format/Checkpoint/ViewChange:
+    ///   copy 0..N-2 → write_header(copy+1)
+    ///   copy N-1    → read_working(Verify) → process_quorum → release
+    ///
+    /// Open (repair):
+    ///   each copy   → repair() → [next repair or release]
+    /// ```
+    ///
+    /// The format/update path writes all copies sequentially, then reads them
+    /// back with `Threshold::Verify` to confirm durability. The repair path
+    /// writes one slot per iteration until [`RepairIterator`] is exhausted.
     fn write_header_callback(write: &mut S::Write) {
         // SAFETY: Storage guarantees context pointer validity for callback duration.
         let ctx = unsafe { S::context_from_write(write) };
@@ -1026,14 +1147,14 @@ impl<S: storage::Storage> SuperBlock<S> {
         assert!(copy < constants::SUPERBLOCK_COPIES);
 
         if ctx.caller == Caller::Open {
-            // Repair write completed.
+            // Repair path: continue to next damaged slot.
             ctx.copy = None;
-            // sb.repair(ctx);
+            sb.repair(ctx);
             return;
         }
 
+        // Format/update path: write remaining copies, then verify.
         if copy + 1 == constants::SUPERBLOCK_COPIES {
-            // All copies written; verify by reading back.
             ctx.copy = None;
             sb.read_working(ctx, Threshold::Verify);
         } else {
@@ -1042,9 +1163,17 @@ impl<S: storage::Storage> SuperBlock<S> {
         }
     }
 
-    /// Callback invoked after each sector read completes.
+    /// Callback invoked after each superblock copy read completes.
     ///
-    /// Continues reading remaining copies or transitions to quorum processing.
+    /// # State machine transitions
+    ///
+    /// ```text
+    /// copy 0..N-2 → read_header(copy+1)
+    /// copy N-1    → process_quorum(threshold) → [repair or release]
+    /// ```
+    ///
+    /// Reads all copies into `self.reading`, then invokes quorum selection.
+    /// For `Threshold::Open`, quorum may trigger repairs before release.
     fn read_header_callback(read: &mut S::Read) {
         // SAFETY: Storage guarantees context pointer validity for callback duration.
         let ctx = unsafe { S::context_from_read(read) };
@@ -1053,7 +1182,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         // SAFETY: ctx.sb set by enqueue(); valid while operation is in-flight.
         let sb = unsafe { &mut *ctx.sb };
 
-        let _threshold = ctx
+        let threshold = ctx
             .read_threshold
             .expect("missing threshold in read callback");
         let copy = ctx.copy.expect("missing copy in read callback") as usize;
@@ -1070,7 +1199,7 @@ impl<S: storage::Storage> SuperBlock<S> {
         ctx.copy = None;
         ctx.read_threshold = None;
 
-        // sb.process_quorum(ctx, threshold);
+        sb.process_quorum(ctx, threshold);
     }
 }
 
