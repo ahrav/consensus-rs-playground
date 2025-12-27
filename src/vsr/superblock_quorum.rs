@@ -148,181 +148,265 @@ impl QuorumCount {
     }
 }
 
-/// Selects the highest-sequence superblock that satisfies the quorum threshold.
+/// Result of quorum analysis across superblock copies.
 ///
-/// This function is stateless: it examines the provided headers and selects the best
-/// candidate based solely on validity, consensus, and sequence number.
+/// After reading all `COPIES` superblock slots, this struct captures which copies
+/// agreed on the same header content. The quorum is "valid" when enough copies
+/// match to meet the [`Threshold`] requirement.
 ///
-/// # Returns
+/// # Slot Mapping
 ///
-/// * `Ok(&header)`: The selected canonical superblock header.
-/// * `Err(Error::NotFound)`: No headers with valid checksums were found.
-/// * `Err(Error::QuorumLost)`: Valid headers exist, but no group meets the threshold.
-/// * `Err(Error::Fork)`: Two disjoint groups satisfy the threshold with the same maximum sequence number.
-pub fn select_superblock<const N: usize>(
-    headers: &[SuperBlockHeader; N],
-    threshold: Threshold,
-) -> Result<&SuperBlockHeader, Error> {
-    // 1. Identify valid headers (checksum pass).
-    // Using a bitmask since N <= MAX_COPIES (16).
-    let mut valid_mask = 0u16;
-    let mut valid_count = 0;
+/// Physical storage has `COPIES` slots numbered 0..COPIES. Each valid superblock
+/// contains a "copy index" field indicating which slot it *should* occupy.
+/// Misdirected writes (copy in wrong slot) and duplicates are tracked here
+/// to enable repair decisions.
+///
+/// # Lifetime
+///
+/// The `header` pointer is borrowed from the caller's buffer. This struct must
+/// not outlive the superblock data it references.
+#[derive(Clone, Copy, Debug)]
+pub struct Quorum<const COPIES: usize> {
+    /// First-seen header for this quorum group. Used as the canonical reference
+    /// when multiple copies agree. Null until a valid header is encountered.
+    header: *const SuperBlockHeader,
 
-    for (i, header) in headers.iter().enumerate() {
-        if header.valid_checksum() {
-            valid_mask |= 1 << i;
-            valid_count += 1;
-        }
-    }
+    /// `true` if this quorum meets the threshold for the intended operation.
+    pub valid: bool,
 
-    if valid_count == 0 {
-        return Err(Error::NotFound);
-    }
+    /// Bitset tracking which copy indices are present in this quorum.
+    pub copies: QuorumCount,
 
-    let required = threshold.count::<N>();
-    let mut best_clique_header: Option<&SuperBlockHeader> = None;
-
-    // 2. Iterate over valid headers to find the best clique.
-    // We only need to check each valid header as a potential "clique leader".
-    for i in 0..N {
-        if (valid_mask & (1 << i)) == 0 {
-            continue;
-        }
-        let candidate = &headers[i];
-
-        // Optimization: If we already found a better clique (higher sequence),
-        // we can skip this candidate if its sequence is strictly lower.
-        // However, we must process equal sequence numbers to detect forks.
-        if let Some(best) = best_clique_header
-            && candidate.sequence < best.sequence
-        {
-            continue;
-        }
-
-        // Count members of this candidate's clique.
-        let mut clique_size = 0;
-        for (j, header) in headers.iter().enumerate().take(N) {
-            if (valid_mask & (1 << j)) != 0 {
-                // Logic equality check (ignores copy index and checksum fields)
-                if header.equal(candidate) {
-                    clique_size += 1;
-                }
-            }
-        }
-
-        if clique_size < required {
-            continue;
-        }
-
-        // We found a quorum. Compare with best_clique_header.
-        match best_clique_header {
-            None => {
-                best_clique_header = Some(candidate);
-            }
-            Some(current_best) => {
-                if candidate.sequence > current_best.sequence {
-                    best_clique_header = Some(candidate);
-                } else if candidate.sequence == current_best.sequence {
-                    // Fork detection:
-                    // If sequences match but headers are logically different,
-                    // we have two disjoint quorums claiming the same sequence.
-                    if !candidate.equal(current_best) {
-                        return Err(Error::Fork);
-                    }
-                    // Else, they are equal, so it's the same clique we already found.
-                }
-            }
-        }
-    }
-
-    best_clique_header.ok_or(Error::QuorumLost)
+    /// Slot-to-copy mapping. `slots[i] = Some(c)` means physical slot `i`
+    /// contains copy index `c`. `None` indicates invalid/missing/ignored.
+    pub slots: [Option<u8>; COPIES],
 }
 
-/// Iterator over superblock copies that require repair.
-#[derive(Debug, Clone)]
-pub struct RepairIterator<const N: usize> {
-    mask: u16,
-    index: usize,
+impl<const COPIES: usize> Default for Quorum<COPIES> {
+    fn default() -> Self {
+        Self {
+            header: std::ptr::null(),
+            valid: false,
+            copies: QuorumCount::default(),
+            slots: [None; COPIES],
+        }
+    }
 }
 
-impl<const N: usize> Iterator for RepairIterator<N> {
-    type Item = usize;
+impl<const COPIES: usize> Quorum<COPIES> {
+    #[inline]
+    fn has_header(&self) -> bool {
+        !self.header.is_null()
+    }
 
+    /// Returns the representative header for this quorum.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the original superblock buffer outlives this reference.
+    /// The pointer was set during quorum construction from caller-provided data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no header was ever recorded (quorum is empty).
+    #[inline]
+    pub unsafe fn header(&self) -> &SuperBlockHeader {
+        assert!(self.has_header());
+        unsafe { &*self.header }
+    }
+
+    /// Validates internal consistency. Used defensively before operations.
+    ///
+    /// # Invariants checked
+    ///
+    /// - Valid quorums have a header
+    /// - `copies` matches the set of unique copy indices found in `slots`
+    /// - All copy indices in `slots` are within bounds
+    fn assert_invariants(&self) {
+        if self.valid {
+            assert!(self.has_header());
+        }
+
+        let mut slot_copies = QuorumCount::empty();
+        for &copy in self.slots.iter().flatten() {
+            assert!((copy as usize) < COPIES);
+            slot_copies.set(copy);
+        }
+
+        assert_eq!(self.copies, slot_copies);
+    }
+
+    /// Returns an iterator yielding slot indices that need repair.
+    ///
+    /// Repairs restore each slot to contain its "home" copy (slot `i` should
+    /// hold copy `i`). See [`RepairIterator`] for priority ordering.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the quorum is not valid.
+    pub fn repairs(&self) -> RepairIterator<COPIES> {
+        assert!(self.valid);
+        self.assert_invariants();
+        RepairIterator::new(self.slots)
+    }
+}
+
+/// Iterates over slot indices requiring repair, in priority order.
+///
+/// The goal is to ensure all copies 0..COPIES exist somewhere. Repairs only
+/// occur when it's safe to do so without losing unique data. The iterator
+/// does NOT guarantee `slot[i] = copy i` after completion—only that all
+/// copies are present.
+///
+/// Slots with unique wrong copies (copy `j` in slot `i` where `j ≠ i` and
+/// `j` is not duplicated) are NOT repaired, as overwriting would lose the
+/// only instance of copy `j`.
+///
+/// # Repair Priority (highest to lowest)
+///
+/// 1. **Empty slot, missing copy**: Slot `i` is empty AND copy `i` doesn't exist
+///    anywhere. This is the most critical—we're missing data entirely.
+///
+/// 2. **Empty slot, misdirected copy**: Slot `i` is empty but copy `i` exists
+///    in some other slot. We can recover by copying from the misdirected location.
+///
+/// 3. **Duplicate in wrong slot**: Slot `i` contains copy `j` (where `j ≠ i`)
+///    and copy `j` also exists elsewhere. Safe to overwrite since we have a backup.
+///
+/// # Mutation
+///
+/// Each call to `next()` updates internal state as if the repair succeeded,
+/// marking `slots[repair_slot] = Some(repair_slot)`. This prevents returning
+/// the same slot twice and allows priority recalculation.
+///
+/// # Example
+///
+/// ```ignore
+/// // slots: [Some(1), None, Some(1), Some(3)]
+/// // - slot 0 has copy 1 (misdirected)
+/// // - slot 1 is empty, copy 1 exists elsewhere (priority 2)
+/// // - slot 2 has copy 1 (duplicate of slot 0)
+/// // - slot 3 has copy 3 (correct)
+/// //
+/// // Iterator yields: 1 (empty, copy exists), 0 (has duplicate), 2 (has duplicate)
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct RepairIterator<const COPIES: usize> {
+    /// Current slot state, mutated as repairs are "applied" during iteration.
+    slots: [Option<u8>; COPIES],
+    /// Count of repairs yielded so far. Bounded by `COPIES`.
+    repairs_returned: u8,
+}
+
+impl<const COPIES: usize> RepairIterator<COPIES> {
+    /// Creates a new repair iterator from the given slot mapping.
+    ///
+    /// # Compile-time constraint
+    ///
+    /// `COPIES` must be 4, 6, or 8.
+    pub fn new(slots: [Option<u8>; COPIES]) -> Self {
+        const { validate_copies::<COPIES>() };
+        Self {
+            slots,
+            repairs_returned: 0,
+        }
+    }
+
+    /// Computes two sets: all copies present, and copies appearing more than once.
+    ///
+    /// Returns `(copies_any, copies_duplicate)` where:
+    /// - `copies_any`: bitset of all copy indices found in any slot
+    /// - `copies_duplicate`: subset of `copies_any` appearing in 2+ slots
+    fn compute_copy_sets(&self) -> (QuorumCount, QuorumCount) {
+        let mut copies_any = QuorumCount::empty();
+        let mut copies_duplicate = QuorumCount::empty();
+
+        for slot in self.slots.iter() {
+            if let Some(copy) = *slot {
+                assert!((copy as usize) < COPIES);
+
+                if copies_any.is_set(copy) {
+                    copies_duplicate.set(copy);
+                }
+                copies_any.set(copy);
+            }
+        }
+
+        (copies_any, copies_duplicate)
+    }
+}
+
+impl<const COPIES: usize> Iterator for RepairIterator<COPIES> {
+    type Item = u8;
+
+    /// Returns the next slot index to repair, or `None` when all slots are correct.
+    ///
+    /// Internally marks the returned slot as repaired (sets `slots[i] = Some(i)`)
+    /// so subsequent calls see updated state.
     fn next(&mut self) -> Option<Self::Item> {
-        while self.index < N {
-            let i = self.index;
-            self.index += 1;
-            if (self.mask & (1 << i)) != 0 {
-                return Some(i);
+        const { validate_copies::<COPIES>() };
+
+        // Precondition: all copy indices are in bounds.
+        assert!(
+            self.slots
+                .iter()
+                .all(|slot| slot.is_none() || (slot.unwrap() as usize) < COPIES)
+        );
+
+        let (copies_any, copies_duplicate) = self.compute_copy_sets();
+
+        // Find candidates at each priority level.
+        // We take a match at the highest priority that has one.
+        let mut priority_1: Option<u8> = None; // Empty slot, copy missing entirely
+        let mut priority_2: Option<u8> = None; // Empty slot, copy exists elsewhere
+        let mut priority_3: Option<u8> = None; // Wrong copy, but it's a duplicate
+
+        for i in 0..COPIES {
+            let i_u8 = i as u8;
+            let slot = self.slots[i];
+
+            if slot.is_none() && !copies_any.is_set(i_u8) {
+                priority_1 = Some(i_u8);
+            }
+            if slot.is_none() && copies_any.is_set(i_u8) {
+                priority_2 = Some(i_u8);
+            }
+            if let Some(slot_copy) = slot {
+                // Slot contains wrong copy, and that copy is duplicated elsewhere.
+                // Safe to overwrite since we have a backup.
+                if slot_copy != i_u8 && copies_duplicate.is_set(slot_copy) {
+                    priority_3 = Some(i_u8);
+                }
+                // Note: We do NOT repair slots with unique wrong copies.
+                // Overwriting would lose the only instance of that copy.
             }
         }
-        None
+
+        let repair = priority_1.or(priority_2).or(priority_3);
+
+        let Some(repair_slot) = repair else {
+            // No more safe repairs available.
+            // Remaining slots either:
+            // - Are correct (slot[i] = Some(i))
+            // - Have unique wrong copies (cannot overwrite without losing data)
+            return None;
+        };
+
+        assert!((repair_slot as usize) < COPIES);
+
+        // Mark as repaired: slot now contains its home copy.
+        self.slots[repair_slot as usize] = Some(repair_slot);
+
+        self.repairs_returned += 1;
+        assert!((self.repairs_returned as usize) <= COPIES);
+
+        Some(repair_slot)
     }
-}
-
-/// Identifies which copies deviate from the canonical state and need repair.
-///
-/// A copy needs repair if:
-/// - It has an invalid checksum.
-/// - It disagrees with the canonical header (sequence, cluster, data, etc).
-///   This includes cases where the copy has a *higher* sequence number but
-///   is not part of the quorum (minority write).
-pub fn detect_repairs<const N: usize>(
-    headers: &[SuperBlockHeader; N],
-    canonical: &SuperBlockHeader,
-) -> RepairIterator<N> {
-    let mut mask = 0u16;
-    for (i, header) in headers.iter().enumerate() {
-        // If checksum is invalid, strictly needs repair.
-        if !header.valid_checksum() {
-            mask |= 1 << i;
-            continue;
-        }
-
-        // If valid, check if it matches canonical state.
-        if !header.equal(canonical) {
-            mask |= 1 << i;
-        }
-    }
-
-    RepairIterator { mask, index: 0 }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants;
-    use crate::vsr::ViewChangeArray;
-    use crate::vsr::superblock::SuperBlockHeader;
-    use proptest::prelude::*;
-
-    // =========================================================================
-    // Test Helpers
-    // =========================================================================
-
-    /// Creates a valid header with given sequence and cluster.
-    fn make_header(sequence: u64, cluster: u128) -> SuperBlockHeader {
-        let mut header = SuperBlockHeader::zeroed();
-        header.version = constants::SUPERBLOCK_VERSION;
-        header.cluster = cluster;
-        header.sequence = sequence;
-        header.view_headers_all = ViewChangeArray::root(cluster).into_array();
-        header.set_checksum();
-        header
-    }
-
-    /// Assigns copy indices and recomputes checksums.
-    fn finalize_headers<const N: usize>(headers: &mut [SuperBlockHeader; N]) {
-        for (i, h) in headers.iter_mut().enumerate() {
-            h.copy = i as u16;
-            h.set_checksum();
-        }
-    }
-
-    /// Corrupts a header's checksum to make it invalid.
-    fn corrupt_checksum(header: &mut SuperBlockHeader) {
-        header.checksum ^= 1;
-    }
 
     // =========================================================================
     // QuorumCount Tests
@@ -431,702 +515,556 @@ mod tests {
     }
 
     // =========================================================================
-    // select_superblock() - Basic Scenarios
+    // Quorum Tests
     // =========================================================================
 
-    #[test]
-    fn select_superblock_basic_quorum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
+    mod quorum_tests {
+        use super::*;
 
-        // 3 copies at seq 10, 1 at seq 5
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        headers[3] = make_header(5, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    #[test]
-    fn select_superblock_unanimous() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // All copies agree
-        for h in &mut headers {
-            *h = make_header(42, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 42);
-
-        // Also works for Verify
-        let result = select_superblock(&headers, Threshold::Verify);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 42);
-    }
-
-    #[test]
-    fn select_superblock_exactly_at_quorum_boundary() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Exactly 2 copies at seq 10 (Open threshold = 2)
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-        headers[2] = make_header(5, 1);
-        headers[3] = make_header(3, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    #[test]
-    fn select_superblock_one_below_quorum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Only 1 copy at highest seq (below Open threshold of 2)
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(5, 1);
-        headers[2] = make_header(3, 1);
-        headers[3] = make_header(1, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::QuorumLost)));
-    }
-
-    // =========================================================================
-    // select_superblock() - Error Cases
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_quorum_lost() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // All different sequences
-        for (i, h) in headers.iter_mut().enumerate() {
-            *h = make_header(10 + i as u64, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::QuorumLost)));
-    }
-
-    #[test]
-    fn select_superblock_all_invalid() {
-        // Zeroed headers have invalid checksums
-        let headers = [SuperBlockHeader::zeroed(); 4];
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::NotFound)));
-    }
-
-    #[test]
-    fn select_superblock_all_corrupt() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        // Corrupt all checksums
-        for h in &mut headers {
-            corrupt_checksum(h);
-        }
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::NotFound)));
-    }
-
-    #[test]
-    fn select_superblock_fork_detection() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Group A: Seq 10, Cluster 1 (indices 0, 1)
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-
-        // Group B: Seq 10, Cluster 2 (indices 2, 3)
-        headers[2] = make_header(10, 2);
-        headers[3] = make_header(10, 2);
-
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::Fork)));
-    }
-
-    #[test]
-    fn select_superblock_fork_different_parent() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Same sequence, same cluster, but different parent
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        headers[0].parent = 111;
-        headers[1].parent = 111;
-        headers[2].parent = 222;
-        headers[3].parent = 222;
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::Fork)));
-    }
-
-    // =========================================================================
-    // select_superblock() - Sequence Selection
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_higher_sequence_wins() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Lower seq with quorum, higher seq without quorum
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-        headers[2] = make_header(20, 1); // Higher but alone
-        headers[3] = make_header(5, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10); // Highest with quorum
-    }
-
-    #[test]
-    fn select_superblock_higher_sequence_has_quorum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Higher seq with quorum beats lower seq with quorum
-        headers[0] = make_header(20, 1);
-        headers[1] = make_header(20, 1);
-        headers[2] = make_header(10, 1);
-        headers[3] = make_header(10, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 20);
-    }
-
-    // =========================================================================
-    // select_superblock() - Partial Corruption
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_survives_single_corruption() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        // Corrupt one copy
-        corrupt_checksum(&mut headers[0]);
-
-        // Still have 3 valid (Verify threshold = 3)
-        let result = select_superblock(&headers, Threshold::Verify);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    #[test]
-    fn select_superblock_survives_two_corruptions_open() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        // Corrupt two copies
-        corrupt_checksum(&mut headers[0]);
-        corrupt_checksum(&mut headers[1]);
-
-        // 2 valid copies: enough for Open (threshold=2), not Verify (threshold=3)
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-
-        let result = select_superblock(&headers, Threshold::Verify);
-        assert!(matches!(result, Err(Error::QuorumLost)));
-    }
-
-    #[test]
-    fn select_superblock_mixed_valid_invalid() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // 2 valid at seq 10, 1 valid at seq 5, 1 corrupted at seq 10
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-        headers[2] = make_header(5, 1);
-        headers[3] = make_header(10, 1);
-        finalize_headers(&mut headers);
-
-        corrupt_checksum(&mut headers[3]);
-
-        // Only 2 valid copies at seq 10
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    // =========================================================================
-    // select_superblock() - Threshold::Verify
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_verify_threshold_strict() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // 2 copies at each sequence (neither meets Verify threshold of 3)
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(10, 1);
-        headers[2] = make_header(5, 1);
-        headers[3] = make_header(5, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Verify);
-        assert!(matches!(result, Err(Error::QuorumLost)));
-    }
-
-    #[test]
-    fn select_superblock_verify_with_minority_old() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // 3 copies at seq 10, 1 at seq 5
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        headers[3] = make_header(5, 1);
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Verify);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    // =========================================================================
-    // select_superblock() - N=6 Configuration
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_6_copies_open_quorum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 6];
-
-        // 3 copies at seq 10 (Open threshold = 3)
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        for h in &mut headers[3..] {
-            *h = make_header(5, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    // =========================================================================
-    // select_superblock() - N=8 Configuration
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_8_copies_open_quorum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 8];
-
-        // 4 copies at seq 10 (Open threshold = 4)
-        for h in &mut headers[..4] {
-            *h = make_header(10, 1);
-        }
-        for h in &mut headers[4..] {
-            *h = make_header(5, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 10);
-    }
-
-    #[test]
-    fn select_superblock_8_copies_fork() {
-        let mut headers = [SuperBlockHeader::zeroed(); 8];
-
-        // Group A: 4 copies (meets Open quorum)
-        for h in &mut headers[..4] {
-            *h = make_header(10, 1);
-        }
-        // Group B: 4 copies at same seq, different cluster (also meets quorum)
-        for h in &mut headers[4..] {
-            *h = make_header(10, 2);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::Fork)));
-    }
-
-    // =========================================================================
-    // select_superblock() - Edge Cases
-    // =========================================================================
-
-    #[test]
-    fn select_superblock_single_valid_copy() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        headers[0] = make_header(10, 1);
-        finalize_headers(&mut headers);
-
-        // Invalidate all but one
-        for h in &mut headers[1..] {
-            *h = SuperBlockHeader::zeroed();
-        }
-
-        // 1 valid copy is below any threshold
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(matches!(result, Err(Error::QuorumLost)));
-    }
-
-    #[test]
-    fn select_superblock_sequence_zero() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        // Sequence 0 is valid (initial state)
-        for h in &mut headers {
-            *h = make_header(0, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, 0);
-    }
-
-    #[test]
-    fn select_superblock_max_sequence() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        for h in &mut headers {
-            *h = make_header(u64::MAX, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open);
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap().sequence, u64::MAX);
-    }
-
-    #[test]
-    fn select_superblock_ptr_stability() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let result = select_superblock(&headers, Threshold::Open).unwrap();
-
-        // Verify returned reference points into original array
-        let result_ptr = result as *const _;
-        let array_start = headers.as_ptr();
-        let array_end = unsafe { array_start.add(4) };
-
-        assert!(result_ptr >= array_start && result_ptr < array_end);
-    }
-
-    // =========================================================================
-    // detect_repairs() Tests
-    // =========================================================================
-
-    #[test]
-    fn detect_repairs_all_match() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert!(repairs.is_empty());
-    }
-
-    #[test]
-    fn detect_repairs_invalid_checksum() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for h in &mut headers {
-            *h = make_header(10, 1);
-        }
-        finalize_headers(&mut headers);
-
-        // Corrupt index 2
-        corrupt_checksum(&mut headers[2]);
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert_eq!(repairs, vec![2]);
-    }
-
-    #[test]
-    fn detect_repairs_old_sequence() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        // Old sequence at index 3
-        headers[3] = make_header(5, 1);
-        finalize_headers(&mut headers);
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert_eq!(repairs, vec![3]);
-    }
-
-    #[test]
-    fn detect_repairs_higher_sequence_without_quorum() {
-        // Scenario: canonical is seq 10 (quorum), but index 3 is seq 11 (minority).
-        // Index 3 should be repaired (rolled back).
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        headers[3] = make_header(11, 1);
-        finalize_headers(&mut headers);
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert_eq!(repairs, vec![3]);
-    }
-
-    #[test]
-    fn detect_repairs_divergent_cluster() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for h in &mut headers[..3] {
-            *h = make_header(10, 1);
-        }
-        // Different cluster at index 3
-        headers[3] = make_header(10, 2);
-        finalize_headers(&mut headers);
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert_eq!(repairs, vec![3]);
-    }
-
-    #[test]
-    fn detect_repairs_multiple_issues() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        headers[0] = make_header(10, 1);
-        headers[1] = make_header(5, 1); // Old sequence
-        headers[2] = make_header(10, 1);
-        headers[3] = make_header(10, 2); // Different cluster
-        finalize_headers(&mut headers);
-
-        corrupt_checksum(&mut headers[2]); // Corrupt checksum
-
-        let canonical = &headers[0];
-        let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-        assert_eq!(repairs, vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn detect_repairs_all_need_repair() {
-        let mut headers = [SuperBlockHeader::zeroed(); 4];
-        for (i, h) in headers.iter_mut().enumerate() {
-            *h = make_header(i as u64, 1);
-        }
-        finalize_headers(&mut headers);
-
-        // Canonical is seq 10, none match
-        let canonical = make_header(10, 1);
-        let repairs: Vec<usize> = detect_repairs(&headers, &canonical).collect();
-        assert_eq!(repairs, vec![0, 1, 2, 3]);
-    }
-
-    // =========================================================================
-    // RepairIterator Tests
-    // =========================================================================
-
-    #[test]
-    fn repair_iterator_empty_mask() {
-        let iter: RepairIterator<4> = RepairIterator { mask: 0, index: 0 };
-        let repairs: Vec<usize> = iter.collect();
-        assert!(repairs.is_empty());
-    }
-
-    #[test]
-    fn repair_iterator_all_set() {
-        let iter: RepairIterator<4> = RepairIterator {
-            mask: 0b1111,
-            index: 0,
-        };
-        let repairs: Vec<usize> = iter.collect();
-        assert_eq!(repairs, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn repair_iterator_sparse() {
-        let iter: RepairIterator<8> = RepairIterator {
-            mask: 0b10100010,
-            index: 0,
-        };
-        let repairs: Vec<usize> = iter.collect();
-        assert_eq!(repairs, vec![1, 5, 7]);
-    }
-
-    // =========================================================================
-    // Property-Based Tests
-    // =========================================================================
-
-    proptest! {
-        /// Unanimous copies always succeed.
         #[test]
-        fn prop_unanimous_always_succeeds(
-            sequence in any::<u64>(),
-            cluster in 1u128..=u128::MAX,
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
-            for h in &mut headers {
-                *h = make_header(sequence, cluster);
-            }
-            finalize_headers(&mut headers);
-
-            prop_assert!(select_superblock(&headers, Threshold::Open).is_ok());
-            prop_assert!(select_superblock(&headers, Threshold::Verify).is_ok());
+        fn default_is_invalid() {
+            let q = Quorum::<4>::default();
+            assert!(!q.valid);
+            assert!(!q.has_header());
+            assert_eq!(q.copies.count(), 0);
+            assert!(q.slots.iter().all(|s| s.is_none()));
         }
 
-        /// Selected header has the highest sequence among quorum groups.
         #[test]
-        fn prop_selected_has_highest_quorum_sequence(
-            seq_a in 0u64..1000,
-            seq_b in 0u64..1000,
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
+        fn header_returns_reference() {
+            let header = SuperBlockHeader::zeroed();
+            let q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                ..Default::default()
+            };
 
-            // 2 copies each at different sequences
-            headers[0] = make_header(seq_a, 1);
-            headers[1] = make_header(seq_a, 1);
-            headers[2] = make_header(seq_b, 1);
-            headers[3] = make_header(seq_b, 1);
-            finalize_headers(&mut headers);
-
-            let result = select_superblock(&headers, Threshold::Open);
-            prop_assert!(result.is_ok());
-            prop_assert_eq!(result.unwrap().sequence, seq_a.max(seq_b));
+            let returned = unsafe { q.header() };
+            assert_eq!(
+                returned as *const SuperBlockHeader,
+                &header as *const SuperBlockHeader
+            );
         }
 
-        /// Fork requires exactly two disjoint quorums at same sequence.
         #[test]
-        fn prop_fork_requires_same_sequence(
-            seq_a in 0u64..1000,
-            seq_b in 0u64..1000,
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
+        fn invariants_hold_when_copies_match_slots() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.copies.set(2);
+            q.slots[0] = Some(0);
+            q.slots[2] = Some(2);
 
-            // Group A at seq_a, Group B at seq_b, different clusters
-            headers[0] = make_header(seq_a, 1);
-            headers[1] = make_header(seq_a, 1);
-            headers[2] = make_header(seq_b, 2);
-            headers[3] = make_header(seq_b, 2);
-            finalize_headers(&mut headers);
+            q.assert_invariants(); // Should not panic
+        }
 
-            let result = select_superblock(&headers, Threshold::Open);
+        #[test]
+        fn invariants_allow_duplicate_copies() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(1);
+            q.slots[0] = Some(1);
+            q.slots[1] = Some(1);
 
-            if seq_a == seq_b {
-                prop_assert!(matches!(result, Err(Error::Fork)));
-            } else {
-                prop_assert!(result.is_ok());
+            q.assert_invariants();
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn invariants_panic_on_copy_set_mismatch() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.copies.set(1);
+            q.slots[0] = Some(0);
+            q.slots[1] = Some(2); // Count matches, but set differs
+
+            q.assert_invariants();
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn invariants_panic_on_out_of_bounds_copy() {
+            let mut q = Quorum::<4>::default();
+            q.copies.set(0);
+            q.slots[0] = Some(5); // Copy 5 is out of bounds for COPIES=4
+
+            q.assert_invariants();
+        }
+
+        #[test]
+        #[should_panic(expected = "assertion")]
+        fn repairs_requires_valid_quorum() {
+            let q = Quorum::<4>::default();
+            let _ = q.repairs();
+        }
+
+        #[test]
+        fn repairs_allow_duplicate_slots() {
+            let header = SuperBlockHeader::zeroed();
+            let mut q = Quorum::<4> {
+                header: &header as *const SuperBlockHeader,
+                valid: true,
+                copies: QuorumCount::empty(),
+                slots: [None; 4],
+            };
+            q.copies.set(1);
+            q.slots[0] = Some(1);
+            q.slots[1] = Some(1);
+
+            let mut repairs: Vec<u8> = q.repairs().collect();
+            repairs.sort();
+            assert_eq!(repairs, vec![0, 2, 3]);
+        }
+    }
+
+    // =========================================================================
+    // RepairIterator Unit Tests
+    // =========================================================================
+
+    mod repair_iterator_tests {
+        use super::*;
+
+        #[test]
+        fn cycle_no_repairs_4() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            // No repairs possible without losing data.
+            let slots = [Some(1), Some(2), Some(3), Some(0)];
+            let mut iter = RepairIterator::<4>::new(slots);
+
+            // No repairs should occur - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            // All copies still present
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..4u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
             }
         }
 
-        /// Corrupting copies below quorum still succeeds.
         #[test]
-        fn prop_survives_single_corruption(
-            corrupt_idx in 0usize..4,
-            sequence in any::<u64>(),
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
-            for h in &mut headers {
-                *h = make_header(sequence, 1);
-            }
-            finalize_headers(&mut headers);
+        fn all_same_copy_catastrophic_corruption() {
+            // All slots have copy 0 (catastrophic corruption)
+            let slots = [Some(0), Some(0), Some(0), Some(0)];
+            let iter = RepairIterator::<4>::new(slots);
 
-            corrupt_checksum(&mut headers[corrupt_idx]);
-
-            // 3 valid copies: passes Verify (threshold=3)
-            prop_assert!(select_superblock(&headers, Threshold::Verify).is_ok());
+            // Slots 1, 2, 3 need their copies (all priority 1 - missing)
+            let repairs: Vec<u8> = iter.collect();
+            assert_eq!(repairs.len(), 3);
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&2));
+            assert!(repairs.contains(&3));
+            assert!(!repairs.contains(&0)); // Slot 0 is correct
         }
 
-        /// All invalid checksums returns NotFound.
         #[test]
-        fn prop_all_invalid_returns_not_found(
-            sequences in proptest::collection::vec(any::<u64>(), 4),
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
-            for (i, h) in headers.iter_mut().enumerate() {
-                *h = make_header(sequences[i], 1);
-            }
-            finalize_headers(&mut headers);
+        fn state_mutation_marks_slot_as_repaired() {
+            let slots = [Some(0), None, Some(2), None];
+            let mut iter = RepairIterator::<4>::new(slots);
 
-            for h in &mut headers {
-                corrupt_checksum(h);
-            }
+            assert_eq!(iter.repairs_returned, 0);
 
-            prop_assert!(matches!(
-                select_superblock(&headers, Threshold::Open),
-                Err(Error::NotFound)
-            ));
+            let first = iter.next().unwrap();
+            assert_eq!(iter.repairs_returned, 1);
+            assert_eq!(iter.slots[first as usize], Some(first));
+
+            let second = iter.next().unwrap();
+            assert_eq!(iter.repairs_returned, 2);
+            assert_eq!(iter.slots[second as usize], Some(second));
+
+            assert_eq!(iter.next(), None);
         }
 
-        /// detect_repairs returns empty when all match canonical.
         #[test]
-        fn prop_detect_repairs_empty_when_unanimous(
-            sequence in any::<u64>(),
-            cluster in 1u128..=u128::MAX,
-        ) {
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
-            for h in &mut headers {
-                *h = make_header(sequence, cluster);
-            }
-            finalize_headers(&mut headers);
+        fn copies_6_works() {
+            let slots = [Some(0), None, None, Some(3), Some(4), Some(5)];
+            let repairs: Vec<u8> = RepairIterator::<6>::new(slots).collect();
 
-            let canonical = &headers[0];
-            let repairs: Vec<usize> = detect_repairs(&headers, canonical).collect();
-            prop_assert!(repairs.is_empty());
+            assert!(repairs.contains(&1));
+            assert!(repairs.contains(&2));
+            assert_eq!(repairs.len(), 2);
         }
 
-        /// detect_repairs finds all mismatches.
         #[test]
-        fn prop_detect_repairs_finds_all_different(
-            seq_canonical in any::<u64>(),
-            seq_other in any::<u64>(),
-        ) {
-            if seq_canonical == seq_other {
-                return Ok(());
+        fn copies_8_works() {
+            let slots = [Some(0), Some(1), Some(2), Some(3), None, None, None, None];
+            let repairs: Vec<u8> = RepairIterator::<8>::new(slots).collect();
+
+            assert_eq!(repairs.len(), 4);
+            assert!(repairs.contains(&4));
+            assert!(repairs.contains(&5));
+            assert!(repairs.contains(&6));
+            assert!(repairs.contains(&7));
+        }
+
+        #[test]
+        fn cycle_no_repairs_6() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            let slots = [Some(1), Some(2), Some(3), Some(4), Some(5), Some(0)];
+            let mut iter = RepairIterator::<6>::new(slots);
+
+            // No repairs - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..6u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
+            }
+        }
+
+        #[test]
+        fn cycle_no_repairs_8() {
+            // A pure permutation cycle: each slot has a unique wrong copy.
+            let slots = [
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6),
+                Some(7),
+                Some(0),
+            ];
+            let mut iter = RepairIterator::<8>::new(slots);
+
+            // No repairs - all copies exist, just misplaced
+            let repairs: Vec<u8> = iter.by_ref().collect();
+            assert_eq!(
+                repairs.len(),
+                0,
+                "Permutation cycles should not be repaired"
+            );
+
+            let (copies_any, _) = iter.compute_copy_sets();
+            for i in 0..8u8 {
+                assert!(copies_any.is_set(i), "Copy {} should still exist", i);
+            }
+        }
+
+        #[test]
+        fn repair_cycle_missing_4() {
+            // Regression case: Permutation cycle with missing element.
+            // Slot 1 is empty (missing copy 1).
+            // Cycle: 0->2, 2->3, 3->0, 1 missing.
+            let slots = [Some(2), None, Some(3), Some(0)];
+            let repairs: Vec<u8> = RepairIterator::<4>::new(slots).collect();
+
+            // Should repair slot 1 (priority 1).
+            // Result: [Some(2), Some(1), Some(3), Some(0)].
+            // Now 1 is correct, others form cycle 0->2->3->0.
+            assert_eq!(repairs, vec![1]);
+        }
+
+        #[test]
+        fn repair_cycle_missing_6() {
+            // Regression case.
+            // Missing: 0, 3, 5.
+            // Present: 1, 2, 4 (in slots 4, 1, 2).
+            let slots = [None, Some(2), Some(4), None, Some(1), None];
+            let mut repairs: Vec<u8> = RepairIterator::<6>::new(slots).collect();
+            repairs.sort();
+
+            // Should repair missing copies: 0, 3, 5.
+            assert_eq!(repairs, vec![0, 3, 5]);
+        }
+
+        #[test]
+        fn repair_cycle_missing_8() {
+            // Regression case.
+            // Missing: 0, 1, 2, 3, 7.
+            // Present: 4, 5, 6 (in slots 6, 4, 5).
+            let slots = [None, None, None, None, Some(5), Some(6), Some(4), None];
+            let mut repairs: Vec<u8> = RepairIterator::<8>::new(slots).collect();
+            repairs.sort();
+
+            // Should repair missing copies.
+            assert_eq!(repairs, vec![0, 1, 2, 3, 7]);
+        }
+
+        mod compute_copy_sets {
+            use super::*;
+
+            #[test]
+            fn identifies_duplicates() {
+                let slots = [Some(1), Some(1), Some(2), Some(3)];
+                let iter = RepairIterator::<4>::new(slots);
+
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert!(copies_any.is_set(1));
+                assert!(copies_any.is_set(2));
+                assert!(copies_any.is_set(3));
+                assert!(!copies_any.is_set(0)); // Copy 0 missing
+
+                assert!(copies_duplicate.is_set(1)); // Copy 1 is duplicated
+                assert!(!copies_duplicate.is_set(2));
+                assert!(!copies_duplicate.is_set(3));
             }
 
-            let mut headers = [SuperBlockHeader::zeroed(); 4];
-            for h in &mut headers {
-                *h = make_header(seq_other, 1);
-            }
-            finalize_headers(&mut headers);
+            #[test]
+            fn empty_slots_yields_empty_sets() {
+                let slots: [Option<u8>; 4] = [None, None, None, None];
+                let iter = RepairIterator::<4>::new(slots);
 
-            let canonical = make_header(seq_canonical, 1);
-            let repairs: Vec<usize> = detect_repairs(&headers, &canonical).collect();
-            prop_assert_eq!(repairs, vec![0, 1, 2, 3]);
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert_eq!(copies_any.count(), 0);
+                assert_eq!(copies_duplicate.count(), 0);
+            }
+
+            #[test]
+            fn all_unique_no_duplicates() {
+                let slots = [Some(0), Some(1), Some(2), Some(3)];
+                let iter = RepairIterator::<4>::new(slots);
+
+                let (copies_any, copies_duplicate) = iter.compute_copy_sets();
+
+                assert_eq!(copies_any.count(), 4);
+                assert_eq!(copies_duplicate.count(), 0);
+            }
+        }
+    }
+
+    // =========================================================================
+    // RepairIterator Property-Based Tests
+    // =========================================================================
+
+    mod repair_iterator_properties {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        /// Strategy to generate a valid slot array where all copy indices are < COPIES.
+        fn valid_slot_array<const COPIES: usize>() -> impl Strategy<Value = [Option<u8>; COPIES]> {
+            proptest::collection::vec(
+                prop_oneof![
+                    1 => Just(None),
+                    3 => (0u8..(COPIES as u8)).prop_map(Some),
+                ],
+                COPIES,
+            )
+            .prop_map(|v| {
+                let mut arr = [None; COPIES];
+                for (i, slot) in v.into_iter().enumerate() {
+                    arr[i] = slot;
+                }
+                arr
+            })
+        }
+
+        proptest! {
+            /// The iterator must always terminate within COPIES iterations.
+            #[test]
+            fn always_terminates_within_copies_iterations(
+                slots in valid_slot_array::<4>()
+            ) {
+                let mut iter = RepairIterator::new(slots);
+                let mut count = 0;
+
+                while iter.next().is_some() {
+                    count += 1;
+                    prop_assert!(count <= 4, "Iterator produced more than COPIES items");
+                }
+            }
+
+            /// Each slot is yielded at most once (no duplicate repairs).
+            #[test]
+            fn no_duplicate_repairs(slots in valid_slot_array::<4>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+
+                prop_assert_eq!(
+                    repairs.len(),
+                    unique.len(),
+                    "Duplicate repairs detected: {:?}",
+                    repairs
+                );
+            }
+
+            /// After full iteration, all copies 0..COPIES must exist somewhere.
+            /// The iterator ensures no data is lost by only repairing safe slots.
+            #[test]
+            fn all_copies_present_after_repairs(slots in valid_slot_array::<4>()) {
+                let mut iter = RepairIterator::new(slots);
+
+                // Consume all repairs
+                while iter.next().is_some() {}
+
+                // Verify all copies exist somewhere
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..4u8 {
+                    prop_assert!(
+                        copies_any.is_set(i),
+                        "Copy {} is missing after repairs. Slots: {:?}",
+                        i,
+                        iter.slots
+                    );
+                }
+            }
+
+            /// All yielded repair indices must be within bounds.
+            #[test]
+            fn all_repairs_in_bounds(slots in valid_slot_array::<4>()) {
+                for repair in RepairIterator::new(slots) {
+                    prop_assert!(
+                        (repair as usize) < 4,
+                        "Repair index {} out of bounds",
+                        repair
+                    );
+                }
+            }
+
+            /// repairs_returned counter matches actual count.
+            #[test]
+            fn repairs_returned_matches_count(slots in valid_slot_array::<4>()) {
+                let mut iter = RepairIterator::new(slots);
+                let mut expected_count = 0u8;
+
+                while iter.next().is_some() {
+                    expected_count += 1;
+                    prop_assert_eq!(
+                        iter.repairs_returned,
+                        expected_count,
+                        "repairs_returned mismatch"
+                    );
+                }
+            }
+
+            /// Priority ordering: repairs are yielded in priority order based on
+            /// the current state at each iteration. Priority is recalculated
+            /// after each repair since duplicates may become unique.
+            ///
+            /// This test verifies that within each iteration, the selected repair
+            /// is the highest priority available at that moment.
+            ///
+            /// Note: Priority 4 (unique wrong copies) are NOT repaired to avoid data loss.
+            #[test]
+            fn priority_ordering_is_strict(slots in valid_slot_array::<4>()) {
+                let mut current_slots = slots;
+
+                loop {
+                    let (copies_any, copies_dup) = {
+                        let temp_iter = RepairIterator::new(current_slots);
+                        temp_iter.compute_copy_sets()
+                    };
+
+                    // Find the highest priority REPAIRABLE slot.
+                    // Priority 4 (unique wrong copy) is not repairable.
+                    let mut best_priority = 4u8; // 4 means "no repairable slot"
+                    let mut has_repairable = false;
+
+                    for (i, &slot_value) in current_slots.iter().enumerate() {
+                        let i_u8 = i as u8;
+
+                        let priority = if slot_value.is_none() && !copies_any.is_set(i_u8) {
+                            1 // Empty slot, copy missing entirely
+                        } else if slot_value.is_none() && copies_any.is_set(i_u8) {
+                            2 // Empty slot, copy exists elsewhere
+                        } else if let Some(copy) = slot_value {
+                            if copy != i_u8 && copies_dup.is_set(copy) {
+                                3 // Wrong copy, duplicated - repairable
+                            } else {
+                                continue; // Correct or unique wrong copy (not repairable)
+                            }
+                        } else {
+                            continue;
+                        };
+
+                        has_repairable = true;
+                        if priority < best_priority {
+                            best_priority = priority;
+                        }
+                    }
+
+                    // Get the actual repair from the iterator
+                    let mut iter = RepairIterator::new(current_slots);
+                    let actual_repair = iter.next();
+
+                    match (has_repairable, actual_repair) {
+                        (false, None) => break, // Both agree: no repairs available
+                        (true, None) => {
+                            prop_assert!(false, "Iterator stopped but repairable slots remain");
+                        }
+                        (false, Some(r)) => {
+                            prop_assert!(false, "Iterator returned {} but no repairable slots", r);
+                        }
+                        (true, Some(actual)) => {
+                            // The iterator should return a slot at the best priority level
+                            let actual_slot_value = current_slots[actual as usize];
+                            let actual_priority = if actual_slot_value.is_none() && !copies_any.is_set(actual) {
+                                1
+                            } else if actual_slot_value.is_none() && copies_any.is_set(actual) {
+                                2
+                            } else if let Some(copy) = actual_slot_value {
+                                if copy != actual && copies_dup.is_set(copy) {
+                                    3
+                                } else {
+                                    prop_assert!(false, "Iterator repaired non-repairable slot {}", actual);
+                                    unreachable!()
+                                }
+                            } else {
+                                prop_assert!(false, "Unexpected state");
+                                unreachable!()
+                            };
+
+                            prop_assert_eq!(
+                                actual_priority,
+                                best_priority,
+                                "Iterator chose priority {} but best available was {}",
+                                actual_priority,
+                                best_priority
+                            );
+
+                            // Apply the repair
+                            current_slots[actual as usize] = Some(actual);
+                        }
+                    }
+                }
+            }
+
+            // Tests for COPIES=6
+            #[test]
+            fn all_copies_present_after_repairs_6_copies(slots in valid_slot_array::<6>()) {
+                let mut iter = RepairIterator::new(slots);
+                while iter.next().is_some() {}
+
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..6u8 {
+                    prop_assert!(copies_any.is_set(i), "Copy {} missing", i);
+                }
+            }
+
+            #[test]
+            fn no_duplicate_repairs_6_copies(slots in valid_slot_array::<6>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+                prop_assert_eq!(repairs.len(), unique.len());
+            }
+
+            // Tests for COPIES=8
+            #[test]
+            fn all_copies_present_after_repairs_8_copies(slots in valid_slot_array::<8>()) {
+                let mut iter = RepairIterator::new(slots);
+                while iter.next().is_some() {}
+
+                let (copies_any, _) = iter.compute_copy_sets();
+                for i in 0..8u8 {
+                    prop_assert!(copies_any.is_set(i), "Copy {} missing", i);
+                }
+            }
+
+            #[test]
+            fn no_duplicate_repairs_8_copies(slots in valid_slot_array::<8>()) {
+                let repairs: Vec<u8> = RepairIterator::new(slots).collect();
+                let unique: HashSet<_> = repairs.iter().collect();
+                prop_assert_eq!(repairs.len(), unique.len());
+            }
         }
     }
 }
