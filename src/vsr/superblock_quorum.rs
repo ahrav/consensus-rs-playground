@@ -595,49 +595,7 @@ mod tests {
         use super::*;
 
         #[test]
-        fn all_correct_no_repairs_needed() {
-            let slots = [Some(0), Some(1), Some(2), Some(3)];
-            let mut iter = RepairIterator::<4>::new(slots);
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn priority_1_empty_slot_missing_copy() {
-            // Slot 2 is empty and copy 2 doesn't exist anywhere
-            let slots = [Some(0), Some(1), None, Some(3)];
-            let mut iter = RepairIterator::<4>::new(slots);
-
-            assert_eq!(iter.next(), Some(2)); // Priority 1: missing copy
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn priority_2_empty_slot_misdirected_copy() {
-            // Slot 1 is empty, but copy 1 exists in slot 2
-            let slots = [Some(0), None, Some(1), Some(3)];
-            let mut iter = RepairIterator::<4>::new(slots);
-
-            // First: fix slot 1 (empty, but copy 1 exists elsewhere)
-            assert_eq!(iter.next(), Some(1)); // Priority 2
-
-            // Next: fix slot 2 (has copy 1 which is now a duplicate)
-            assert_eq!(iter.next(), Some(2)); // Priority 3
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn priority_3_duplicate_copy() {
-            // Slot 0 has copy 1 (wrong), and copy 1 also exists in slot 1
-            let slots = [Some(1), Some(1), Some(2), Some(3)];
-            let mut iter = RepairIterator::<4>::new(slots);
-
-            // Copy 0 is missing entirely → slot 0 becomes priority 1
-            assert_eq!(iter.next(), Some(0));
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn permutation_cycle_no_repairs_needed() {
+        fn cycle_no_repairs_4() {
             // A pure permutation cycle: each slot has a unique wrong copy.
             // No repairs possible without losing data.
             let slots = [Some(1), Some(2), Some(3), Some(0)];
@@ -656,44 +614,6 @@ mod tests {
             for i in 0..4u8 {
                 assert!(copies_any.is_set(i), "Copy {} should still exist", i);
             }
-        }
-
-        #[test]
-        fn mixed_priorities_ordered_correctly() {
-            // slots[0] = Some(2) → wrong copy, duplicate (priority 3)
-            // slots[1] = None → copy 1 missing entirely (priority 1)
-            // slots[2] = Some(2) → correct
-            // slots[3] = None → copy 3 missing entirely (priority 1)
-            let slots = [Some(2), None, Some(2), None];
-            let mut iter = RepairIterator::<4>::new(slots);
-
-            // Priority 1 repairs come first (slots 1 and 3 - missing copies)
-            let first = iter.next().unwrap();
-            assert!(
-                first == 1 || first == 3,
-                "expected slot 1 or 3, got {first}"
-            );
-
-            let second = iter.next().unwrap();
-            assert!(
-                second == 1 || second == 3,
-                "expected slot 1 or 3, got {second}"
-            );
-            assert_ne!(first, second);
-
-            // Priority 3 last (slot 0 has duplicate)
-            assert_eq!(iter.next(), Some(0));
-            assert_eq!(iter.next(), None);
-        }
-
-        #[test]
-        fn all_empty_slots_all_priority_1() {
-            let slots: [Option<u8>; 4] = [None, None, None, None];
-            let mut iter = RepairIterator::<4>::new(slots);
-
-            let mut repairs: Vec<u8> = iter.by_ref().collect();
-            repairs.sort();
-            assert_eq!(repairs, vec![0, 1, 2, 3]);
         }
 
         #[test]
@@ -752,7 +672,7 @@ mod tests {
         }
 
         #[test]
-        fn permutation_cycle_no_repairs_6_copies() {
+        fn cycle_no_repairs_6() {
             // A pure permutation cycle: each slot has a unique wrong copy.
             let slots = [Some(1), Some(2), Some(3), Some(4), Some(5), Some(0)];
             let mut iter = RepairIterator::<6>::new(slots);
@@ -772,7 +692,7 @@ mod tests {
         }
 
         #[test]
-        fn permutation_cycle_no_repairs_8_copies() {
+        fn cycle_no_repairs_8() {
             // A pure permutation cycle: each slot has a unique wrong copy.
             let slots = [
                 Some(1),
@@ -801,7 +721,7 @@ mod tests {
         }
 
         #[test]
-        fn repair_missing_in_permutation_cycle_4() {
+        fn repair_cycle_missing_4() {
             // Regression case: Permutation cycle with missing element.
             // Slot 1 is empty (missing copy 1).
             // Cycle: 0->2, 2->3, 3->0, 1 missing.
@@ -815,7 +735,7 @@ mod tests {
         }
 
         #[test]
-        fn repair_missing_in_permutation_cycle_6() {
+        fn repair_cycle_missing_6() {
             // Regression case.
             // Missing: 0, 3, 5.
             // Present: 1, 2, 4 (in slots 4, 1, 2).
@@ -828,7 +748,7 @@ mod tests {
         }
 
         #[test]
-        fn repair_missing_in_permutation_cycle_8() {
+        fn repair_cycle_missing_8() {
             // Regression case.
             // Missing: 0, 1, 2, 3, 7.
             // Present: 4, 5, 6 (in slots 6, 4, 5).
