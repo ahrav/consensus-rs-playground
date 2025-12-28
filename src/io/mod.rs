@@ -14,7 +14,6 @@
 //! identifies completions via `user_data` (`Completion*` cast to `u64`).
 
 pub mod intrusive_iops;
-pub mod iops;
 
 mod io_core;
 

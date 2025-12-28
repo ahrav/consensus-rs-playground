@@ -21,8 +21,9 @@ use super::constants::{
     IO_ENTRIES_DEFAULT, MAX_NEXT_TICK_ITERATIONS, SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX,
     SECTOR_SIZE_MIN,
 };
-use super::iocb::{NextTick, NextTickQueue, NextTickTag, Read, Synchronicity, Write};
+use super::iocb::{NextTick, NextTickQueue, NextTickTag, Read, Write};
 pub use super::layout::{Layout, Zone, ZoneSpec};
+use crate::vsr::storage::Synchronicity;
 
 /// Direct I/O storage engine with async operation queues and deferred callbacks.
 ///

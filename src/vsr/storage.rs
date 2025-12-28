@@ -7,6 +7,19 @@
 use crate::container_of;
 use crate::storage;
 use crate::storage::iocb;
+
+/// Controls whether I/O operations complete synchronously or asynchronously.
+///
+/// Used to configure storage behavior for testing (synchronous) vs production
+/// (asynchronous with io_uring/epoll).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Synchronicity {
+    /// Operations block until completion. Useful for deterministic testing.
+    AlwaysSynchronous,
+    /// Operations return immediately; completion notified via callback.
+    AlwaysAsynchronous,
+}
+
 use crate::vsr::superblock;
 
 /// Backend-agnostic storage interface for sector-aligned async I/O.
@@ -22,8 +35,17 @@ pub trait Storage: Sized {
     /// Logical region within the storage file (superblock, WAL, LSM zones).
     type Zone: Copy;
 
+    /// Synchronicity of I/O operations.
+    const SYNCHRONICITY: Synchronicity;
+
     /// Zone identifier for superblock I/O operations.
     const SUPERBLOCK_ZONE: Self::Zone;
+
+    /// Zone identifier for WAL headers I/O operations.
+    const WAL_HEADERS_ZONE: Self::Zone;
+
+    /// Zone identifier for WAL prepares I/O operations.
+    const WAL_PREPARES_ZONE: Self::Zone;
 
     /// Submits an async read at `offset` within `zone`.
     ///
@@ -77,7 +99,11 @@ impl Storage for storage::Storage {
 
     type Zone = storage::Zone;
 
+    const SYNCHRONICITY: Synchronicity = Synchronicity::AlwaysAsynchronous;
+
     const SUPERBLOCK_ZONE: Self::Zone = storage::Zone::SuperBlock;
+    const WAL_HEADERS_ZONE: Self::Zone = storage::Zone::WalHeaders;
+    const WAL_PREPARES_ZONE: Self::Zone = storage::Zone::WalPrepares;
 
     #[inline]
     fn read_sectors(

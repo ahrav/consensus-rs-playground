@@ -1968,7 +1968,11 @@ mod tests {
         type Read = u64;
         type Write = u64;
         type Zone = u8;
+        const SYNCHRONICITY: crate::vsr::storage::Synchronicity =
+            crate::vsr::storage::Synchronicity::AlwaysSynchronous;
         const SUPERBLOCK_ZONE: Self::Zone = 0;
+        const WAL_HEADERS_ZONE: Self::Zone = 1;
+        const WAL_PREPARES_ZONE: Self::Zone = 2;
 
         fn read_sectors(
             &mut self,

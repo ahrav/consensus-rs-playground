@@ -11,10 +11,11 @@ pub mod constants {
 }
 
 // Re-exports for convenient access
+pub use crate::vsr::storage::Synchronicity;
 pub use buffer::AlignedBuf;
 pub use constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN};
 pub use engine::{Options, Storage};
-pub use iocb::{NextTickQueue, Read, Synchronicity, Write};
+pub use iocb::{NextTickQueue, Read, Write};
 pub use layout::{Layout, Zone, ZoneSpec};
 
 #[macro_export]
