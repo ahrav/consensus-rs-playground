@@ -65,7 +65,8 @@ use crate::vsr::storage::{Storage, Synchronicity};
 /// - `buffer_ptr` must point to valid, aligned memory for `buffer_len` bytes
 /// - When `locked == true`, a storage I/O operation is in progress
 /// - When `next != null`, this range is queued behind another locked range
-/// - A range cannot be both `locked` and have a non-null `next` (mutually exclusive)
+/// - A **waiting** range (queued behind a locked range) always has `locked = false`
+/// - A **locked** range may have waiters attached via `next`
 #[repr(C)]
 pub struct Range<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
     /// Storage completion token, passed to `Storage::write_sectors`.
@@ -867,6 +868,70 @@ mod tests {
                 (*write2).range.next.is_null(),
                 "Waiter's next should be cleared"
             );
+        }
+    }
+
+    /// Verifies that overlapping writes queue and defer until the first completes.
+    #[test]
+    fn async_overlap_queuing_defers_until_completion() {
+        // Use async storage so callbacks are deferred.
+        let mut storage = MockStorage::<true>::new();
+        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+
+        let write1 = journal.writes.acquire().unwrap();
+        let write2 = journal.writes.acquire().unwrap();
+
+        let buf1 = vec![1u8; 4096];
+        let buf2 = vec![2u8; 4096];
+
+        unsafe {
+            (*write1).slot_index = 1;
+            (*write2).slot_index = 2;
+
+            // Submit first write - becomes locked.
+            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
+            assert!((*write1).range.locked, "First write should be locked");
+
+            // Submit second write at SAME offset - should queue, not submit.
+            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 0);
+            assert!(
+                !(*write2).range.locked,
+                "Second write should be queued, not locked"
+            );
+
+            // First write should have second in its wait list.
+            assert!(
+                !(*write1).range.next.is_null(),
+                "First write should have waiter"
+            );
+
+            // Only 1 I/O should have been submitted so far.
+            assert_eq!(
+                storage.write_count(),
+                1,
+                "Only first write should be submitted"
+            );
+
+            // Complete first write - this dequeues and submits second.
+            storage.drain_callbacks();
+
+            // Second write is now in-flight (submitted when first completed).
+            assert_eq!(
+                storage.write_count(),
+                2,
+                "Second write should now be submitted"
+            );
+            assert!(!(*write1).range.locked, "First write should be unlocked");
+            assert!(
+                (*write2).range.locked,
+                "Second write should now be locked (in-flight)"
+            );
+
+            // Complete second write.
+            storage.drain_callbacks();
+
+            // Now both should be complete.
+            assert!(!(*write2).range.locked, "Second write should be unlocked");
         }
     }
 
