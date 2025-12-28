@@ -235,6 +235,18 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         debug_assert!(self.is_empty());
     }
 
+    #[inline]
+    pub const fn is_subset(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < WORDS {
+            if self.words[i] & !other.words[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
     /// Iterates over set bits in ascending order using a snapshot of the current state.
     #[inline]
     pub const fn iter(&self) -> BitSetIterator<N, WORDS> {
@@ -386,6 +398,41 @@ mod tests {
             // Also verify the collected indices match the input set
             let collected: HashSet<usize> = b1.iter().collect();
             prop_assert_eq!(collected, bits);
+        }
+
+        #[test]
+        fn subset_is_reflexive(bits in prop::collection::vec(0usize..64, 0..64)) {
+            let mut b: BitSet64 = BitSet::empty();
+            for &idx in &bits {
+                b.set(idx);
+            }
+
+            prop_assert!(b.is_subset(&b));
+        }
+
+        #[test]
+        fn subset_with_additional_bits(
+            base_bits in prop::collection::hash_set(0usize..64, 0..32),
+            extra_bits in prop::collection::hash_set(0usize..64, 1..32),
+        ) {
+            let mut subset: BitSet64 = BitSet::empty();
+            let mut superset: BitSet64 = BitSet::empty();
+
+            for &idx in &base_bits {
+                subset.set(idx);
+                superset.set(idx);
+            }
+
+            for &idx in &extra_bits {
+                superset.set(idx);
+            }
+
+            // subset should always be a subset of superset
+            prop_assert!(subset.is_subset(&superset));
+
+            // superset is only a subset of subset if extra_bits were already in base_bits
+            let extra_outside_base: HashSet<_> = extra_bits.difference(&base_bits).collect();
+            prop_assert_eq!(superset.is_subset(&subset), extra_outside_base.is_empty());
         }
     }
 
@@ -912,5 +959,79 @@ mod tests {
         }
 
         assert_eq!(b.first_unset(), Some(70));
+    }
+
+    // ============================================
+    // is_subset tests
+    // ============================================
+
+    #[test]
+    fn empty_is_subset_of_any() {
+        let empty: BitSet64 = BitSet::empty();
+        let full: BitSet64 = BitSet::full();
+        let mut partial: BitSet64 = BitSet::empty();
+        partial.set(10);
+        partial.set(30);
+
+        assert!(empty.is_subset(&empty));
+        assert!(empty.is_subset(&partial));
+        assert!(empty.is_subset(&full));
+    }
+
+    #[test]
+    fn any_is_subset_of_full() {
+        let empty: BitSet64 = BitSet::empty();
+        let full: BitSet64 = BitSet::full();
+        let mut partial: BitSet64 = BitSet::empty();
+        partial.set(10);
+        partial.set(30);
+
+        assert!(empty.is_subset(&full));
+        assert!(partial.is_subset(&full));
+        assert!(full.is_subset(&full));
+    }
+
+    #[test]
+    fn subset_not_superset() {
+        let mut a: BitSet64 = BitSet::empty();
+        let mut b: BitSet64 = BitSet::empty();
+
+        a.set(5);
+        b.set(5);
+        b.set(10);
+
+        assert!(a.is_subset(&b));
+        assert!(!b.is_subset(&a));
+    }
+
+    #[test]
+    fn disjoint_sets_not_subsets() {
+        let mut a: BitSet64 = BitSet::empty();
+        let mut b: BitSet64 = BitSet::empty();
+
+        a.set(5);
+        b.set(10);
+
+        assert!(!a.is_subset(&b));
+        assert!(!b.is_subset(&a));
+    }
+
+    #[test]
+    fn subset_across_word_boundary() {
+        let mut subset: BitSet128 = BitSet::empty();
+        let mut superset: BitSet128 = BitSet::empty();
+
+        // Set bits in both words for subset
+        subset.set(10); // first word
+        subset.set(70); // second word
+
+        // Superset has all of subset's bits plus more
+        superset.set(10);
+        superset.set(50);
+        superset.set(70);
+        superset.set(100);
+
+        assert!(subset.is_subset(&superset));
+        assert!(!superset.is_subset(&subset));
     }
 }
