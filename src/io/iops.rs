@@ -49,9 +49,11 @@ impl<T, const SIZE: usize, const WORDS: usize> IOPSType<T, SIZE, WORDS> {
     /// # Panics
     ///
     /// Panics if `item` wasn't acquired from this pool or is misaligned.
+    /// Panics if the slot is not currently executing (double free).
     #[inline]
     pub fn release(&mut self, item: *mut T) {
         let index = self.index(item) as usize;
+        assert!(self.busy.is_set(index), "double free");
         self.items[index] = MaybeUninit::uninit();
         self.busy.unset(index);
     }
@@ -440,6 +442,15 @@ mod tests {
 
         // Try to release ptr_a into pool_b - should panic
         pool_b.release(ptr_a);
+    }
+
+    #[test]
+    #[should_panic(expected = "double free")]
+    fn release_double_free_panics() {
+        let mut pool: SmallPool = IOPSType::default();
+        let ptr = pool.acquire().unwrap();
+        pool.release(ptr);
+        pool.release(ptr);
     }
 
     // ==================== Iterator Tests ====================
