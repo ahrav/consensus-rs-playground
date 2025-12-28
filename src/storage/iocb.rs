@@ -4,18 +4,6 @@ use super::layout::{Zone, ZoneSpec};
 use crate::io::Completion as IoCompletion;
 use crate::stdx::queue::{QueueLink, QueueNode};
 
-/// Controls whether I/O operations complete synchronously or asynchronously.
-///
-/// Used to configure storage behavior for testing (synchronous) vs production
-/// (asynchronous with io_uring/epoll).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Synchronicity {
-    /// Operations block until completion. Useful for deterministic testing.
-    AlwaysSynchronous,
-    /// Operations return immediately; completion notified via callback.
-    AlwaysAsynchronous,
-}
-
 /// Identifies which subsystem a deferred callback belongs to.
 ///
 /// Callbacks are partitioned to allow priority-based processing: VSR protocol

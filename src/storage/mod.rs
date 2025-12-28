@@ -11,10 +11,11 @@ pub mod constants {
 }
 
 // Re-exports for convenient access
+pub use crate::vsr::storage::Synchronicity;
 pub use buffer::AlignedBuf;
 pub use constants::{SECTOR_SIZE_DEFAULT, SECTOR_SIZE_MAX, SECTOR_SIZE_MIN};
 pub use engine::{Options, Storage};
-pub use iocb::{NextTickQueue, Read, Synchronicity, Write};
+pub use iocb::{NextTickQueue, Read, Write};
 pub use layout::{Layout, Zone, ZoneSpec};
 
 #[macro_export]
@@ -23,10 +24,16 @@ macro_rules! container_of {
         let ptr_u8 = ($ptr as *const _ as *const u8) as usize;
 
         // Compute field offset without taking references to uninitialized data.
-        let offset = unsafe {
+        let offset = {
             let uninit = core::mem::MaybeUninit::<$parent>::uninit();
             let base = uninit.as_ptr();
-            let field_ptr = core::ptr::addr_of!((*base).$field);
+            // SAFETY: `addr_of!` does not dereference the pointer; it only
+            // computes the address. The MaybeUninit ensures we have a valid
+            // (albeit uninitialized) memory location for offset calculation.
+            // Allow unused_unsafe so this works both inside and outside
+            // existing unsafe blocks.
+            #[allow(unused_unsafe)]
+            let field_ptr = unsafe { core::ptr::addr_of!((*base).$field) };
             (field_ptr as usize) - (base as usize)
         };
 

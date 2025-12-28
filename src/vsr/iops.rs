@@ -32,7 +32,11 @@ impl<T, const SIZE: usize, const WORDS: usize> Default for IOPSType<T, SIZE, WOR
 impl<T, const SIZE: usize, const WORDS: usize> IOPSType<T, SIZE, WORDS> {
     const _ASSERT_SIZE_FITS_U8: () = { assert!(SIZE <= u8::MAX as usize) };
 
-    /// Returns a pointer to uninitialized memory, or `None` if full.
+    /// Returns a pointer to **zero-initialized** memory, or `None` if full.
+    ///
+    /// The slot is zeroed before return to ensure safe defaults for any fields
+    /// that might be read before the caller completes initialization (e.g., in
+    /// iteration patterns where acquired-but-not-submitted entries are scanned).
     ///
     /// Caller must write a valid `T` before reading and call [`release`](Self::release) when done.
     #[inline]
@@ -41,6 +45,10 @@ impl<T, const SIZE: usize, const WORDS: usize> IOPSType<T, SIZE, WORDS> {
         self.busy.set(index);
 
         let ptr = self.items[index].as_mut_ptr();
+        // Zero-initialize to ensure safe defaults for any fields that may be
+        // read before the caller fully initializes the slot.
+        // SAFETY: ptr is valid, aligned, and we're writing SIZE_OF::<T> zeros.
+        unsafe { ptr.write_bytes(0, 1) };
         Some(ptr)
     }
 
