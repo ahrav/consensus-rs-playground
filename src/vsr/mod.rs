@@ -1,5 +1,6 @@
 pub mod header_prepare;
 pub mod iops;
+pub mod journal;
 pub mod journal_primitives;
 pub mod members;
 pub mod operation;

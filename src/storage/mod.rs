@@ -24,10 +24,10 @@ macro_rules! container_of {
         let ptr_u8 = ($ptr as *const _ as *const u8) as usize;
 
         // Compute field offset without taking references to uninitialized data.
-        let offset = unsafe {
+        let offset = {
             let uninit = core::mem::MaybeUninit::<$parent>::uninit();
             let base = uninit.as_ptr();
-            let field_ptr = core::ptr::addr_of!((*base).$field);
+            let field_ptr = unsafe { core::ptr::addr_of!((*base).$field) };
             (field_ptr as usize) - (base as usize)
         };
 
