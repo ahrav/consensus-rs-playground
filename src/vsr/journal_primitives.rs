@@ -8,6 +8,8 @@ use core::mem::size_of;
 
 use crate::constants;
 use crate::vsr;
+use crate::vsr::Header;
+use crate::vsr::HeaderPrepare;
 
 /// Divides `n` by `d`, panicking if the division is not exact.
 pub const fn div_exact_usize(n: usize, d: usize) -> usize {
@@ -33,6 +35,9 @@ pub const fn sector_floor(offset: u64) -> u64 {
 // Core journal constants
 // -----------------------------------------------------------------------------
 
+/// WAL header size in bytes.
+pub const WAL_HEADER_SIZE: usize = size_of::<Header>();
+
 /// Total slots in the journal's circular buffers.
 pub const SLOT_COUNT: usize = constants::JOURNAL_SLOT_COUNT;
 
@@ -55,6 +60,10 @@ pub const HEADERS_PER_MESSAGE: usize = div_exact_usize(
     size_of::<vsr::Header>(),
 );
 
+pub const HEADER_CHUNK_COUNT: usize = SLOT_COUNT.div_ceil(HEADERS_PER_MESSAGE);
+
+pub const HEADER_CHUNK_WORDS: usize = (HEADER_CHUNK_COUNT + 63) / 64;
+
 const IS_PRODUCTION: bool = cfg!(feature = "production");
 
 const _: () = {
@@ -75,6 +84,8 @@ const _: () = {
         let headers_sector = div_exact_u64(HEADERS_SIZE, constants::SECTOR_SIZE as u64);
         assert!(headers_sector > constants::JOURNAL_IOPS_WRITE_MAX as u64 || !IS_PRODUCTION);
     }
+
+    assert!(size_of::<HeaderPrepare>() == WAL_HEADER_SIZE);
 
     assert!(PREPARES_SIZE > 0);
     assert!(PREPARES_SIZE.is_multiple_of(constants::SECTOR_SIZE as u64));
