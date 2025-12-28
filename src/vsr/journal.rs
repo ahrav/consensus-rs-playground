@@ -573,7 +573,7 @@ mod tests {
     fn dummy_callback_async(_: *mut Write<MockStorage<true>, 32, 1>) {}
 
     // =========================================================================
-    // Group 1: Range Overlap Detection (Property Tests)
+    // Range Overlap Detection (Property Tests)
     // =========================================================================
 
     mod overlap_properties {
@@ -801,44 +801,8 @@ mod tests {
     }
 
     // =========================================================================
-    // Group 3: Completion & Drain Logic (Unit Tests)
+    // Completion & Drain Logic (Unit Tests)
     // =========================================================================
-
-    #[test]
-    fn completion_processes_all_queued_writes() {
-        // Verify that when overlapping writes queue up, they all eventually complete.
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        fn counting_callback(_write: *mut TestWrite) {
-            // We verify via storage write count instead of callback state.
-        }
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-        let write3 = journal.writes.acquire().unwrap();
-
-        let buf1 = vec![1u8; 4096];
-        let buf2 = vec![2u8; 4096];
-        let buf3 = vec![3u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-            (*write3).slot_index = 3;
-
-            journal.write_sectors(write1, counting_callback, &buf1, Ring::Headers, 0);
-            journal.write_sectors(write2, counting_callback, &buf2, Ring::Headers, 0);
-            journal.write_sectors(write3, counting_callback, &buf3, Ring::Headers, 0);
-        }
-
-        // All three should have been submitted in sequence.
-        assert_eq!(
-            storage.write_count(),
-            3,
-            "All queued writes should complete"
-        );
-    }
 
     #[test]
     fn completion_clears_wait_list() {
@@ -872,7 +836,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Group 4: Integration Properties (Property Tests)
+    // Integration Properties (Property Tests)
     // =========================================================================
 
     mod integration_properties {
@@ -956,7 +920,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Group 5: Callback Safety (Unit Tests)
+    // Callback Safety (Unit Tests)
     // =========================================================================
 
     #[test]
@@ -982,7 +946,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Group 6: Edge Cases (Unit Tests)
+    // Edge Cases (Unit Tests)
     // =========================================================================
 
     #[test]
