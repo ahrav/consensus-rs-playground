@@ -235,6 +235,9 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         debug_assert!(self.is_empty());
     }
 
+    /// Returns `true` if every set bit in `self` is also set in `other`.
+    ///
+    /// An empty bitset is a subset of any bitset; any bitset is a subset of a full bitset.
     #[inline]
     pub const fn is_subset(&self, other: &Self) -> bool {
         let mut i = 0;
