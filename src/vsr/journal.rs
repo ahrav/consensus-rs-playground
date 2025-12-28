@@ -155,6 +155,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - `b <= a` implies `b + len_b > a`
     ///
     /// Different rings (Headers vs Prepares) never overlap regardless of offset.
+    ///
+    /// Uses `saturating_add` to prevent overflow when offset is near `u64::MAX`.
     #[inline]
     pub fn overlaps(&self, other: &Self) -> bool {
         if self.ring != other.ring {
@@ -164,10 +166,13 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let len_a = self.buffer_len as u64;
         let len_b = other.buffer_len as u64;
 
+        // Use saturating_add to prevent wrap-around at u64::MAX.
+        // If offset + len overflows, saturate to MAX which correctly indicates
+        // the range extends to the end of the address space.
         if self.offset < other.offset {
-            self.offset + len_a > other.offset
+            self.offset.saturating_add(len_a) > other.offset
         } else {
-            other.offset + len_b > self.offset
+            other.offset.saturating_add(len_b) > self.offset
         }
     }
 }
@@ -368,7 +373,14 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             // Verify synchronicity model matches storage behavior.
             match S::SYNCHRONICITY {
                 Synchronicity::AlwaysAsynchronous => assert!((*write).range.locked),
-                Synchronicity::AlwaysSynchronous => assert!(!(*write).range.locked),
+                Synchronicity::AlwaysSynchronous => {
+                    // We cannot assert !locked here because the callback has already run
+                    // and might have released the `write` back to the pool. Dereferencing
+                    // `write` here would be a Use-After-Free/Release.
+                    //
+                    // We rely on the storage contract: AlwaysSynchronous must have called
+                    // the completion callback inline.
+                }
             }
         };
     }
@@ -701,6 +713,29 @@ mod tests {
     }
 
     // =========================================================================
+    // Overflow Edge Cases (Unit Tests)
+    // =========================================================================
+
+    /// Regression test: offset near u64::MAX should not wrap and false-detect overlap.
+    #[test]
+    fn overlaps_handles_offset_overflow() {
+        let buf = vec![0u8; 4096];
+        let near_max = TestRange::new(dummy_callback, &buf, Ring::Headers, u64::MAX - 2048);
+        let at_zero = TestRange::new(dummy_callback, &buf, Ring::Headers, 0);
+
+        // Without saturating_add, (MAX-2048) + 4096 wraps to ~2047, which is > 0,
+        // causing a false positive overlap. With saturating_add, it saturates to MAX.
+        assert!(
+            !near_max.overlaps(&at_zero),
+            "Near-MAX range should not wrap and false-detect overlap with zero"
+        );
+        assert!(
+            !at_zero.overlaps(&near_max),
+            "Zero range should not overlap with near-MAX range"
+        );
+    }
+
+    // =========================================================================
     // Locking Protocol (Unit Tests)
     // =========================================================================
 
@@ -974,6 +1009,43 @@ mod tests {
         );
     }
 
+    /// Regression test for UB: batch acquire then submit pattern.
+    #[test]
+    fn batch_acquire_then_submit_is_safe() {
+        let mut storage = MockStorage::new();
+        let mut journal = TestJournal::new(&mut storage, 0);
+
+        // Acquire multiple writes first (all have unsubmitted ranges).
+        let write1 = journal.writes.acquire().unwrap();
+        let write2 = journal.writes.acquire().unwrap();
+        let write3 = journal.writes.acquire().unwrap();
+
+        // Set slot indices (required by caller contract).
+        unsafe {
+            (*write1).slot_index = 1;
+            (*write2).slot_index = 2;
+            (*write3).slot_index = 3;
+        }
+
+        // Submit only the first write. lock_sectors will iterate write2 and write3,
+        // reading their range.locked fields. With zero-initialization, this is safe.
+        let buf1 = vec![1u8; 4096];
+        unsafe {
+            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
+        }
+
+        // Submit the remaining writes.
+        let buf2 = vec![2u8; 4096];
+        let buf3 = vec![3u8; 4096];
+        unsafe {
+            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
+            journal.write_sectors(write3, dummy_callback, &buf3, Ring::Headers, 16384);
+        }
+
+        // All writes should complete successfully.
+        assert_eq!(storage.write_count(), 3);
+    }
+
     #[test]
     #[should_panic(expected = "assertion failed")]
     fn zero_length_buffer_panics() {
@@ -1036,5 +1108,45 @@ mod tests {
         }
 
         assert_eq!(storage.write_count(), 1);
+    }
+
+    #[test]
+    fn synchronous_callback_can_release_write() {
+        let mut storage = MockStorage::<false>::new();
+        let mut journal = Journal::<MockStorage<false>, 32, 1>::new(&mut storage, 0);
+
+        let write = journal.writes.acquire().unwrap();
+        let buf = vec![1u8; 4096];
+
+        fn releasing_callback(w: *mut TestWrite) {
+            unsafe {
+                let journal = &mut *(*w).journal;
+                // Release the write back to the pool.
+                // This makes the `w` pointer invalid for the caller of the callback.
+                journal.writes.release(w);
+            }
+        }
+
+        unsafe {
+            (*write).slot_index = 1;
+            // This should not panic or trigger UB (accessing released write).
+            journal.write_sectors(write, releasing_callback, &buf, Ring::Headers, 0);
+        }
+
+        // Verify the write was actually released.
+        // Capacity is 32, we acquired 1, then released it in callback.
+        // So available should be 32.
+        // We can't check `journal.writes.available()` directly as it's not exposed in `IOPSType`
+        // public interface easily without iteration or internal knowledge,
+        // but we can try to acquire 32 writes again to prove it's free.
+
+        let mut writes = Vec::new();
+        for _ in 0..32 {
+            if let Some(w) = journal.writes.acquire() {
+                writes.push(w);
+            } else {
+                panic!("Should be able to re-acquire all writes");
+            }
+        }
     }
 }
