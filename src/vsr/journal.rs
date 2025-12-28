@@ -367,8 +367,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             // Verify synchronicity model matches storage behavior.
             match S::SYNCHRONICITY {
-                Synchronicity::AlwaysAsynchronous => assert!(!(*write).range.locked),
-                Synchronicity::AlwaysSynchronous => assert!((*write).range.locked),
+                Synchronicity::AlwaysAsynchronous => assert!((*write).range.locked),
+                Synchronicity::AlwaysSynchronous => assert!(!(*write).range.locked),
             }
         };
     }
@@ -461,34 +461,22 @@ mod tests {
 
     /// Mock storage implementation for deterministic testing.
     ///
-    /// By default, callbacks are invoked immediately (simulating fast I/O completion).
-    /// For tests that need to observe intermediate states (e.g., overlapping writes),
-    /// use `new_deferred()` to defer callbacks until `drain_callbacks()` is called.
-    struct MockStorage {
+    /// The `ASYNC` const generic controls the synchronicity model:
+    /// - `false`: AlwaysSynchronous (callbacks invoked immediately)
+    /// - `true`: AlwaysAsynchronous (callbacks deferred until `drain_callbacks`)
+    struct MockStorage<const ASYNC: bool> {
         /// Log of all writes submitted to storage.
         write_log: RefCell<Vec<WriteRecord>>,
         /// Pending callbacks to invoke (for deferred mode).
         pending_callbacks: RefCell<Vec<*mut MockWriteCompletion>>,
-        /// Whether to defer callback invocation.
-        defer_callbacks: bool,
     }
 
-    impl MockStorage {
-        /// Creates a storage that immediately invokes callbacks.
+    impl<const ASYNC: bool> MockStorage<ASYNC> {
+        /// Creates a new mock storage.
         fn new() -> Self {
             Self {
                 write_log: RefCell::new(Vec::new()),
                 pending_callbacks: RefCell::new(Vec::new()),
-                defer_callbacks: false,
-            }
-        }
-
-        /// Creates a storage that defers callbacks until drain_callbacks is called.
-        fn new_deferred() -> Self {
-            Self {
-                write_log: RefCell::new(Vec::new()),
-                pending_callbacks: RefCell::new(Vec::new()),
-                defer_callbacks: true,
             }
         }
 
@@ -511,14 +499,18 @@ mod tests {
         }
     }
 
-    impl Storage for MockStorage {
+    impl<const ASYNC: bool> Storage for MockStorage<ASYNC> {
         type Read = ();
         type Write = MockWriteCompletion;
         type Zone = Zone;
 
         // We invoke callbacks (either immediately or deferred), so declare as Async.
         // The assertion expects !locked after write_sectors returns.
-        const SYNCHRONICITY: Synchronicity = Synchronicity::AlwaysAsynchronous;
+        const SYNCHRONICITY: Synchronicity = if ASYNC {
+            Synchronicity::AlwaysAsynchronous
+        } else {
+            Synchronicity::AlwaysSynchronous
+        };
         const SUPERBLOCK_ZONE: Self::Zone = Zone::SuperBlock;
         const WAL_HEADERS_ZONE: Self::Zone = Zone::WalHeaders;
         const WAL_PREPARES_ZONE: Self::Zone = Zone::WalPrepares;
@@ -552,7 +544,7 @@ mod tests {
             // Store callback for invocation.
             write.callback = callback;
 
-            if self.defer_callbacks {
+            if ASYNC {
                 // Store for later invocation.
                 self.pending_callbacks.borrow_mut().push(write as *mut _);
             } else {
@@ -571,12 +563,14 @@ mod tests {
     }
 
     // Type aliases for test convenience.
-    type TestWrite = Write<MockStorage, 32, 1>;
-    type TestRange = Range<MockStorage, 32, 1>;
-    type TestJournal = Journal<MockStorage, 32, 1>;
+    type TestMockStorage = MockStorage<false>;
+    type TestWrite = Write<TestMockStorage, 32, 1>;
+    type TestRange = Range<TestMockStorage, 32, 1>;
+    type TestJournal = Journal<TestMockStorage, 32, 1>;
 
     /// Dummy callback for tests that don't need callback verification.
     fn dummy_callback(_: *mut TestWrite) {}
+    fn dummy_callback_async(_: *mut Write<MockStorage<true>, 32, 1>) {}
 
     // =========================================================================
     // Group 1: Range Overlap Detection (Property Tests)
@@ -730,8 +724,14 @@ mod tests {
 
             // Both should have been submitted and completed (synchronous storage).
             // After completion, locked = false.
-            assert!(!(*write1).range.locked, "Write1 should be unlocked after completion");
-            assert!(!(*write2).range.locked, "Write2 should be unlocked after completion");
+            assert!(
+                !(*write1).range.locked,
+                "Write1 should be unlocked after completion"
+            );
+            assert!(
+                !(*write2).range.locked,
+                "Write2 should be unlocked after completion"
+            );
             assert!((*write1).range.next.is_null());
             assert!((*write2).range.next.is_null());
         }
@@ -809,8 +809,8 @@ mod tests {
     #[should_panic(expected = "assertion failed")]
     fn panics_on_overlapping_different_offset() {
         // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::new_deferred();
-        let mut journal = TestJournal::new(&mut storage, 0);
+        let mut storage = MockStorage::<true>::new();
+        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
 
         let write1 = journal.writes.acquire().unwrap();
         let write2 = journal.writes.acquire().unwrap();
@@ -823,10 +823,10 @@ mod tests {
             (*write1).slot_index = 1;
             (*write2).slot_index = 2;
 
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
+            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
             // write1 is now locked (callback deferred).
             // This overlaps [0, 8192) but starts at 4096 - should panic.
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 4096);
+            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 4096);
         }
     }
 
@@ -834,8 +834,8 @@ mod tests {
     #[should_panic(expected = "assertion failed")]
     fn panics_on_overlapping_different_length() {
         // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::new_deferred();
-        let mut journal = TestJournal::new(&mut storage, 0);
+        let mut storage = MockStorage::<true>::new();
+        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
 
         let write1 = journal.writes.acquire().unwrap();
         let write2 = journal.writes.acquire().unwrap();
@@ -848,10 +848,10 @@ mod tests {
             (*write1).slot_index = 1;
             (*write2).slot_index = 2;
 
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
+            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
             // write1 is now locked (callback deferred).
             // Same offset (0) but different length - should panic.
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 0);
+            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 0);
         }
     }
 
@@ -859,8 +859,8 @@ mod tests {
     #[should_panic(expected = "assertion failed")]
     fn panics_on_overlapping_prepares() {
         // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::new_deferred();
-        let mut journal = TestJournal::new(&mut storage, 0);
+        let mut storage = MockStorage::<true>::new();
+        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
 
         let write1 = journal.writes.acquire().unwrap();
         let write2 = journal.writes.acquire().unwrap();
@@ -872,10 +872,10 @@ mod tests {
             (*write1).slot_index = 1;
             (*write2).slot_index = 2;
 
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Prepares, 0);
+            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Prepares, 0);
             // write1 is now locked (callback deferred).
             // Prepares writes must never overlap - should panic.
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Prepares, 0);
+            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Prepares, 0);
         }
     }
 
@@ -934,7 +934,11 @@ mod tests {
         }
 
         // All three should have been submitted in sequence.
-        assert_eq!(storage.write_count(), 3, "All queued writes should complete");
+        assert_eq!(
+            storage.write_count(),
+            3,
+            "All queued writes should complete"
+        );
     }
 
     #[test]
@@ -957,8 +961,14 @@ mod tests {
             journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 0);
 
             // After synchronous completion, next pointers should be null.
-            assert!((*write1).range.next.is_null(), "Wait list should be cleared");
-            assert!((*write2).range.next.is_null(), "Waiter's next should be cleared");
+            assert!(
+                (*write1).range.next.is_null(),
+                "Wait list should be cleared"
+            );
+            assert!(
+                (*write2).range.next.is_null(),
+                "Waiter's next should be cleared"
+            );
         }
     }
 
@@ -1088,11 +1098,17 @@ mod tests {
         }
 
         // Next acquire should fail.
-        assert!(journal.writes.acquire().is_none(), "Pool should be exhausted");
+        assert!(
+            journal.writes.acquire().is_none(),
+            "Pool should be exhausted"
+        );
 
         // Release one and acquire again should work.
         journal.writes.release(writes.pop().unwrap());
-        assert!(journal.writes.acquire().is_some(), "Should be able to acquire after release");
+        assert!(
+            journal.writes.acquire().is_some(),
+            "Should be able to acquire after release"
+        );
     }
 
     #[test]
@@ -1132,5 +1148,30 @@ mod tests {
 
         assert_eq!(journal.storage, &mut storage as *mut _);
         assert_eq!(journal.replica, 5);
+    }
+
+    #[test]
+    fn async_writes_complete_correctly() {
+        let mut storage = MockStorage::<true>::new();
+        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+
+        let write = journal.writes.acquire().unwrap();
+        let buf = vec![1u8; 4096];
+
+        unsafe {
+            (*write).slot_index = 1;
+            journal.write_sectors(write, dummy_callback_async, &buf, Ring::Headers, 0);
+
+            // Should be locked (Async).
+            assert!((*write).range.locked);
+            assert_eq!(storage.pending_callbacks.borrow().len(), 1);
+
+            storage.drain_callbacks();
+
+            // Should be unlocked.
+            assert!(!(*write).range.locked);
+        }
+
+        assert_eq!(storage.write_count(), 1);
     }
 }
