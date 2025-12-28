@@ -27,6 +27,12 @@ macro_rules! container_of {
         let offset = {
             let uninit = core::mem::MaybeUninit::<$parent>::uninit();
             let base = uninit.as_ptr();
+            // SAFETY: `addr_of!` does not dereference the pointer; it only
+            // computes the address. The MaybeUninit ensures we have a valid
+            // (albeit uninitialized) memory location for offset calculation.
+            // Allow unused_unsafe so this works both inside and outside
+            // existing unsafe blocks.
+            #[allow(unused_unsafe)]
             let field_ptr = unsafe { core::ptr::addr_of!((*base).$field) };
             (field_ptr as usize) - (base as usize)
         };
