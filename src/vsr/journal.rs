@@ -710,30 +710,27 @@ mod tests {
                 prop_assert!(outer.overlaps(&inner), "Outer must overlap inner");
                 prop_assert!(inner.overlaps(&outer), "Inner must overlap outer");
             }
+
+            /// Ranges near u64::MAX do not wrap and false-detect overlap with low offsets.
+            #[test]
+            fn high_offset_does_not_wrap(
+                ring in ring_strategy(),
+                len in 1usize..65536,
+                low_offset in 0u64..1_000_000
+            ) {
+                // Place a range near MAX such that offset + len would overflow without saturation.
+                let high_offset = u64::MAX - (len as u64 / 2);
+                let buf_high = vec![0u8; len];
+                let buf_low = vec![0u8; len];
+
+                let high_range = TestRange::new(dummy_callback, &buf_high, ring, high_offset);
+                let low_range = TestRange::new(dummy_callback, &buf_low, ring, low_offset);
+
+                // These ranges are at opposite ends of the address space; they must not overlap.
+                prop_assert!(!high_range.overlaps(&low_range), "High range must not wrap to overlap low");
+                prop_assert!(!low_range.overlaps(&high_range), "Low range must not overlap high");
+            }
         }
-    }
-
-    // =========================================================================
-    // Overflow Edge Cases (Unit Tests)
-    // =========================================================================
-
-    /// Regression test: offset near u64::MAX should not wrap and false-detect overlap.
-    #[test]
-    fn overlaps_handles_offset_overflow() {
-        let buf = vec![0u8; 4096];
-        let near_max = TestRange::new(dummy_callback, &buf, Ring::Headers, u64::MAX - 2048);
-        let at_zero = TestRange::new(dummy_callback, &buf, Ring::Headers, 0);
-
-        // Without saturating_add, (MAX-2048) + 4096 wraps to ~2047, which is > 0,
-        // causing a false positive overlap. With saturating_add, it saturates to MAX.
-        assert!(
-            !near_max.overlaps(&at_zero),
-            "Near-MAX range should not wrap and false-detect overlap with zero"
-        );
-        assert!(
-            !at_zero.overlaps(&near_max),
-            "Zero range should not overlap with near-MAX range"
-        );
     }
 
     // =========================================================================
