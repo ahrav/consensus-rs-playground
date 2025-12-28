@@ -62,7 +62,7 @@ pub const HEADERS_PER_MESSAGE: usize = div_exact_usize(
 
 pub const HEADER_CHUNK_COUNT: usize = SLOT_COUNT.div_ceil(HEADERS_PER_MESSAGE);
 
-pub const HEADER_CHUNK_WORDS: usize = (HEADER_CHUNK_COUNT + 63) / 64;
+pub const HEADER_CHUNK_WORDS: usize = HEADER_CHUNK_COUNT.div_ceil(64);
 
 const IS_PRODUCTION: bool = cfg!(feature = "production");
 
