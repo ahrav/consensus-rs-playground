@@ -1270,8 +1270,14 @@ mod tests {
         assert!(matches!(journal.status, Status::Init));
 
         // BitSets should be full (all slots marked dirty/faulty initially)
-        assert!(journal.dirty.is_full(), "dirty BitSet should be full initially");
-        assert!(journal.faulty.is_full(), "faulty BitSet should be full initially");
+        assert!(
+            journal.dirty.is_full(),
+            "dirty BitSet should be full initially"
+        );
+        assert!(
+            journal.faulty.is_full(),
+            "faulty BitSet should be full initially"
+        );
 
         // Vector lengths and contents - prepare_checksums
         assert_eq!(
@@ -1339,7 +1345,10 @@ mod tests {
             "all headers should have invalid checksums after initialization"
         );
         assert!(
-            journal.headers_redundant.iter().all(|h| !h.valid_checksum()),
+            journal
+                .headers_redundant
+                .iter()
+                .all(|h| !h.valid_checksum()),
             "all redundant headers should have invalid checksums after initialization"
         );
     }
