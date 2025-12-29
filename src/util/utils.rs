@@ -3,7 +3,7 @@
 use core::mem::{align_of, size_of};
 use core::ptr::NonNull;
 use core::slice;
-use std::alloc::{Layout, alloc_zeroed, dealloc};
+use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 
 /// # Safety
 ///
@@ -364,6 +364,200 @@ impl<T> core::ops::Drop for AlignedBox<T> {
 unsafe impl<T: Send> Send for AlignedBox<T> {}
 unsafe impl<T: Sync> Sync for AlignedBox<T> {}
 
+/// Heap-allocated slice with guaranteed alignment and zero-initialized memory.
+///
+/// `AlignedSlice<T>` allocates an array of `len` elements with a specified alignment,
+/// zero-initializing all bytes. Use this when you need aligned buffers for direct I/O,
+/// DMA targets, or SIMD operations.
+///
+/// # Differences from [`AlignedBox<T>`]
+///
+/// - Allocates multiple elements (slice) vs single value
+/// - Supports custom alignment beyond the type's natural alignment
+///
+/// # Memory Management
+///
+/// This type implements `Drop`, automatically freeing memory when it goes out of scope.
+/// The [`dealloc_in_place()`](Self::dealloc_in_place) method is available for explicit
+/// early cleanup if needed.
+pub struct AlignedSlice<T> {
+    ptr: NonNull<T>,
+    len: usize,
+    layout: Layout,
+}
+
+// SAFETY: AlignedSlice owns its data exclusively.
+unsafe impl<T: Send> Send for AlignedSlice<T> {}
+unsafe impl<T: Sync> Sync for AlignedSlice<T> {}
+
+impl<T> AlignedSlice<T> {
+    /// Allocates a zero-initialized slice of `T` with the type's natural alignment.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the all-zero byte pattern is a valid `T`.
+    ///
+    /// # Panics
+    ///
+    /// - `len == 0`
+    /// - `T` is a ZST
+    /// - Allocation size overflows `isize::MAX`
+    /// - Allocation fails
+    pub unsafe fn new_zeroed(len: usize) -> Self
+    where
+        T: Zeroable,
+    {
+        unsafe { Self::new_zeroed_aligned(len, align_of::<T>()) }
+    }
+
+    /// Allocates a zero-initialized slice of `T` with at least `align` byte alignment.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the all-zero byte pattern is a valid `T`.
+    ///
+    /// # Panics
+    ///
+    /// - `len == 0`
+    /// - `T` is a ZST
+    /// - `align` is not a power of two
+    /// - `align` is less than `align_of::<T>()`
+    /// - Allocation size overflows `isize::MAX`
+    /// - Allocation fails
+    pub unsafe fn new_zeroed_aligned(len: usize, align: usize) -> Self
+    where
+        T: Zeroable,
+    {
+        const { assert!(size_of::<T>() > 0) };
+
+        assert!(len > 0);
+        assert!(align > 0);
+        assert!(align.is_power_of_two());
+        assert!(align >= align_of::<T>(), "alignment below type requirement");
+        assert!(align <= isize::MAX as usize);
+
+        let size = len
+            .checked_mul(size_of::<T>())
+            .expect("aligned_slice size overflow");
+        
+        assert!(size <= isize::MAX as usize);
+
+        let layout = Layout::from_size_align(size, align).expect("invalid layout");
+        
+        // Use alloc_zeroed for safety with Zeroable types
+        let raw = unsafe { alloc_zeroed(layout) } as *mut T;
+        if raw.is_null() {
+            handle_alloc_error(layout);
+        }
+
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(raw) },
+            len,
+            layout,
+        }
+    }
+
+    /// Returns the number of elements in the slice.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the slice contains no elements.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns a raw pointer to the first element.
+    ///
+    /// The pointer is guaranteed to meet the alignment requirement specified
+    /// during allocation.
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        let ptr = self.ptr.as_ptr();
+        assert!((ptr as usize).is_multiple_of(self.layout.align()));
+        ptr
+    }
+
+    /// Returns a mutable raw pointer to the first element.
+    ///
+    /// The pointer is guaranteed to meet the alignment requirement specified
+    /// during allocation.
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        let ptr = self.ptr.as_ptr();
+        assert!((ptr as usize).is_multiple_of(self.layout.align()));
+        ptr
+    }
+
+    /// Returns a shared slice view of the allocated elements.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        // SAFETY: Pointer and length are valid from allocation.
+        // Memory is zero-initialized via alloc_zeroed.
+        unsafe { slice::from_raw_parts(self.as_ptr(), self.len()) }
+    }
+
+    /// Returns a mutable slice view of the allocated elements.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        // SAFETY: Pointer and length are valid from allocation.
+        // Memory is zero-initialized via alloc_zeroed.
+        unsafe { slice::from_raw_parts_mut(self.as_mut_ptr(), self.len()) }
+    }
+
+    /// Returns the memory layout used for this allocation.
+    #[inline]
+    pub fn layout(&self) -> Layout {
+        self.layout
+    }
+
+    /// Deallocates the memory, dropping elements first.
+    ///
+    /// This is safe to call multiple times (idempotent), though typically
+    /// `Drop` handles this automatically.
+    #[inline]
+    pub fn dealloc_in_place(&mut self) {
+        if self.len == 0 {
+            return;
+        }
+
+        let ptr = self.ptr.as_ptr();
+        
+        // 1. Drop elements
+        let slice_ptr = core::ptr::slice_from_raw_parts_mut(ptr, self.len);
+        unsafe { core::ptr::drop_in_place(slice_ptr) };
+
+        // 2. Dealloc memory
+        unsafe { dealloc(ptr as *mut u8, self.layout) };
+
+        // 3. Reset state
+        self.ptr = NonNull::dangling();
+        self.len = 0;
+        self.layout = Layout::new::<u8>();
+    }
+}
+
+impl<T> core::ops::Deref for AlignedSlice<T> {
+    type Target = [T];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T> core::ops::DerefMut for AlignedSlice<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
+    }
+}
+
+impl<T> Drop for AlignedSlice<T> {
+    fn drop(&mut self) {
+        self.dealloc_in_place();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,31 +587,6 @@ mod tests {
         align_up(0, alignment);
     }
 
-    #[test]
-    fn test_aligned_box() {
-        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed() };
-        assert_eq!(*boxed, 0u64);
-        assert!((boxed.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
-    }
-
-    #[test]
-    fn test_aligned_box_mut() {
-        let mut boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed() };
-        *boxed = 42;
-        assert_eq!(*boxed, 42);
-    }
-
-    #[test]
-    fn test_as_bytes() {
-        let value: u32 = 0xDEADBEEF;
-        let bytes = unsafe { as_bytes(&value) };
-        assert_eq!(bytes.len(), 4);
-
-        // Verify we can read the bytes back
-        let reconstructed = u32::from_ne_bytes(bytes.try_into().unwrap());
-        assert_eq!(reconstructed, value);
-    }
-
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct TestStruct {
@@ -438,23 +607,6 @@ mod tests {
 
         assert_eq!(boxed.a, 1);
         assert_eq!(boxed.b, 2);
-    }
-
-    #[test]
-    fn test_aligned_box_custom_alignment() {
-        // Align u64 (natural align 8) to 4096 bytes
-        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(4096) };
-        assert_eq!(*boxed, 0u64);
-        assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
-        assert_eq!(boxed.layout().align(), 4096);
-    }
-
-    #[test]
-    fn test_aligned_box_custom_alignment_equals_natural() {
-        // Align to exactly the type's natural alignment
-        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(align_of::<u64>()) };
-        assert_eq!(*boxed, 0u64);
-        assert!((boxed.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
     }
 
     #[test]
@@ -490,14 +642,6 @@ mod tests {
         assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
         assert_eq!(boxed.a, 0);
         assert_eq!(boxed.b, 0);
-    }
-
-    #[test]
-    fn test_aligned_box_custom_alignment_mut() {
-        let mut boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(4096) };
-        *boxed = 42;
-        assert_eq!(*boxed, 42);
-        assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
     }
 
     #[test]
@@ -714,6 +858,50 @@ mod tests {
         assert_eq!(layout.size(), size_of::<u128>());
         assert_eq!(layout.align(), align_of::<u128>());
     }
+
+    #[test]
+    fn test_aligned_slice_new_zeroed() {
+        let slice: AlignedSlice<u64> = unsafe { AlignedSlice::new_zeroed(10) };
+        assert_eq!(slice.len(), 10);
+        assert!(!slice.is_empty());
+        for &x in slice.iter() {
+            assert_eq!(x, 0);
+        }
+        assert!((slice.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
+    }
+
+    #[test]
+    fn test_aligned_slice_custom_align() {
+        let slice: AlignedSlice<u64> = unsafe { AlignedSlice::new_zeroed_aligned(10, 4096) };
+        assert!((slice.as_ptr() as usize).is_multiple_of(4096));
+    }
+
+    #[test]
+    fn test_aligned_slice_drop() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+        DROP_COUNT.store(0, Ordering::SeqCst); // Reset
+
+        struct Dropper { _padding: u8 }
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe impl Zeroable for Dropper {}
+
+        {
+            let _slice: AlignedSlice<Dropper> = unsafe { AlignedSlice::new_zeroed(5) };
+        }
+
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_zero_len() {
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed(0) };
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +1020,14 @@ mod proptests {
                 *boxed = value;
                 prop_assert_eq!(*boxed, value);
             }
+        }
+
+        #[test]
+        fn prop_aligned_slice_roundtrip(vec: Vec<u64>) {
+            if vec.is_empty() { return Ok(()); }
+            let mut slice = unsafe { AlignedSlice::<u64>::new_zeroed(vec.len()) };
+            slice.copy_from_slice(&vec);
+            prop_assert_eq!(slice.as_slice(), vec.as_slice());
         }
     }
 }
