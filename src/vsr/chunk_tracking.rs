@@ -7,15 +7,13 @@
 //!
 //! State machine: unrequested → requested → recovered
 
-#![allow(dead_code)]
-
 use core::cmp::min;
 
 use super::journal_primitives::{HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS};
 use crate::constants;
 use crate::stdx::BitSet;
-use crate::vsr::journal_primitives::{HEADERS_SIZE, WAL_HEADER_SIZE};
 use crate::vsr::HeaderPrepare;
+use crate::vsr::journal_primitives::{HEADERS_SIZE, WAL_HEADER_SIZE};
 
 // Compile-time assertions to verify constant relationships.
 const _: () = {
@@ -628,7 +626,11 @@ mod tests {
         // Find a misaligned slice within the buffer
         let align = core::mem::align_of::<HeaderPrepare>();
         let base_addr = buffer.as_ptr() as usize;
-        let offset = if base_addr.is_multiple_of(align) { 1 } else { 0 };
+        let offset = if base_addr.is_multiple_of(align) {
+            1
+        } else {
+            0
+        };
 
         let slice = &buffer[offset..offset + WAL_HEADER_SIZE];
         assert!(
@@ -822,8 +824,10 @@ mod tests {
         }
 
         // Invariant should hold: recovered (half) is subset of requested (all)
-        assert!(tracking.header_chunks_recovered.count() < tracking.header_chunks_requested.count()
-            || HEADER_CHUNK_COUNT <= 1);
+        assert!(
+            tracking.header_chunks_recovered.count() < tracking.header_chunks_requested.count()
+                || HEADER_CHUNK_COUNT <= 1
+        );
     }
 }
 
