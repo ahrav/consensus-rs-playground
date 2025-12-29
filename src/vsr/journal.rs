@@ -328,16 +328,13 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             )
         };
 
-        assert!(&headers.iter().all(|h| !h.valid_checksum()));
-        assert!(&headers_redundant.iter().all(|h| !h.valid_checksum()));
-
         let dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
         let faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
 
         let prepare_checksums = vec![0u128; SLOT_COUNT];
         let prepare_inhabited = vec![false; SLOT_COUNT];
 
-        Self {
+        let mut journal = Self {
             storage,
             replica,
             headers,
@@ -350,7 +347,33 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             prepare_checksums,
             prepare_inhabited,
             status: Status::Init,
+        };
+
+        unsafe {
+            ptr::write_bytes(
+                journal.headers.as_mut_ptr() as *mut u8,
+                0,
+                SLOT_COUNT * size_of::<HeaderPrepare>(),
+            );
+            ptr::write_bytes(
+                journal.headers_redundant.as_mut_ptr() as *mut u8,
+                0,
+                SLOT_COUNT * size_of::<HeaderPrepare>(),
+            );
         }
+
+        assert!(journal.headers.iter().all(|h| !h.valid_checksum()));
+        assert!(
+            journal
+                .headers_redundant
+                .iter()
+                .all(|h| !h.valid_checksum())
+        );
+
+        journal.prepare_checksums.fill(0);
+        journal.prepare_inhabited.fill(false);
+
+        journal
     }
 
     /// Initiates a sector write operation with range locking.
