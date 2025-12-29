@@ -473,9 +473,10 @@ impl<S: storage::Storage> SuperBlock<S> {
     }
 
     pub fn new_with_limit(storage: S, storage_size_limit: u64) -> Self {
-        let working = unsafe { AlignedBox::new_zeroed() };
-        let staging = unsafe { AlignedBox::new_zeroed() };
-        let reading = unsafe { AlignedBox::new_zeroed() };
+        // SAFETY: SuperBlockHeader is Zeroable and SECTOR_SIZE (4096) >= align_of::<SuperBlockHeader>().
+        let working = unsafe { AlignedBox::new_zeroed_aligned(constants::SECTOR_SIZE) };
+        let staging = unsafe { AlignedBox::new_zeroed_aligned(constants::SECTOR_SIZE) };
+        let reading = unsafe { AlignedBox::new_zeroed_aligned(constants::SECTOR_SIZE) };
 
         let sb = Self {
             storage,
