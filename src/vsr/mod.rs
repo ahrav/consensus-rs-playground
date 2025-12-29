@@ -1,3 +1,4 @@
+pub mod chunk_tracking;
 pub mod header_prepare;
 pub mod iops;
 pub mod journal;
