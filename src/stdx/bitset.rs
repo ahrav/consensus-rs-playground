@@ -239,12 +239,11 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     ///
     /// An empty bitset is a subset of any bitset; any bitset is a subset of a full bitset.
     #[inline]
-        for i in 0..WORDS {
+    pub const fn is_subset(&self, other: &Self) -> bool {
+        let mut i = 0;
+        while i < WORDS {
             if self.words[i] & !other.words[i] != 0 {
                 return false;
-            }
-        }
-        true
             }
             i += 1;
         }
