@@ -249,6 +249,10 @@ impl HeaderChunkTracking {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::AlignedBuf;
+
+    /// Alignment required for `HeaderPrepare` (16 bytes).
+    const HEADER_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
 
     // ==========================================================================
     // HeaderChunk Unit Tests
@@ -579,43 +583,18 @@ mod tests {
 
     #[test]
     fn bytes_as_headers_single_header() {
-        // Use aligned allocation
-        let layout =
-            std::alloc::Layout::from_size_align(WAL_HEADER_SIZE, core::mem::align_of::<HeaderPrepare>())
-                .unwrap();
-        let buffer = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout);
-            std::slice::from_raw_parts(ptr, WAL_HEADER_SIZE)
-        };
-
-        let headers = HeaderChunkTracking::bytes_as_headers(buffer);
+        let buffer = AlignedBuf::new_zeroed(WAL_HEADER_SIZE, HEADER_ALIGN);
+        let headers = HeaderChunkTracking::bytes_as_headers(buffer.as_slice());
         assert_eq!(headers.len(), 1);
-
-        // Clean up
-        unsafe {
-            std::alloc::dealloc(buffer.as_ptr() as *mut u8, layout);
-        }
     }
 
     #[test]
     fn bytes_as_headers_multiple_headers() {
         let count = 4;
         let size = WAL_HEADER_SIZE * count;
-        let layout =
-            std::alloc::Layout::from_size_align(size, core::mem::align_of::<HeaderPrepare>())
-                .unwrap();
-        let buffer = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout);
-            std::slice::from_raw_parts(ptr, size)
-        };
-
-        let headers = HeaderChunkTracking::bytes_as_headers(buffer);
+        let buffer = AlignedBuf::new_zeroed(size, HEADER_ALIGN);
+        let headers = HeaderChunkTracking::bytes_as_headers(buffer.as_slice());
         assert_eq!(headers.len(), count);
-
-        // Clean up
-        unsafe {
-            std::alloc::dealloc(buffer.as_ptr() as *mut u8, layout);
-        }
     }
 
     #[test]
@@ -634,28 +613,9 @@ mod tests {
     #[test]
     #[should_panic]
     fn bytes_as_headers_panics_on_non_multiple_length() {
-        // Create aligned buffer with non-multiple size
         let size = WAL_HEADER_SIZE + 1;
-        let layout =
-            std::alloc::Layout::from_size_align(size, core::mem::align_of::<HeaderPrepare>())
-                .unwrap();
-        let buffer = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout);
-            std::slice::from_raw_parts(ptr, size)
-        };
-
-        // This will panic due to non-multiple length
-        let _ = std::panic::catch_unwind(|| {
-            HeaderChunkTracking::bytes_as_headers(buffer);
-        });
-
-        // Clean up even on panic path
-        unsafe {
-            std::alloc::dealloc(buffer.as_ptr() as *mut u8, layout);
-        }
-
-        // Re-panic to satisfy should_panic
-        panic!("Expected panic for non-multiple length");
+        let buffer = AlignedBuf::new_zeroed(size, HEADER_ALIGN);
+        HeaderChunkTracking::bytes_as_headers(buffer.as_slice());
     }
 
     #[test]
