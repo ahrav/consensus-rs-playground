@@ -40,13 +40,29 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
+#[allow(dead_code)]
 use core::mem::MaybeUninit;
 use core::ptr;
 
+#[allow(unused_imports)]
+use crate::constants;
 use crate::container_of;
-use crate::vsr::iops::IOPSType;
-use crate::vsr::journal_primitives::Ring;
-use crate::vsr::storage::{Storage, Synchronicity};
+use crate::stdx::BitSet;
+use crate::util::utils::AlignedSlice;
+use crate::vsr::{
+    Header,
+    HeaderPrepare,
+    chunk_tracking::HeaderChunkTracking,
+    iops::IOPSType,
+    journal_primitives::{
+        Ring,
+        SLOT_COUNT,
+        // HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_MESSAGE,
+        // WAL_HEADER_SIZE,
+    },
+    storage::{Storage, Synchronicity},
+    // wire::{Command, Operation},
+};
 
 /// A write range descriptor with intrusive linked-list support for wait queuing.
 ///
@@ -216,6 +232,10 @@ pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usiz
     pub range: Range<S, WRITE_OPS, WRITE_OPS_WORDS>,
 }
 
+const _: () = {
+    assert!(size_of::<HeaderPrepare>() == size_of::<Header>());
+};
+
 /// WAL journal skeleton implementing range-locked sector writes.
 ///
 /// The `Journal` coordinates write operations to the Write-Ahead Log, ensuring
@@ -240,8 +260,24 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Replica identifier for logging and debugging.
     pub replica: u8,
 
+    /// During recovery: unvalidated prepare headers (per-slot).
+    pub headers: AlignedSlice<HeaderPrepare>,
+    /// During recovery: unvalidated redundant headers (per-slot).
+    pub headers_redundant: AlignedSlice<HeaderPrepare>,
+
+    /// Aligned write staging buffers for redundant header sectors:
+    pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
+
+    pub header_chunk_tracking: HeaderChunkTracking,
+
     /// Pool of write operation descriptors.
     pub writes: IOPSType<Write<S, WRITE_OPS, WRITE_OPS_WORDS>, WRITE_OPS, WRITE_OPS_WORDS>,
+
+    pub dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
+    pub faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
+
+    pub prepare_checksums: Vec<u128>,
+    pub prepare_inhabited: Vec<bool>,
 }
 
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
@@ -254,10 +290,40 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - `storage` must point to a valid `S` that outlives the Journal
     /// - The storage pointer must not be aliased elsewhere during Journal operations
     pub fn new(storage: *mut S, replica: u8) -> Self {
+        let headers = unsafe {
+            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+        };
+        let headers_redundant = unsafe {
+            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+        };
+        let write_headers_sectors = unsafe {
+            AlignedSlice::<[u8; constants::SECTOR_SIZE]>::new_zeroed_aligned(
+                constants::JOURNAL_IOPS_WRITE_MAX as usize,
+                constants::SECTOR_SIZE,
+            )
+        };
+
+        assert!(&headers.iter().all(|h| !h.valid_checksum()));
+        assert!(&headers_redundant.iter().all(|h| !h.valid_checksum()));
+
+        let dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
+        let faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
+
+        let prepare_checksums = vec![0u128; SLOT_COUNT];
+        let prepare_inhabited = vec![false; SLOT_COUNT];
+
         Self {
             storage,
             replica,
+            headers,
+            headers_redundant,
+            write_headers_sectors,
+            header_chunk_tracking: HeaderChunkTracking::default(),
             writes: IOPSType::default(),
+            dirty,
+            faulty,
+            prepare_checksums,
+            prepare_inhabited,
         }
     }
 

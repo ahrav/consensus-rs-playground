@@ -8,7 +8,7 @@ use core::{mem, slice};
 
 use crate::{
     constants::{JOURNAL_SLOT_COUNT, VSR_VERSION},
-    util::Pod,
+    util::{Pod, Zeroable},
     vsr::wire::{Checksum128, Command, Operation, checksum, constants, header::Release},
 };
 
@@ -114,6 +114,10 @@ pub struct HeaderPrepare {
 // which are Pod. The struct has no padding bytes due to careful field ordering
 // and explicit padding fields (checksum_padding, etc.).
 unsafe impl Pod for HeaderPrepare {}
+
+// SAFETY: HeaderPrepare is #[repr(C)] with only primitive types and arrays thereof.
+// All-zeros is a valid bit pattern for every field, as validated by `HeaderPrepare::zeroed()`.
+unsafe impl Zeroable for HeaderPrepare {}
 
 impl HeaderPrepare {
     pub const SIZE: usize = 256;
