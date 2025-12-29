@@ -1253,13 +1253,112 @@ mod tests {
         assert_eq!(retrieved, &[10, 20, 30, 40]);
     }
 
-    #[test]
-    fn journal_new_initializes_correctly() {
-        let mut storage = MockStorage::new();
-        let journal = TestJournal::new(&mut storage, 5);
+    // =========================================================================
+    // Journal::new Initialization Tests
+    // =========================================================================
 
+    #[test]
+    fn journal_new_initializes_all_fields_correctly() {
+        let mut storage = MockStorage::new();
+        let journal = TestJournal::new(&mut storage, 7);
+
+        // Basic pointer and replica fields
         assert_eq!(journal.storage, &mut storage as *mut _);
-        assert_eq!(journal.replica, 5);
+        assert_eq!(journal.replica, 7);
+
+        // Status should be Init
+        assert!(matches!(journal.status, Status::Init));
+
+        // BitSets should be full (all slots marked dirty/faulty initially)
+        assert!(journal.dirty.is_full(), "dirty BitSet should be full initially");
+        assert!(journal.faulty.is_full(), "faulty BitSet should be full initially");
+
+        // Vector lengths and contents - prepare_checksums
+        assert_eq!(
+            journal.prepare_checksums.len(),
+            SLOT_COUNT,
+            "prepare_checksums should have SLOT_COUNT entries"
+        );
+        assert!(
+            journal.prepare_checksums.iter().all(|&c| c == 0),
+            "all prepare_checksums should be zero"
+        );
+
+        // Vector lengths and contents - prepare_inhabited
+        assert_eq!(
+            journal.prepare_inhabited.len(),
+            SLOT_COUNT,
+            "prepare_inhabited should have SLOT_COUNT entries"
+        );
+        assert!(
+            journal.prepare_inhabited.iter().all(|&i| !i),
+            "all prepare_inhabited should be false"
+        );
+
+        // AlignedSlice lengths
+        assert_eq!(
+            journal.headers.len(),
+            SLOT_COUNT,
+            "headers should have SLOT_COUNT entries"
+        );
+        assert_eq!(
+            journal.headers_redundant.len(),
+            SLOT_COUNT,
+            "headers_redundant should have SLOT_COUNT entries"
+        );
+        assert_eq!(
+            journal.write_headers_sectors.len(),
+            constants::JOURNAL_IOPS_WRITE_MAX as usize,
+            "write_headers_sectors should have JOURNAL_IOPS_WRITE_MAX entries"
+        );
+
+        // IOPSType write pool should be empty (all 32 slots available)
+        assert_eq!(
+            journal.writes.available(),
+            32,
+            "writes pool should have all slots available"
+        );
+
+        // HeaderChunkTracking should be in default (not done) state
+        assert!(
+            !journal.header_chunk_tracking.done(),
+            "header_chunk_tracking should not be done initially"
+        );
+    }
+
+    #[test]
+    fn journal_new_headers_have_invalid_checksums() {
+        let mut storage = MockStorage::new();
+        let journal = TestJournal::new(&mut storage, 0);
+
+        // Critical safety invariant: headers must have invalid checksums initially.
+        // This prevents interpreting uninitialized/zeroed data as valid prepares,
+        // which could lead to data corruption during recovery.
+        assert!(
+            journal.headers.iter().all(|h| !h.valid_checksum()),
+            "all headers should have invalid checksums after initialization"
+        );
+        assert!(
+            journal.headers_redundant.iter().all(|h| !h.valid_checksum()),
+            "all redundant headers should have invalid checksums after initialization"
+        );
+    }
+
+    #[test]
+    fn journal_new_works_with_edge_case_replica_values() {
+        // Test minimum replica value (0)
+        let mut storage_min = MockStorage::new();
+        let journal_min = TestJournal::new(&mut storage_min, 0);
+        assert_eq!(journal_min.replica, 0);
+        assert!(matches!(journal_min.status, Status::Init));
+        assert!(journal_min.dirty.is_full());
+
+        // Test maximum replica value (255)
+        let mut storage_max = MockStorage::new();
+        let journal_max = TestJournal::new(&mut storage_max, 255);
+        assert_eq!(journal_max.replica, 255);
+        assert!(matches!(journal_max.status, Status::Init));
+        assert!(journal_max.faulty.is_full());
     }
 
     #[test]
