@@ -291,8 +291,7 @@ impl<T> AlignedBox<T> {
         assert!(size_of::<T>() <= isize::MAX as usize);
         assert!(align <= isize::MAX as usize);
 
-        let layout =
-            Layout::from_size_align(size_of::<T>(), align).expect("invalid layout");
+        let layout = Layout::from_size_align(size_of::<T>(), align).expect("invalid layout");
         assert!(layout.size() > 0);
         assert!(layout.align().is_power_of_two());
 
