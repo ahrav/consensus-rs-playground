@@ -213,19 +213,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 /// # Layout
 ///
 /// `#[repr(C)]` is required for `container_of!` to recover `Write` from `Range`.
-///
-/// # Current Limitations
-///
-/// This is a minimal implementation for the range-locking machinery. The full
-/// Journal port will add: message pointer, high-level callback, and additional
-/// metadata.
 #[repr(C)]
 pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
     /// Back-pointer to the owning Journal. Set by `write_sectors`.
     pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
 
     /// Slot index within the log. Used to assert no concurrent writes to same slot.
-    // TODO: This will be replaced with full slot tracking in the complete Journal.
     pub slot_index: u32,
 
     /// The range descriptor containing buffer, offset, and locking state.
@@ -236,17 +229,22 @@ const _: () = {
     assert!(size_of::<HeaderPrepare>() == size_of::<Header>());
 };
 
-/// WAL journal skeleton implementing range-locked sector writes.
+/// Journal lifecycle state.
+#[derive(Clone, Copy)]
+pub enum Status<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+    /// Initial state before recovery begins.
+    Init,
+    /// Recovery in progress; callback invoked when complete.
+    Recovering(fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>)),
+    /// Recovery complete; journal is ready for normal operation.
+    Recovered,
+}
+
+/// WAL journal implementing range-locked sector writes.
 ///
 /// The `Journal` coordinates write operations to the Write-Ahead Log, ensuring
 /// that overlapping writes are serialized. It maintains a pool of `Write` objects
 /// and implements the range-locking protocol.
-///
-/// # Current Limitations
-///
-/// This is a partial implementation containing only the range-locking machinery.
-/// The full Journal will include: headers/prepares index arrays, dirty/faulty
-/// bitsets, view change state, and recovery logic.
 ///
 /// # Concurrency
 ///
@@ -260,24 +258,51 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Replica identifier for logging and debugging.
     pub replica: u8,
 
-    /// During recovery: unvalidated prepare headers (per-slot).
+    /// Prepare headers indexed by slot, where `slot == header.op % SLOT_COUNT`.
+    ///
+    /// Each slot's header command is either `prepare` or `reserved`. When a slot
+    /// contains a `reserved` header, the header's `op` equals the slot index.
     pub headers: AlignedSlice<HeaderPrepare>,
-    /// During recovery: unvalidated redundant headers (per-slot).
+
+    /// Redundant copy of prepare headers, updated after the corresponding prepare
+    /// is written to disk.
+    ///
+    /// This handles the case where a prepare is written before its header sector
+    /// is flushed, allowing recovery to detect and repair inconsistencies.
     pub headers_redundant: AlignedSlice<HeaderPrepare>,
 
-    /// Aligned write staging buffers for redundant header sectors:
+    /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
 
+    /// Tracks which header chunks have been read/written during recovery.
     pub header_chunk_tracking: HeaderChunkTracking,
 
-    /// Pool of write operation descriptors.
+    /// Pool of write operation descriptors for the range-locking machinery.
     pub writes: IOPSType<Write<S, WRITE_OPS, WRITE_OPS_WORDS>, WRITE_OPS, WRITE_OPS_WORDS>,
 
+    /// Slots that need to be written to disk or repaired from other replicas.
+    ///
+    /// Similar to a dirty bit in a kernel page cache: indicates the in-memory
+    /// state differs from durable storage.
     pub dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
+
+    /// Slots that are dirty due to corruption, misdirected writes, or sector errors.
+    ///
+    /// A faulty bit always implies the corresponding dirty bit is set. Faulty
+    /// indicates the entry requires repair from another replica, not just a flush.
     pub faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
 
+    /// Checksums of prepare messages, used to respond to `request_prepare` messages.
+    ///
+    /// A checksum may be unavailable when the slot is reserved, being written, or corrupt.
+    /// Check `prepare_inhabited` to determine validity.
     pub prepare_checksums: Vec<u128>,
+
+    /// Indicates whether each `prepare_checksums` entry contains a valid checksum.
     pub prepare_inhabited: Vec<bool>,
+
+    /// Current journal state (initializing, recovering, or recovered).
+    pub status: Status<S, WRITE_OPS, WRITE_OPS_WORDS>,
 }
 
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
@@ -324,6 +349,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             faulty,
             prepare_checksums,
             prepare_inhabited,
+            status: Status::Init,
         }
     }
 
