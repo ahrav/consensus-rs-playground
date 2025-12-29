@@ -263,11 +263,52 @@ impl<T> AlignedBox<T> {
         Self { ptr, layout }
     }
 
+    /// Allocates a zero-initialized `T` with at least `align` byte alignment.
+    ///
+    /// Use this when the allocation requires alignment beyond the type's natural
+    /// alignment (e.g., sector-aligned buffers for direct I/O).
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee the all-zero byte pattern is a valid `T`.
+    ///
+    /// # Panics
+    ///
+    /// - `T` is a ZST
+    /// - `align == 0` or not a power of two
+    /// - `align < align_of::<T>()` (alignment below type requirement)
+    /// - `size_of::<T>() > isize::MAX` (Rust allocation limit)
+    /// - Allocation failure
+    pub unsafe fn new_zeroed_aligned(align: usize) -> Self
+    where
+        T: Zeroable,
+    {
+        const { assert!(size_of::<T>() > 0) };
+
+        assert!(align > 0);
+        assert!(align.is_power_of_two());
+        assert!(align >= align_of::<T>(), "alignment below type requirement");
+        assert!(size_of::<T>() <= isize::MAX as usize);
+        assert!(align <= isize::MAX as usize);
+
+        let layout =
+            Layout::from_size_align(size_of::<T>(), align).expect("invalid layout");
+        assert!(layout.size() > 0);
+        assert!(layout.align().is_power_of_two());
+
+        let raw = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(raw.cast()).expect("allocation failed");
+
+        assert!((ptr.as_ptr() as usize).is_multiple_of(align));
+
+        Self { ptr, layout }
+    }
+
     /// Returns a raw pointer to the allocated value.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         let ptr = self.ptr.as_ptr();
-        assert!((ptr as usize).is_multiple_of(align_of::<T>()));
+        assert!((ptr as usize).is_multiple_of(self.layout.align()));
         ptr
     }
 
@@ -275,7 +316,7 @@ impl<T> AlignedBox<T> {
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         let ptr = self.ptr.as_ptr();
-        assert!((ptr as usize).is_multiple_of(align_of::<T>()));
+        assert!((ptr as usize).is_multiple_of(self.layout.align()));
         ptr
     }
 
@@ -291,7 +332,7 @@ impl<T> core::ops::Deref for AlignedBox<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        assert!((self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()));
+        assert!((self.ptr.as_ptr() as usize).is_multiple_of(self.layout.align()));
         unsafe { &*self.ptr.as_ptr() }
     }
 }
@@ -299,7 +340,7 @@ impl<T> core::ops::Deref for AlignedBox<T> {
 impl<T> core::ops::DerefMut for AlignedBox<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        assert!((self.ptr.as_ptr() as usize).is_multiple_of(align_of::<T>()));
+        assert!((self.ptr.as_ptr() as usize).is_multiple_of(self.layout.align()));
         unsafe { &mut *self.ptr.as_ptr() }
     }
 }
@@ -307,9 +348,9 @@ impl<T> core::ops::DerefMut for AlignedBox<T> {
 impl<T> core::ops::Drop for AlignedBox<T> {
     fn drop(&mut self) {
         let ptr = self.ptr.as_ptr();
-        assert!((ptr as usize).is_multiple_of(align_of::<T>()));
+        assert!((ptr as usize).is_multiple_of(self.layout.align()));
         assert!(self.layout().size() == size_of::<T>());
-        assert!(self.layout().align() == align_of::<T>());
+        assert!(self.layout().align() >= align_of::<T>());
 
         unsafe {
             core::ptr::drop_in_place(ptr);
@@ -398,6 +439,66 @@ mod tests {
 
         assert_eq!(boxed.a, 1);
         assert_eq!(boxed.b, 2);
+    }
+
+    #[test]
+    fn test_aligned_box_custom_alignment() {
+        // Align u64 (natural align 8) to 4096 bytes
+        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(4096) };
+        assert_eq!(*boxed, 0u64);
+        assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
+        assert_eq!(boxed.layout().align(), 4096);
+    }
+
+    #[test]
+    fn test_aligned_box_custom_alignment_equals_natural() {
+        // Align to exactly the type's natural alignment
+        let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(align_of::<u64>()) };
+        assert_eq!(*boxed, 0u64);
+        assert!((boxed.as_ptr() as usize).is_multiple_of(align_of::<u64>()));
+    }
+
+    #[test]
+    #[should_panic(expected = "alignment below type requirement")]
+    fn test_aligned_box_panic_alignment_below_type() {
+        // u64 has natural alignment of 8, so align=4 should panic
+        let _: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(4) };
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_aligned_box_panic_zero_alignment() {
+        let _: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(0) };
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion failed")]
+    fn test_aligned_box_panic_non_power_of_two_alignment() {
+        let _: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(100) };
+    }
+
+    #[test]
+    fn test_aligned_box_custom_alignment_struct() {
+        #[repr(C)]
+        struct SmallStruct {
+            a: u8,
+            b: u8,
+        }
+        unsafe impl Zeroable for SmallStruct {}
+
+        // Align 2-byte struct to 4096
+        let boxed: AlignedBox<SmallStruct> = unsafe { AlignedBox::new_zeroed_aligned(4096) };
+        assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
+        assert_eq!(boxed.a, 0);
+        assert_eq!(boxed.b, 0);
+    }
+
+    #[test]
+    fn test_aligned_box_custom_alignment_mut() {
+        let mut boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(4096) };
+        *boxed = 42;
+        assert_eq!(*boxed, 42);
+        assert!((boxed.as_ptr() as usize).is_multiple_of(4096));
     }
 
     #[test]
@@ -710,6 +811,28 @@ mod proptests {
             let _ = value;
             let boxed: AlignedBox<[u64; 4]> = unsafe { AlignedBox::new_zeroed() };
             prop_assert_eq!(*boxed, [0u64; 4]);
+        }
+
+        #[test]
+        fn prop_aligned_box_custom_alignment_valid(power in 3u32..16u32) {
+            let align = 1usize << power;
+            // Use u64 which has natural alignment of 8
+            if align >= align_of::<u64>() {
+                let boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(align) };
+                prop_assert!((boxed.as_ptr() as usize).is_multiple_of(align));
+                prop_assert_eq!(boxed.layout().align(), align);
+                prop_assert_eq!(*boxed, 0);
+            }
+        }
+
+        #[test]
+        fn prop_aligned_box_custom_alignment_preserves_value(value: u64, power in 3u32..16u32) {
+            let align = 1usize << power;
+            if align >= align_of::<u64>() {
+                let mut boxed: AlignedBox<u64> = unsafe { AlignedBox::new_zeroed_aligned(align) };
+                *boxed = value;
+                prop_assert_eq!(*boxed, value);
+            }
         }
     }
 }
