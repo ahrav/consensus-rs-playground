@@ -439,11 +439,11 @@ impl<T> AlignedSlice<T> {
         let size = len
             .checked_mul(size_of::<T>())
             .expect("aligned_slice size overflow");
-        
+
         assert!(size <= isize::MAX as usize);
 
         let layout = Layout::from_size_align(size, align).expect("invalid layout");
-        
+
         // Use alloc_zeroed for safety with Zeroable types
         let raw = unsafe { alloc_zeroed(layout) } as *mut T;
         if raw.is_null() {
@@ -524,7 +524,7 @@ impl<T> AlignedSlice<T> {
         }
 
         let ptr = self.ptr.as_ptr();
-        
+
         // 1. Drop elements
         let slice_ptr = core::ptr::slice_from_raw_parts_mut(ptr, self.len);
         unsafe { core::ptr::drop_in_place(slice_ptr) };
@@ -877,12 +877,24 @@ mod tests {
     }
 
     #[test]
+    fn test_aligned_slice_custom_align_zeroed_mut() {
+        let mut slice: AlignedSlice<u32> = unsafe { AlignedSlice::new_zeroed_aligned(4, 64) };
+        assert!((slice.as_ptr() as usize).is_multiple_of(64));
+        assert_eq!(slice.as_slice(), &[0, 0, 0, 0]);
+
+        slice.as_mut_slice().copy_from_slice(&[10, 20, 30, 40]);
+        assert_eq!(slice.as_slice(), &[10, 20, 30, 40]);
+    }
+
+    #[test]
     fn test_aligned_slice_drop() {
         use std::sync::atomic::{AtomicU32, Ordering};
         static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
         DROP_COUNT.store(0, Ordering::SeqCst); // Reset
 
-        struct Dropper { _padding: u8 }
+        struct Dropper {
+            _padding: u8,
+        }
         impl Drop for Dropper {
             fn drop(&mut self) {
                 DROP_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -901,6 +913,76 @@ mod tests {
     #[should_panic]
     fn test_aligned_slice_panic_zero_len() {
         let _ = unsafe { AlignedSlice::<u64>::new_zeroed(0) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_zero_len_aligned() {
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(0, align_of::<u64>()) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_zero_alignment() {
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(1, 0) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_non_power_of_two_alignment() {
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(1, 3) };
+    }
+
+    #[test]
+    #[should_panic(expected = "alignment below type requirement")]
+    fn test_aligned_slice_panic_alignment_below_type() {
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(1, 4) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_align_too_large() {
+        let align = 1usize << (usize::BITS - 1);
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(1, align) };
+    }
+
+    #[test]
+    #[should_panic(expected = "aligned_slice size overflow")]
+    fn test_aligned_slice_panic_size_overflow() {
+        let len = (usize::MAX / size_of::<u64>()) + 1;
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(len, align_of::<u64>()) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_aligned_slice_panic_size_over_isize_max() {
+        let len = (isize::MAX as usize / size_of::<u64>()) + 1;
+        let _ = unsafe { AlignedSlice::<u64>::new_zeroed_aligned(len, align_of::<u64>()) };
+    }
+
+    #[test]
+    fn test_aligned_slice_dealloc_in_place_idempotent() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DROP_COUNT: AtomicU32 = AtomicU32::new(0);
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        struct Dropper {
+            _padding: u8,
+        }
+        impl Drop for Dropper {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        unsafe impl Zeroable for Dropper {}
+
+        let mut slice: AlignedSlice<Dropper> = unsafe { AlignedSlice::new_zeroed(3) };
+        slice.dealloc_in_place();
+        slice.dealloc_in_place();
+
+        assert!(slice.is_empty());
+        assert_eq!(slice.as_slice().len(), 0);
+        assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
     }
 }
 
