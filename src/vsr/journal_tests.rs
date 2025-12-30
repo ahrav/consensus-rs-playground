@@ -1057,6 +1057,165 @@ mod overlap_properties {
 }
 
 // =========================================================================
+// Header Helper Method Properties (Property Tests)
+// =========================================================================
+
+mod header_helper_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for op values that span multiple wraparounds.
+    fn op_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            0u64..SLOT_COUNT as u64,                          // First epoch
+            SLOT_COUNT as u64..(SLOT_COUNT * 2) as u64,       // Second epoch (wraparound)
+            (SLOT_COUNT * 5) as u64..(SLOT_COUNT * 6) as u64, // Later epoch
+        ]
+    }
+
+    /// Strategy for slot indices.
+    fn slot_strategy() -> impl Strategy<Value = usize> {
+        0..SLOT_COUNT
+    }
+
+    proptest! {
+        /// Property: header_with_op returns Some iff stored header.op == query op.
+        /// Only tests within the same slot to avoid accessing uninitialized headers.
+        #[test]
+        fn prop_header_with_op_returns_iff_op_matches(
+            slot in slot_strategy(),
+            epoch in 0u64..10
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            // Store a header at a specific op for this slot
+            let stored_op = slot as u64 + epoch * SLOT_COUNT as u64;
+            journal.headers[slot] = make_header(stored_op, Operation::REGISTER);
+
+            // Query with the exact op - should return the header
+            let result = journal.header_with_op(stored_op);
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, stored_op);
+
+            // Query with a different epoch for the same slot - should return None
+            let different_epoch = if epoch == 0 { 1 } else { epoch - 1 };
+            let different_op = slot as u64 + different_epoch * SLOT_COUNT as u64;
+            let result_different = journal.header_with_op(different_op);
+            prop_assert!(result_different.is_none());
+        }
+
+        /// Property: reserved slots always return None regardless of query op.
+        #[test]
+        fn prop_reserved_slots_always_return_none(
+            slot in slot_strategy(),
+            epoch in 0u64..10
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            // Initialize the slot as reserved (default behavior but explicit here)
+            journal.headers[slot] = make_reserved_header(slot);
+
+            // Query for any op that maps to this slot - should return None
+            let query_op = slot as u64 + epoch * SLOT_COUNT as u64;
+            let result = journal.header_with_op(query_op);
+            prop_assert!(result.is_none());
+        }
+
+        /// Property: header_with_op_and_checksum requires BOTH op AND checksum match.
+        #[test]
+        fn prop_checksum_match_required(
+            op in op_strategy(),
+            use_correct_checksum in proptest::bool::ANY
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            let header = make_header(op, Operation::REGISTER);
+            let correct_checksum = header.checksum;
+            let slot = (op % SLOT_COUNT as u64) as usize;
+            journal.headers[slot] = header;
+
+            let query_checksum = if use_correct_checksum {
+                correct_checksum
+            } else {
+                correct_checksum.wrapping_add(1)
+            };
+
+            let result = journal.header_with_op_and_checksum(op, query_checksum);
+
+            if use_correct_checksum {
+                prop_assert!(result.is_some());
+            } else {
+                prop_assert!(result.is_none());
+            }
+        }
+
+        /// Property: previous_entry returns op-1 when it exists.
+        #[test]
+        fn prop_previous_entry_navigation(
+            base_op in 1u64..50 // Keep small for simplicity
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            // Setup: headers at base_op-1 and base_op
+            journal.headers[(base_op - 1) as usize] = make_header(base_op - 1, Operation::REGISTER);
+            journal.headers[base_op as usize] = make_header(base_op, Operation::REGISTER);
+
+            let current = &journal.headers[base_op as usize];
+            let result = journal.previous_entry(current);
+
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, base_op - 1);
+        }
+
+        /// Property: next_entry returns op+1 when it exists.
+        #[test]
+        fn prop_next_entry_navigation(
+            base_op in 0u64..49
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            journal.headers[base_op as usize] = make_header(base_op, Operation::REGISTER);
+            journal.headers[(base_op + 1) as usize] = make_header(base_op + 1, Operation::REGISTER);
+
+            let current = &journal.headers[base_op as usize];
+            let result = journal.next_entry(current);
+
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, base_op + 1);
+        }
+
+        /// Property: op_maximum returns actual maximum of non-reserved ops.
+        #[test]
+        fn prop_op_maximum_is_actual_max(
+            num_headers in 1usize..20,
+            base_op in 0u64..100
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+            journal.status = Status::Recovered;
+
+            // Insert headers at consecutive slots starting from base_op
+            let mut expected_max = 0u64;
+            for i in 0..num_headers {
+                let op = base_op + i as u64;
+                if (op as usize) < SLOT_COUNT {
+                    journal.headers[op as usize] = make_header(op, Operation::REGISTER);
+                    expected_max = expected_max.max(op);
+                }
+            }
+
+            let actual_max = journal.op_maximum();
+            prop_assert_eq!(actual_max, expected_max);
+        }
+    }
+}
+
+// =========================================================================
 // Locking Protocol (Unit Tests)
 // =========================================================================
 
@@ -1075,8 +1234,8 @@ fn panics_on_overlapping_different_offset() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
         // write1 is now locked (callback deferred).
@@ -1100,8 +1259,8 @@ fn panics_on_overlapping_different_length() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
         // write1 is now locked (callback deferred).
@@ -1124,8 +1283,8 @@ fn panics_on_overlapping_prepares() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Prepares, 0);
         // write1 is now locked (callback deferred).
@@ -1136,20 +1295,21 @@ fn panics_on_overlapping_prepares() {
 
 #[test]
 #[should_panic(expected = "assertion failed")]
-fn panics_on_duplicate_slot_index() {
+fn panics_on_duplicate_slot() {
     let mut storage = MockStorage::new();
     let mut journal = TestJournal::new(&mut storage, 0);
 
     let write1 = journal.writes.acquire().unwrap();
     let write2 = journal.writes.acquire().unwrap();
 
-    // Non-overlapping ranges but same slot index.
+    // Non-overlapping ranges but ops map to the same slot.
+    // op 42 and op 42 + SLOT_COUNT both map to slot 42.
     let buf1 = vec![1u8; 4096];
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 42;
-        (*write2).slot_index = 42; // Same slot - should panic.
+        (*write1).op = 42;
+        (*write2).op = 42 + SLOT_COUNT as u64; // Same slot - should panic.
 
         journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
         journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
@@ -1173,8 +1333,8 @@ fn completion_clears_wait_list() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
         journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 0);
@@ -1205,8 +1365,8 @@ fn async_overlap_queuing_defers_until_completion() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         // Submit first write - becomes locked.
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
@@ -1277,8 +1437,8 @@ mod integration_properties {
 
             for i in 0..write_count {
                 let write = journal.writes.acquire().unwrap();
-                // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                unsafe { (*write).slot_index = i as u32; }
+                // Set op immediately to avoid conflicts during lock_sectors iteration.
+                unsafe { (*write).op = i as u64; }
                 let buf = vec![i as u8; 4096];
                 buffers.push(buf);
                 writes.push(write);
@@ -1314,8 +1474,8 @@ mod integration_properties {
             // All same offset/length.
             for i in 0..overlap_count {
                 let write = journal.writes.acquire().unwrap();
-                // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                unsafe { (*write).slot_index = i as u32; }
+                // Set op immediately to avoid conflicts during lock_sectors iteration.
+                unsafe { (*write).op = i as u64; }
                 let buf = vec![i as u8; 4096];
                 buffers.push(buf);
                 writes.push(write);
@@ -1357,7 +1517,7 @@ fn container_of_recovers_correct_write() {
     }
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         journal.write_sectors(write, verifying_callback, &buf, Ring::Headers, 0);
     }
 
@@ -1405,11 +1565,11 @@ fn batch_acquire_then_submit_is_safe() {
     let write2 = journal.writes.acquire().unwrap();
     let write3 = journal.writes.acquire().unwrap();
 
-    // Set slot indices (required by caller contract).
+    // Set op values (required by caller contract).
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
-        (*write3).slot_index = 3;
+        (*write1).op = 1;
+        (*write2).op = 2;
+        (*write3).op = 3;
     }
 
     // Submit only the first write. lock_sectors will iterate write2 and write3,
@@ -1596,7 +1756,7 @@ fn async_writes_complete_correctly() {
     let buf = vec![1u8; 4096];
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         journal.write_sectors(write, dummy_callback_async, &buf, Ring::Headers, 0);
 
         // Should be locked (Async).
@@ -1630,7 +1790,7 @@ fn synchronous_callback_can_release_write() {
     }
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         // This should not panic or trigger UB (accessing released write).
         journal.write_sectors(write, releasing_callback, &buf, Ring::Headers, 0);
     }
@@ -1650,4 +1810,63 @@ fn synchronous_callback_can_release_write() {
             panic!("Should be able to re-acquire all writes");
         }
     }
+}
+
+// =========================================================================
+// Header Helper Method Tests
+// =========================================================================
+
+/// Creates a valid HeaderPrepare with the given op and operation.
+fn make_header(op: u64, operation: Operation) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = operation;
+    header.op = op;
+    header.size = HeaderPrepare::SIZE as u32;
+    header.set_checksum();
+    header
+}
+
+/// Creates a reserved header for the given slot index.
+/// Reserved headers have operation = RESERVED and op = slot_index.
+fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = Operation::RESERVED;
+    header.op = slot_index as u64;
+    header.size = HeaderPrepare::SIZE as u32;
+    header.set_checksum();
+    header
+}
+
+// -------------------------------------------------------------------------
+// previous_entry / next_entry Boundary Tests
+// -------------------------------------------------------------------------
+
+#[test]
+fn previous_entry_returns_none_for_op_zero() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert header at op 0.
+    let header = make_header(0, Operation::ROOT);
+    journal.headers[0] = header;
+
+    // previous_entry for op 0 should return None.
+    let result = journal.previous_entry(&journal.headers[0]);
+    assert!(result.is_none());
+}
+
+// -------------------------------------------------------------------------
+// op_maximum Panic Tests
+// -------------------------------------------------------------------------
+
+#[test]
+#[should_panic]
+fn op_maximum_panics_when_not_recovered() {
+    let mut storage = MockStorage::new();
+    let journal = TestJournal::new(&mut storage, 0);
+
+    // Status is Init, should panic.
+    let _ = journal.op_maximum();
 }
