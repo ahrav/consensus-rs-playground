@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn checksum_body_with_various_sizes() {
-        use crate::vsr::wire::constants::MESSAGE_BODY_SIZE_MAX;
+        use crate::vsr::MESSAGE_BODY_SIZE_MAX;
 
         let body_sizes = [1, 100, 1024, 4096, MESSAGE_BODY_SIZE_MAX as usize];
 

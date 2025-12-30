@@ -262,7 +262,7 @@ impl<const N: usize> Default for MessagePool<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsr::wire::Command;
+    use crate::vsr::Command;
 
     #[test]
     fn pool_initialization() {

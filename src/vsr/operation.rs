@@ -1,796 +1,770 @@
-//! Wire-format operation codes for client requests.
+//! Wire-level operation codes for VSR protocol messages.
 //!
-//! Operations occupy the reserved range `128..=145`. Discriminants are part of the wire
-//! protocol and must never change. Use [`Operation::try_from`] to parse from bytes.
+//! Operations are split into two ranges:
+//! - **VSR-reserved** (0–127): Protocol-level operations handled by the replication layer.
+//! - **User-defined** (128–255): Application-specific operations via [`StateMachineOperation`].
+//!
+//! This separation allows VSR to manage consensus mechanics (view changes, recovery)
+//! independently of application logic.
 
-/// First byte value reserved for user-defined operations.
-pub const VSR_OPERATIONS_RESERVED: u8 = 128;
+use core::fmt;
 
-/// Total number of defined operations.
-pub const OPERATION_COUNT: u8 = 18;
+use crate::constants;
 
-/// Minimum valid operation discriminant.
-pub const OPERATION_MIN: u8 = VSR_OPERATIONS_RESERVED;
+/// Highest VSR-reserved operation with a defined meaning.
+/// Operations 7–127 are reserved for future protocol use.
+const VSR_RESERVED_MAX: u8 = 6;
 
-/// Maximum valid operation discriminant.
-pub const OPERATION_MAX: u8 = VSR_OPERATIONS_RESERVED + OPERATION_COUNT - 1;
-
+// Compile-time validation of operation discriminants.
+// These values are part of the wire protocol and must never change.
 const _: () = {
-    assert!(VSR_OPERATIONS_RESERVED == 128);
-    assert!(OPERATION_COUNT > 0);
-    assert!(OPERATION_COUNT <= 128);
+    assert!(Operation::RESERVED.0 == 0);
+    assert!(Operation::ROOT.0 == 1);
+    assert!(Operation::REGISTER.0 == 2);
+    assert!(Operation::RECONFIGURE.0 == 3);
+    assert!(Operation::PULSE.0 == 4);
+    assert!(Operation::UPGRADE.0 == 5);
+    assert!(Operation::NOOP.0 == 6);
 
-    assert!(VSR_OPERATIONS_RESERVED as u16 + OPERATION_COUNT as u16 <= u8::MAX as u16 + 1);
-
-    assert!(OPERATION_MIN == 128);
-    assert!(OPERATION_MAX == 145);
-    assert!(OPERATION_MAX - OPERATION_MIN + 1 == OPERATION_COUNT);
+    assert!(constants::VSR_OPERATIONS_RESERVED > VSR_RESERVED_MAX);
+    assert!(constants::VSR_OPERATIONS_RESERVED <= 128);
 };
 
-/// Client request operation codes with stable wire-format discriminants.
+/// Trait for application-defined state machine operations.
 ///
-/// Each variant maps to a fixed `u8` value in the range [`OPERATION_MIN`]..=[`OPERATION_MAX`].
-/// Discriminants are part of the protocol specification and must never change.
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum Operation {
-    /// Internal heartbeat/keepalive operation.
-    Pulse = 128,
+/// Implementors define the operations their state machine supports. Each operation
+/// must have a stable `u8` discriminant in the range `128..=255`.
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(Copy, Clone, Eq, PartialEq)]
+/// #[repr(u8)]
+/// enum MyOp {
+///     CreateAccount = 128,
+///     Transfer = 129,
+/// }
+///
+/// impl StateMachineOperation for MyOp {
+///     fn from_u8(v: u8) -> Option<Self> {
+///         match v {
+///             128 => Some(Self::CreateAccount),
+///             129 => Some(Self::Transfer),
+///             _ => None,
+///         }
+///     }
+///     fn as_u8(&self) -> u8 { *self as u8 }
+///     fn tag_name(self) -> &'static str {
+///         match self {
+///             Self::CreateAccount => "create_account",
+///             Self::Transfer => "transfer",
+///         }
+///     }
+/// }
+/// ```
+pub trait StateMachineOperation: Copy + Eq {
+    /// Converts a raw byte to this operation type.
+    /// Returns `None` if the value is not a valid discriminant.
+    fn from_u8(v: u8) -> Option<Self>;
 
-    // Deprecated unbatched operations (129-134). Retained for wire compatibility.
-    #[doc(hidden)]
-    DeprecatedCreateAccountsUnbatched = 129,
-    #[doc(hidden)]
-    DeprecatedCreateTransfersUnbatched = 130,
-    #[doc(hidden)]
-    DeprecatedLookupAccountsUnbatched = 131,
-    #[doc(hidden)]
-    DeprecatedLookupTransfersUnbatched = 132,
-    #[doc(hidden)]
-    DeprecatedGetAccountTransfersUnbatched = 133,
-    #[doc(hidden)]
-    DeprecatedGetAccountBalancesUnbatched = 134,
+    /// Returns the wire discriminant for this operation.
+    fn as_u8(&self) -> u8;
 
-    /// Batch create accounts.
-    CreateAccounts = 135,
-    /// Batch create transfers.
-    CreateTransfers = 136,
-    /// Lookup accounts by ID.
-    LookupAccounts = 137,
-    /// Lookup transfers by ID.
-    LookupTransfers = 138,
-    /// Get transfers for a specific account.
-    GetAccountTransfers = 139,
-    /// Get balance history for a specific account.
-    GetAccountBalances = 140,
-    /// Query accounts with filters.
-    QueryAccounts = 141,
-    /// Query transfers with filters.
-    QueryTransfers = 142,
-    /// Subscribe to change events.
-    GetChangeEvents = 143,
+    /// Returns a human-readable name for logging/debugging.
+    fn tag_name(self) -> &'static str;
 
-    /// Reserved slot for future use. Preserves discriminant stability.
-    UnusedReserved = 144,
-
-    /// Internal query operation. Not client-facing.
-    QueryTransfersOp = 145,
+    /// Converts from wire [`Operation`], returning `None` for VSR-reserved operations.
+    #[inline]
+    fn from_vsr(op: Operation) -> Option<Self> {
+        if op.vsr_reserved() {
+            return None;
+        }
+        Self::from_u8(op.as_u8())
+    }
 }
 
-const _: () = {
-    // Verify first and last variants match expected values
-    assert!(Operation::Pulse as u8 == OPERATION_MIN);
-    assert!(Operation::QueryTransfersOp as u8 == OPERATION_MAX);
-
-    // Verify each discriminant equals VSR_OPERATIONS_RESERVED + offset
-    assert!(Operation::Pulse as u8 == VSR_OPERATIONS_RESERVED);
-    assert!(Operation::DeprecatedCreateAccountsUnbatched as u8 == VSR_OPERATIONS_RESERVED + 1);
-    assert!(Operation::DeprecatedCreateTransfersUnbatched as u8 == VSR_OPERATIONS_RESERVED + 2);
-    assert!(Operation::DeprecatedLookupAccountsUnbatched as u8 == VSR_OPERATIONS_RESERVED + 3);
-    assert!(Operation::DeprecatedLookupTransfersUnbatched as u8 == VSR_OPERATIONS_RESERVED + 4);
-    assert!(Operation::DeprecatedGetAccountTransfersUnbatched as u8 == VSR_OPERATIONS_RESERVED + 5);
-    assert!(Operation::DeprecatedGetAccountBalancesUnbatched as u8 == VSR_OPERATIONS_RESERVED + 6);
-    assert!(Operation::CreateAccounts as u8 == VSR_OPERATIONS_RESERVED + 7);
-    assert!(Operation::CreateTransfers as u8 == VSR_OPERATIONS_RESERVED + 8);
-    assert!(Operation::LookupAccounts as u8 == VSR_OPERATIONS_RESERVED + 9);
-    assert!(Operation::LookupTransfers as u8 == VSR_OPERATIONS_RESERVED + 10);
-    assert!(Operation::GetAccountTransfers as u8 == VSR_OPERATIONS_RESERVED + 11);
-    assert!(Operation::GetAccountBalances as u8 == VSR_OPERATIONS_RESERVED + 12);
-    assert!(Operation::QueryAccounts as u8 == VSR_OPERATIONS_RESERVED + 13);
-    assert!(Operation::QueryTransfers as u8 == VSR_OPERATIONS_RESERVED + 14);
-    assert!(Operation::GetChangeEvents as u8 == VSR_OPERATIONS_RESERVED + 15);
-    assert!(Operation::UnusedReserved as u8 == VSR_OPERATIONS_RESERVED + 16);
-    assert!(Operation::QueryTransfersOp as u8 == VSR_OPERATIONS_RESERVED + 17);
-
-    // Verify enum is exactly one byte (wire format requirement)
-    assert!(core::mem::size_of::<Operation>() == 1);
-    assert!(core::mem::align_of::<Operation>() == 1);
-};
+/// Wire-level operation code carried in message headers.
+///
+/// A thin wrapper over `u8` that distinguishes VSR-reserved operations from
+/// user-defined state machine operations. Use [`Operation::from`] and [`Operation::to`]
+/// to convert between this type and a [`StateMachineOperation`].
+#[repr(transparent)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Operation(u8);
 
 impl Operation {
-    /// Returns the wire-format byte value.
+    /// Invalid/uninitialized operation. Used as a sentinel in zeroed headers.
+    pub const RESERVED: Self = Self(0);
+
+    /// Bootstraps the commit log with an initial entry at op-number 0.
+    pub const ROOT: Self = Self(1);
+
+    /// Registers a new client session with the cluster.
+    pub const REGISTER: Self = Self(2);
+
+    /// Reconfigures cluster membership (add/remove replicas).
+    pub const RECONFIGURE: Self = Self(3);
+
+    /// Periodic heartbeat to drive liveness and view-change detection.
+    pub const PULSE: Self = Self(4);
+
+    /// Upgrades the cluster to a new protocol version.
+    pub const UPGRADE: Self = Self(5);
+
+    /// No-operation used for padding or leader assertions.
+    pub const NOOP: Self = Self(6);
+
+    /// Wraps a raw byte without validation.
     #[inline]
-    pub fn as_u8(self) -> u8 {
-        let value = self as u8;
-
-        #[cfg(debug_assertions)]
-        {
-            debug_assert!(value >= OPERATION_MIN);
-            debug_assert!(value <= OPERATION_MAX);
-        }
-
-        value
+    pub const fn from_u8(v: u8) -> Self {
+        Self(v)
     }
 
-    /// Returns `true` for legacy operations no longer accepted by clients.
+    /// Returns the underlying byte value.
     #[inline]
-    pub const fn is_deprecated(self) -> bool {
-        matches!(
-            self,
-            Operation::DeprecatedCreateAccountsUnbatched
-                | Operation::DeprecatedCreateTransfersUnbatched
-                | Operation::DeprecatedLookupAccountsUnbatched
-                | Operation::DeprecatedLookupTransfersUnbatched
-                | Operation::DeprecatedGetAccountTransfersUnbatched
-                | Operation::DeprecatedGetAccountBalancesUnbatched
-        )
+    pub const fn as_u8(&self) -> u8 {
+        self.0
     }
 
-    /// Returns `true` for operations exposed to external clients.
-    #[inline]
-    pub const fn is_client_facing(self) -> bool {
-        matches!(
-            self,
-            Self::CreateAccounts
-                | Self::CreateTransfers
-                | Self::LookupAccounts
-                | Self::LookupTransfers
-                | Self::GetAccountTransfers
-                | Self::GetAccountBalances
-                | Self::QueryAccounts
-                | Self::QueryTransfers
-                | Self::GetChangeEvents
-        )
-    }
-
-    /// Returns `true` if this operation can be requested by clients.
+    /// Wraps a state machine operation for wire transmission.
     ///
-    /// Equivalent to `is_client_facing() && !is_deprecated()`.
+    /// # Panics
+    ///
+    /// Panics if the operation's discriminant is in the VSR-reserved range.
     #[inline]
-    pub const fn is_valid_client_request(self) -> bool {
-        self.is_client_facing() && !self.is_deprecated()
+    pub fn from<SM: StateMachineOperation>(operation: SM) -> Self {
+        let v = operation.as_u8();
+
+        assert!(v >= constants::VSR_OPERATIONS_RESERVED);
+        let roundtrip = SM::from_u8(v).expect("state machine operation must round-trip");
+        assert!(roundtrip.as_u8() == v);
+
+        Self(v)
     }
 
-    /// Checks if a raw byte is within the valid operation range.
+    /// Extracts a state machine operation from this wire operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this operation is VSR-reserved or invalid for `SM`.
     #[inline]
-    pub const fn is_valid_discriminant(v: u8) -> bool {
-        v >= OPERATION_MIN && v <= OPERATION_MAX
+    pub fn to<SM: StateMachineOperation>(operation: Self) -> SM {
+        assert!(
+            operation.valid::<SM>(),
+            "invalid operation for this state machine"
+        );
+        assert!(
+            !operation.vsr_reserved(),
+            "reserved operations cannot be converted to state machine operations"
+        );
+
+        let result = SM::from_u8(operation.0).expect("valid non-reserved op must map to SM");
+        assert!(result.as_u8() == operation.0);
+
+        result
+    }
+
+    /// Converts to a state machine operation, panicking on failure.
+    ///
+    /// Unlike [`Operation::to`], this is a method taking `self`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this operation cannot be converted to `SM`.
+    #[inline]
+    pub fn cast<SM: StateMachineOperation>(self) -> SM {
+        let result =
+            SM::from_vsr(self).expect("operation not covertible to state machine operation");
+        assert!(result.as_u8() == self.0 || self.vsr_reserved());
+
+        result
+    }
+
+    /// Returns `true` if this operation is a defined VSR operation (0-6) or a
+    /// user-defined `SM` operation in the `128..=255` range that round-trips.
+    #[inline]
+    pub fn valid<SM: StateMachineOperation>(self) -> bool {
+        if self.0 <= VSR_RESERVED_MAX {
+            true
+        } else if self.0 < constants::VSR_OPERATIONS_RESERVED {
+            false
+        } else {
+            SM::from_u8(self.0)
+                .map(|op| op.as_u8() == self.0)
+                .unwrap_or(false)
+        }
+    }
+
+    /// Returns `true` if this operation is in the VSR-reserved range (0–127).
+    ///
+    /// Reserved operations are handled by the protocol layer, not the state machine.
+    #[inline]
+    pub const fn vsr_reserved(&self) -> bool {
+        self.0 < constants::VSR_OPERATIONS_RESERVED
+    }
+
+    /// Returns the human-readable name for this operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self.valid::<SM>()` is false.
+    #[inline]
+    pub fn tag_name<SM: StateMachineOperation>(self) -> &'static str {
+        assert!(self.valid::<SM>());
+
+        if self.0 <= VSR_RESERVED_MAX {
+            Self::vsr_reserved_tag_name(self.0)
+        } else {
+            SM::from_u8(self.0)
+                .expect("valid non-reserved op must map to SM")
+                .tag_name()
+        }
+    }
+
+    #[inline]
+    const fn vsr_reserved_tag_name(opcode: u8) -> &'static str {
+        assert!(opcode <= VSR_RESERVED_MAX);
+
+        match opcode {
+            0 => "reserved",
+            1 => "root",
+            2 => "register",
+            3 => "reconfigure",
+            4 => "pulse",
+            5 => "upgrade",
+            6 => "noop",
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Default for Operation {
+    /// Defaults to [`Operation::RESERVED`].
+    #[inline]
+    fn default() -> Self {
+        Operation::RESERVED
+    }
+}
+
+impl From<u8> for Operation {
+    #[inline]
+    fn from(v: u8) -> Self {
+        Operation::from_u8(v)
     }
 }
 
 impl From<Operation> for u8 {
     #[inline]
     fn from(op: Operation) -> u8 {
-        let value = op as u8;
-
-        debug_assert!(
-            (OPERATION_MIN..=OPERATION_MAX).contains(&value),
-            "operation discriminant out of range"
-        );
-
-        value
+        op.as_u8()
     }
 }
 
-/// Error returned when parsing an invalid operation byte.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct InvalidOperation(pub u8);
-
-impl InvalidOperation {
-    /// Returns the invalid byte value.
-    #[inline]
-    pub const fn value(self) -> u8 {
-        self.0
-    }
-
-    /// Returns `true` if the value was below [`OPERATION_MIN`].
-    #[inline]
-    pub const fn is_below_range(self) -> bool {
-        self.0 < OPERATION_MIN
-    }
-
-    /// Returns `true` if the value was above [`OPERATION_MAX`].
-    #[inline]
-    pub const fn is_above_range(self) -> bool {
-        self.0 > OPERATION_MAX
-    }
-}
-
-impl core::fmt::Display for InvalidOperation {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "invalid operation: {} (valid range: {}..={})",
-            self.0, OPERATION_MIN, OPERATION_MAX
-        )
-    }
-}
-
-impl std::error::Error for InvalidOperation {}
-
-impl TryFrom<u8> for Operation {
-    type Error = InvalidOperation;
-
-    #[inline]
-    fn try_from(v: u8) -> Result<Self, Self::Error> {
-        if !(OPERATION_MIN..=OPERATION_MAX).contains(&v) {
-            return Err(InvalidOperation(v));
+impl fmt::Debug for Operation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.0 <= VSR_RESERVED_MAX {
+            write!(
+                f,
+                "Operation({}={})",
+                Self::vsr_reserved_tag_name(self.0),
+                self.0
+            )
+        } else {
+            write!(f, "Operation({})", self.0)
         }
-
-        let result = match v {
-            128 => Self::Pulse,
-
-            129 => Self::DeprecatedCreateAccountsUnbatched,
-            130 => Self::DeprecatedCreateTransfersUnbatched,
-            131 => Self::DeprecatedLookupAccountsUnbatched,
-            132 => Self::DeprecatedLookupTransfersUnbatched,
-            133 => Self::DeprecatedGetAccountTransfersUnbatched,
-            134 => Self::DeprecatedGetAccountBalancesUnbatched,
-
-            135 => Self::CreateAccounts,
-            136 => Self::CreateTransfers,
-            137 => Self::LookupAccounts,
-            138 => Self::LookupTransfers,
-            139 => Self::GetAccountTransfers,
-            140 => Self::GetAccountBalances,
-            141 => Self::QueryAccounts,
-            142 => Self::QueryTransfers,
-            143 => Self::GetChangeEvents,
-
-            144 => Self::UnusedReserved,
-            145 => Self::QueryTransfersOp,
-
-            _ => {
-                debug_assert!(false, "bounds check should have caught value {}", v);
-                return Err(InvalidOperation(v));
-            }
-        };
-
-        debug_assert_eq!(
-            result as u8, v,
-            "roundtrip failed: {:?} as u8 = {}, expected {}",
-            result, result as u8, v
-        );
-
-        Ok(result)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    #[repr(u8)]
+    enum TestOp {
+        CreateAccount = 128,
+        Transfer = 129,
+    }
+
+    impl StateMachineOperation for TestOp {
+        fn from_u8(v: u8) -> Option<Self> {
+            match v {
+                128 => Some(Self::CreateAccount),
+                129 => Some(Self::Transfer),
+                _ => None,
+            }
+        }
+
+        fn as_u8(&self) -> u8 {
+            *self as u8
+        }
+
+        fn tag_name(self) -> &'static str {
+            match self {
+                Self::CreateAccount => "create_account",
+                Self::Transfer => "transfer",
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct InconsistentOp(u8);
+
+    impl StateMachineOperation for InconsistentOp {
+        fn from_u8(v: u8) -> Option<Self> {
+            if v == 128 { Some(Self(129)) } else { None }
+        }
+
+        fn as_u8(&self) -> u8 {
+            self.0
+        }
+
+        fn tag_name(self) -> &'static str {
+            "inconsistent"
+        }
+    }
+
+    // =========================================================================
+    // Basic validity tests
+    // =========================================================================
+
+    #[test]
+    fn test_vsr_constants() {
+        // All named VSR constants must be valid and reserved.
+        let constants = [
+            Operation::RESERVED,
+            Operation::ROOT,
+            Operation::REGISTER,
+            Operation::RECONFIGURE,
+            Operation::PULSE,
+            Operation::UPGRADE,
+            Operation::NOOP,
+        ];
+
+        for op in constants {
+            assert!(op.valid::<TestOp>());
+            assert!(op.vsr_reserved());
+        }
+    }
+
+    #[test]
+    fn test_invalid_gap() {
+        // Ensure operations in the gap 7..128 are invalid
+        for op_code in (VSR_RESERVED_MAX + 1)..constants::VSR_OPERATIONS_RESERVED {
+            let op = Operation::from_u8(op_code);
+            assert!(!op.valid::<TestOp>(), "Op {} should be invalid", op_code);
+            assert!(op.vsr_reserved(), "Op {} should be reserved", op_code);
+        }
+    }
+
+    #[test]
+    fn test_reserved_range_not_valid_for_sm() {
+        #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+        struct ReservedRangeOp;
+
+        impl StateMachineOperation for ReservedRangeOp {
+            fn from_u8(v: u8) -> Option<Self> {
+                if v == 42 { Some(Self) } else { None }
+            }
+
+            fn as_u8(&self) -> u8 {
+                42
+            }
+
+            fn tag_name(self) -> &'static str {
+                "reserved_range"
+            }
+        }
+
+        let op = Operation::from_u8(42);
+        assert!(op.vsr_reserved());
+        assert!(!op.valid::<ReservedRangeOp>());
+    }
+
+    #[test]
+    fn test_sm_roundtrip() {
+        let op = Operation::from(TestOp::CreateAccount);
+        assert!(op.as_u8() == 128);
+        assert!(op.valid::<TestOp>());
+
+        let sm_op: TestOp = Operation::to(op);
+        assert!(sm_op == TestOp::CreateAccount);
+    }
+
+    #[test]
+    fn test_invalid_opcode() {
+        let op = Operation::from_u8(200); // Not a TestOp
+        assert!(!op.valid::<TestOp>());
+    }
+
+    #[test]
+    fn test_inconsistent_sm_not_valid() {
+        let op = Operation::from_u8(128);
+        assert!(!op.valid::<InconsistentOp>());
+    }
+
+    #[test]
+    fn test_sm_not_reserved() {
+        let create = Operation::from(TestOp::CreateAccount);
+        let transfer = Operation::from(TestOp::Transfer);
+
+        assert!(!create.vsr_reserved());
+        assert!(!transfer.vsr_reserved());
+    }
+
+    #[test]
+    fn test_sm_valid() {
+        let create = Operation::from(TestOp::CreateAccount);
+        let transfer = Operation::from(TestOp::Transfer);
+
+        assert!(create.valid::<TestOp>());
+        assert!(transfer.valid::<TestOp>());
+    }
+
+    // =========================================================================
+    // Boundary tests (127/128 boundary between VSR reserved and user ops)
+    // =========================================================================
+
+    // =========================================================================
+    // from_vsr trait method tests
+    // =========================================================================
+
+    #[test]
+    fn test_from_vsr_reserved() {
+        for opcode in 0..128 {
+            let op = Operation::from_u8(opcode);
+            assert!(
+                TestOp::from_vsr(op).is_none(),
+                "from_vsr should return None for VSR reserved opcode {opcode}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_vsr_sm() {
+        let create_op = Operation::from_u8(128);
+        let transfer_op = Operation::from_u8(129);
+
+        assert_eq!(TestOp::from_vsr(create_op), Some(TestOp::CreateAccount));
+        assert_eq!(TestOp::from_vsr(transfer_op), Some(TestOp::Transfer));
+    }
+
+    #[test]
+    fn test_from_vsr_invalid() {
+        let invalid_op = Operation::from_u8(200);
+        assert!(TestOp::from_vsr(invalid_op).is_none());
+    }
+
+    // =========================================================================
+    // cast() method tests
+    // =========================================================================
+
+    #[test]
+    fn test_cast_sm() {
+        let create_op = Operation::from_u8(128);
+        let transfer_op = Operation::from_u8(129);
+
+        let create: TestOp = create_op.cast();
+        let transfer: TestOp = transfer_op.cast();
+
+        assert_eq!(create, TestOp::CreateAccount);
+        assert_eq!(transfer, TestOp::Transfer);
+    }
+
+    #[test]
+    #[should_panic(expected = "operation not covertible to state machine operation")]
+    fn test_cast_reserved_panic() {
+        Operation::ROOT.cast::<TestOp>();
+    }
+
+    #[test]
+    #[should_panic(expected = "operation not covertible to state machine operation")]
+    fn test_cast_invalid_panic() {
+        let invalid = Operation::from_u8(200);
+        let _: TestOp = invalid.cast();
+    }
+
+    #[test]
+    fn test_cast_remapping_logic() {
+        // Define a custom SM that maps ROOT(1) to a user op.
+        #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+        struct RemappingOp(u8);
+        impl StateMachineOperation for RemappingOp {
+            fn from_u8(v: u8) -> Option<Self> {
+                if v == 128 { Some(Self(128)) } else { None }
+            }
+            fn as_u8(&self) -> u8 {
+                self.0
+            }
+            fn tag_name(self) -> &'static str {
+                "remapping"
+            }
+            fn from_vsr(op: Operation) -> Option<Self> {
+                if op == Operation::ROOT {
+                    Some(Self(128))
+                } else {
+                    Self::from_u8(op.as_u8())
+                }
+            }
+        }
+
+        let op = Operation::ROOT;
+        // cast allows the mapping because from_vsr handles it
+        let sm = op.cast::<RemappingOp>();
+        assert_eq!(sm.0, 128);
+    }
+
+    // =========================================================================
+    // tag_name() tests
+    // =========================================================================
+
+    #[test]
+    fn test_tag_name_reserved() {
+        assert_eq!(Operation::RESERVED.tag_name::<TestOp>(), "reserved");
+        assert_eq!(Operation::ROOT.tag_name::<TestOp>(), "root");
+        assert_eq!(Operation::REGISTER.tag_name::<TestOp>(), "register");
+        assert_eq!(Operation::RECONFIGURE.tag_name::<TestOp>(), "reconfigure");
+        assert_eq!(Operation::PULSE.tag_name::<TestOp>(), "pulse");
+        assert_eq!(Operation::UPGRADE.tag_name::<TestOp>(), "upgrade");
+        assert_eq!(Operation::NOOP.tag_name::<TestOp>(), "noop");
+    }
+
+    #[test]
+    fn test_tag_name_sm() {
+        let create = Operation::from(TestOp::CreateAccount);
+        let transfer = Operation::from(TestOp::Transfer);
+
+        assert_eq!(create.tag_name::<TestOp>(), "create_account");
+        assert_eq!(transfer.tag_name::<TestOp>(), "transfer");
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_tag_name_panic() {
+        let invalid = Operation::from_u8(200);
+        let _ = invalid.tag_name::<TestOp>();
+    }
+
+    // =========================================================================
+    // Panic behavior tests for from/to
+    // =========================================================================
+
+    /// A malformed state machine operation that returns a VSR-reserved discriminant.
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct MalformedOp;
+
+    impl StateMachineOperation for MalformedOp {
+        fn from_u8(v: u8) -> Option<Self> {
+            if v == 5 { Some(MalformedOp) } else { None }
+        }
+
+        fn as_u8(&self) -> u8 {
+            5 // VSR-reserved range - this is invalid!
+        }
+
+        fn tag_name(self) -> &'static str {
+            "malformed"
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_panic_reserved() {
+        // MalformedOp has discriminant 5, which is in VSR-reserved range
+        let _ = Operation::from(MalformedOp);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_from_panic_inconsistent_roundtrip() {
+        let _ = Operation::from(InconsistentOp(128));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "reserved operations cannot be converted to state machine operations"
+    )]
+    fn test_to_panic_reserved() {
+        Operation::to::<TestOp>(Operation::ROOT);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_to_panic_invalid() {
+        let invalid = Operation::from_u8(200);
+        let _: TestOp = Operation::to(invalid);
+    }
+
+    // =========================================================================
+    // Default trait tests
+    // =========================================================================
+
+    #[test]
+    fn test_default_is_reserved() {
+        assert_eq!(Operation::default(), Operation::RESERVED);
+        assert_eq!(Operation::default().as_u8(), 0);
+    }
+
+    // =========================================================================
+    // From trait tests
+    // =========================================================================
+
+    // =========================================================================
+    // Debug formatting tests
+    // =========================================================================
+
+    #[test]
+    fn test_debug_reserved() {
+        let debug_str = format!("{:?}", Operation::RESERVED);
+        assert_eq!(debug_str, "Operation(reserved=0)");
+
+        let debug_str = format!("{:?}", Operation::ROOT);
+        assert_eq!(debug_str, "Operation(root=1)");
+
+        let debug_str = format!("{:?}", Operation::NOOP);
+        assert_eq!(debug_str, "Operation(noop=6)");
+    }
+
+    #[test]
+    fn test_debug_sm() {
+        let op = Operation::from_u8(128);
+        let debug_str = format!("{:?}", op);
+        assert_eq!(debug_str, "Operation(128)");
+
+        let op = Operation::from_u8(255);
+        let debug_str = format!("{:?}", op);
+        assert_eq!(debug_str, "Operation(255)");
+    }
+
+    #[test]
+    fn test_debug_undefined() {
+        // Operations 7-127 are VSR reserved but undefined, so they show as raw numbers
+        let op = Operation::from_u8(50);
+        let debug_str = format!("{:?}", op);
+        assert_eq!(debug_str, "Operation(50)");
+    }
+
+    // =========================================================================
+    // Ordering tests
+    // =========================================================================
+
+    // =========================================================================
+    // Full roundtrip tests for all TestOp variants
+    // =========================================================================
+
+    #[test]
+    fn test_all_test_ops_roundtrip() {
+        for test_op in [TestOp::CreateAccount, TestOp::Transfer] {
+            // SM -> Operation -> SM
+            let wire_op = Operation::from(test_op);
+            let recovered: TestOp = Operation::to(wire_op);
+            assert_eq!(test_op, recovered);
+
+            // Also test cast
+            let cast_recovered: TestOp = wire_op.cast();
+            assert_eq!(test_op, cast_recovered);
+
+            // Also test from_vsr
+            let vsr_recovered = TestOp::from_vsr(wire_op);
+            assert_eq!(Some(test_op), vsr_recovered);
+        }
+    }
+}
+
+#[cfg(test)]
+mod proptests {
     use proptest::prelude::*;
 
-    const _: () = {
-        assert!(OPERATION_MIN == 128);
-        assert!(OPERATION_MAX == 145);
-        assert!(OPERATION_COUNT == 18);
-    };
+    use super::*;
 
-    const ALL_OPERATIONS: [Operation; OPERATION_COUNT as usize] = [
-        Operation::Pulse,
-        Operation::DeprecatedCreateAccountsUnbatched,
-        Operation::DeprecatedCreateTransfersUnbatched,
-        Operation::DeprecatedLookupAccountsUnbatched,
-        Operation::DeprecatedLookupTransfersUnbatched,
-        Operation::DeprecatedGetAccountTransfersUnbatched,
-        Operation::DeprecatedGetAccountBalancesUnbatched,
-        Operation::CreateAccounts,
-        Operation::CreateTransfers,
-        Operation::LookupAccounts,
-        Operation::LookupTransfers,
-        Operation::GetAccountTransfers,
-        Operation::GetAccountBalances,
-        Operation::QueryAccounts,
-        Operation::QueryTransfers,
-        Operation::GetChangeEvents,
-        Operation::UnusedReserved,
-        Operation::QueryTransfersOp,
-    ];
+    /// Test state machine with operations spanning the full user range.
+    #[derive(Copy, Clone, Eq, PartialEq, Debug)]
+    struct WideOp(u8);
 
-    const _: () = assert!(ALL_OPERATIONS.len() == OPERATION_COUNT as usize);
+    impl StateMachineOperation for WideOp {
+        fn from_u8(v: u8) -> Option<Self> {
+            if v >= 128 { Some(WideOp(v)) } else { None }
+        }
 
-    impl Arbitrary for Operation {
-        type Parameters = ();
-        type Strategy = BoxedStrategy<Self>;
+        fn as_u8(&self) -> u8 {
+            self.0
+        }
 
-        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
-            (OPERATION_MIN..=OPERATION_MAX)
-                .prop_map(|b| Operation::try_from(b).unwrap())
-                .boxed()
+        fn tag_name(self) -> &'static str {
+            "wide_op"
         }
     }
 
     proptest! {
         #[test]
-        fn prop_roundtrip(op in any::<Operation>()) {
-            let byte = op.as_u8();
-            let recovered = Operation::try_from(byte)
-                .expect("Valid operation must convert back from its byte");
-            prop_assert_eq!(op, recovered);
-        }
-
-        #[test]
-        fn prop_inverse_roundtrip(byte in OPERATION_MIN..=OPERATION_MAX) {
-            let op = Operation::try_from(byte)
-                .expect("Byte in valid range must convert");
+        fn proptest_u8_roundtrip(byte: u8) {
+            let op = Operation::from_u8(byte);
             prop_assert_eq!(op.as_u8(), byte);
+
+            // Also test via From traits
+            let op2: Operation = byte.into();
+            let back: u8 = op2.into();
+            prop_assert_eq!(back, byte);
         }
 
         #[test]
-        fn prop_unique_discriminants(
-            v1 in any::<Operation>(),
-            v2 in any::<Operation>()
-        ) {
-            if v1 != v2 {
-                prop_assert_ne!(v1.as_u8(), v2.as_u8());
+        fn proptest_vsr_reserved_boundary(byte: u8) {
+            let op = Operation::from_u8(byte);
+            if byte < 128 {
+                prop_assert!(op.vsr_reserved());
+            } else {
+                prop_assert!(!op.vsr_reserved());
             }
         }
 
         #[test]
-        fn prop_into_u8(op in any::<Operation>()) {
-            let byte: u8 = op.into();
-            prop_assert_eq!(byte, op.as_u8());
+        fn proptest_wide_op_roundtrip(byte in 128u8..=255) {
+            let sm_op = WideOp(byte);
+            let wire_op = Operation::from(sm_op);
+            let recovered: WideOp = Operation::to(wire_op);
+            prop_assert_eq!(sm_op, recovered);
         }
 
         #[test]
-        fn prop_is_valid_discriminant(byte: u8) {
-            let is_valid = Operation::is_valid_discriminant(byte);
-            let try_from_result = Operation::try_from(byte);
-            prop_assert_eq!(is_valid, try_from_result.is_ok());
+        fn proptest_valid_for_defined_vsr_or_sm(byte: u8) {
+            let op = Operation::from_u8(byte);
+            let is_valid = op.valid::<WideOp>();
+
+            // Valid if: (0-6) OR (128-255)
+            let expected_valid = byte <= 6 || byte >= 128;
+            prop_assert_eq!(is_valid, expected_valid);
         }
 
         #[test]
-        fn prop_as_u8_range(op in any::<Operation>()) {
-            let byte = op.as_u8();
-            prop_assert!(byte >= OPERATION_MIN);
-            prop_assert!(byte <= OPERATION_MAX);
+        fn proptest_ordering_consistent_with_u8(a: u8, b: u8) {
+            let op_a = Operation::from_u8(a);
+            let op_b = Operation::from_u8(b);
+
+            prop_assert_eq!(op_a.cmp(&op_b), a.cmp(&b));
+            prop_assert_eq!(op_a.partial_cmp(&op_b), a.partial_cmp(&b));
         }
 
         #[test]
-        fn prop_client_request(op in any::<Operation>()) {
-            if op.is_valid_client_request() {
-                prop_assert!(op.is_client_facing());
-                prop_assert!(!op.is_deprecated());
-            }
+        fn proptest_equality_consistent_with_u8(a: u8, b: u8) {
+            let op_a = Operation::from_u8(a);
+            let op_b = Operation::from_u8(b);
+
+            prop_assert_eq!(op_a == op_b, a == b);
+            prop_assert_eq!(op_a != op_b, a != b);
         }
-    }
 
-    #[test]
-    fn discriminants() {
-        assert_eq!(VSR_OPERATIONS_RESERVED, 128);
-
-        assert_eq!(Operation::Pulse as u8, 128);
-        assert_eq!(Operation::DeprecatedCreateAccountsUnbatched as u8, 129);
-        assert_eq!(Operation::DeprecatedCreateTransfersUnbatched as u8, 130);
-        assert_eq!(Operation::DeprecatedLookupAccountsUnbatched as u8, 131);
-        assert_eq!(Operation::DeprecatedLookupTransfersUnbatched as u8, 132);
-        assert_eq!(Operation::DeprecatedGetAccountTransfersUnbatched as u8, 133);
-        assert_eq!(Operation::DeprecatedGetAccountBalancesUnbatched as u8, 134);
-        assert_eq!(Operation::CreateAccounts as u8, 135);
-        assert_eq!(Operation::CreateTransfers as u8, 136);
-        assert_eq!(Operation::LookupAccounts as u8, 137);
-        assert_eq!(Operation::LookupTransfers as u8, 138);
-        assert_eq!(Operation::GetAccountTransfers as u8, 139);
-        assert_eq!(Operation::GetAccountBalances as u8, 140);
-        assert_eq!(Operation::QueryAccounts as u8, 141);
-        assert_eq!(Operation::QueryTransfers as u8, 142);
-        assert_eq!(Operation::GetChangeEvents as u8, 143);
-        assert_eq!(Operation::UnusedReserved as u8, 144);
-        assert_eq!(Operation::QueryTransfersOp as u8, 145);
-    }
-
-    #[test]
-    fn try_from_roundtrip() {
-        for v in OPERATION_MIN..=OPERATION_MAX {
-            let op = Operation::try_from(v).expect("valid range should succeed");
-
-            assert_eq!(op as u8, v, "roundtrip failed for {}", v);
-            assert!(
-                Operation::is_valid_discriminant(op as u8),
-                "result should be valid discriminant"
-            );
+        #[test]
+        fn proptest_from_vsr_never_returns_for_reserved(byte in 0u8..128) {
+            let op = Operation::from_u8(byte);
+            prop_assert!(WideOp::from_vsr(op).is_none());
         }
-    }
 
-    #[test]
-    fn try_from_below_min() {
-        for v in 0..OPERATION_MIN {
-            let err = Operation::try_from(v).expect_err("below range should fail");
-
-            assert_eq!(err.0, v);
-            assert!(err.is_below_range());
-            assert!(!err.is_above_range());
-        }
-    }
-
-    #[test]
-    fn try_from_above_max() {
-        for v in (OPERATION_MAX + 1)..=u8::MAX {
-            let err = Operation::try_from(v).expect_err("above range should fail");
-
-            assert_eq!(err.0, v);
-            assert!(!err.is_below_range());
-            assert!(err.is_above_range());
-        }
-    }
-
-    #[test]
-    fn boundaries() {
-        assert!(Operation::try_from(OPERATION_MIN - 1).is_err());
-
-        assert!(Operation::try_from(OPERATION_MIN).is_ok());
-        assert_eq!(
-            Operation::try_from(OPERATION_MIN).unwrap(),
-            Operation::Pulse
-        );
-
-        assert!(Operation::try_from(OPERATION_MAX).is_ok());
-        assert_eq!(
-            Operation::try_from(OPERATION_MAX).unwrap(),
-            Operation::QueryTransfersOp
-        );
-
-        assert!(Operation::try_from(OPERATION_MAX + 1).is_err());
-    }
-
-    #[test]
-    fn contiguous() {
-        let mut count = 0u8;
-        for v in OPERATION_MIN..=OPERATION_MAX {
-            assert!(
-                Operation::try_from(v).is_ok(),
-                "gap in discriminants at {}",
-                v
-            );
-            count += 1;
-        }
-        assert_eq!(count, OPERATION_COUNT);
-    }
-
-    #[test]
-    fn all_operations_array() {
-        for (i, &op) in ALL_OPERATIONS.iter().enumerate() {
-            let byte = OPERATION_MIN + i as u8;
-            let expected = Operation::try_from(byte).unwrap();
-            assert_eq!(
-                op, expected,
-                "ALL_OPERATIONS[{}] doesn't match try_from({})",
-                i, byte
-            );
-        }
-    }
-
-    #[test]
-    fn as_u8_values() {
-        assert_eq!(Operation::Pulse.as_u8(), 128);
-        assert_eq!(Operation::DeprecatedCreateAccountsUnbatched.as_u8(), 129);
-        assert_eq!(Operation::DeprecatedCreateTransfersUnbatched.as_u8(), 130);
-        assert_eq!(Operation::DeprecatedLookupAccountsUnbatched.as_u8(), 131);
-        assert_eq!(Operation::DeprecatedLookupTransfersUnbatched.as_u8(), 132);
-        assert_eq!(
-            Operation::DeprecatedGetAccountTransfersUnbatched.as_u8(),
-            133
-        );
-        assert_eq!(
-            Operation::DeprecatedGetAccountBalancesUnbatched.as_u8(),
-            134
-        );
-        assert_eq!(Operation::CreateAccounts.as_u8(), 135);
-        assert_eq!(Operation::CreateTransfers.as_u8(), 136);
-        assert_eq!(Operation::LookupAccounts.as_u8(), 137);
-        assert_eq!(Operation::LookupTransfers.as_u8(), 138);
-        assert_eq!(Operation::GetAccountTransfers.as_u8(), 139);
-        assert_eq!(Operation::GetAccountBalances.as_u8(), 140);
-        assert_eq!(Operation::QueryAccounts.as_u8(), 141);
-        assert_eq!(Operation::QueryTransfers.as_u8(), 142);
-        assert_eq!(Operation::GetChangeEvents.as_u8(), 143);
-        assert_eq!(Operation::UnusedReserved.as_u8(), 144);
-        assert_eq!(Operation::QueryTransfersOp.as_u8(), 145);
-    }
-
-    #[test]
-    fn deprecated() {
-        assert!(Operation::DeprecatedCreateAccountsUnbatched.is_deprecated());
-        assert!(Operation::DeprecatedCreateTransfersUnbatched.is_deprecated());
-        assert!(Operation::DeprecatedLookupAccountsUnbatched.is_deprecated());
-        assert!(Operation::DeprecatedLookupTransfersUnbatched.is_deprecated());
-        assert!(Operation::DeprecatedGetAccountTransfersUnbatched.is_deprecated());
-        assert!(Operation::DeprecatedGetAccountBalancesUnbatched.is_deprecated());
-
-        assert!(!Operation::Pulse.is_deprecated());
-        assert!(!Operation::CreateAccounts.is_deprecated());
-        assert!(!Operation::CreateTransfers.is_deprecated());
-        assert!(!Operation::LookupAccounts.is_deprecated());
-        assert!(!Operation::LookupTransfers.is_deprecated());
-        assert!(!Operation::GetAccountTransfers.is_deprecated());
-        assert!(!Operation::GetAccountBalances.is_deprecated());
-        assert!(!Operation::QueryAccounts.is_deprecated());
-        assert!(!Operation::QueryTransfers.is_deprecated());
-        assert!(!Operation::GetChangeEvents.is_deprecated());
-        assert!(!Operation::UnusedReserved.is_deprecated());
-        assert!(!Operation::QueryTransfersOp.is_deprecated());
-    }
-
-    #[test]
-    fn deprecated_count() {
-        let count = ALL_OPERATIONS
-            .iter()
-            .filter(|op| op.is_deprecated())
-            .count();
-        assert_eq!(count, 6);
-    }
-
-    #[test]
-    fn client_facing() {
-        assert!(Operation::CreateAccounts.is_client_facing());
-        assert!(Operation::CreateTransfers.is_client_facing());
-        assert!(Operation::LookupAccounts.is_client_facing());
-        assert!(Operation::LookupTransfers.is_client_facing());
-        assert!(Operation::GetAccountTransfers.is_client_facing());
-        assert!(Operation::GetAccountBalances.is_client_facing());
-        assert!(Operation::QueryAccounts.is_client_facing());
-        assert!(Operation::QueryTransfers.is_client_facing());
-        assert!(Operation::GetChangeEvents.is_client_facing());
-
-        assert!(!Operation::Pulse.is_client_facing());
-        assert!(!Operation::DeprecatedCreateAccountsUnbatched.is_client_facing());
-        assert!(!Operation::DeprecatedCreateTransfersUnbatched.is_client_facing());
-        assert!(!Operation::DeprecatedLookupAccountsUnbatched.is_client_facing());
-        assert!(!Operation::DeprecatedLookupTransfersUnbatched.is_client_facing());
-        assert!(!Operation::DeprecatedGetAccountTransfersUnbatched.is_client_facing());
-        assert!(!Operation::DeprecatedGetAccountBalancesUnbatched.is_client_facing());
-        assert!(!Operation::UnusedReserved.is_client_facing());
-        assert!(!Operation::QueryTransfersOp.is_client_facing());
-    }
-
-    #[test]
-    fn client_facing_count() {
-        let count = ALL_OPERATIONS
-            .iter()
-            .filter(|op| op.is_client_facing())
-            .count();
-        assert_eq!(count, 9);
-    }
-
-    #[test]
-    fn valid_client_request() {
-        assert!(Operation::CreateAccounts.is_valid_client_request());
-        assert!(Operation::CreateTransfers.is_valid_client_request());
-        assert!(Operation::LookupAccounts.is_valid_client_request());
-        assert!(Operation::LookupTransfers.is_valid_client_request());
-        assert!(Operation::GetAccountTransfers.is_valid_client_request());
-        assert!(Operation::GetAccountBalances.is_valid_client_request());
-        assert!(Operation::QueryAccounts.is_valid_client_request());
-        assert!(Operation::QueryTransfers.is_valid_client_request());
-        assert!(Operation::GetChangeEvents.is_valid_client_request());
-
-        assert!(!Operation::Pulse.is_valid_client_request());
-        assert!(!Operation::DeprecatedCreateAccountsUnbatched.is_valid_client_request());
-        assert!(!Operation::DeprecatedCreateTransfersUnbatched.is_valid_client_request());
-        assert!(!Operation::DeprecatedLookupAccountsUnbatched.is_valid_client_request());
-        assert!(!Operation::DeprecatedLookupTransfersUnbatched.is_valid_client_request());
-        assert!(!Operation::DeprecatedGetAccountTransfersUnbatched.is_valid_client_request());
-        assert!(!Operation::DeprecatedGetAccountBalancesUnbatched.is_valid_client_request());
-        assert!(!Operation::UnusedReserved.is_valid_client_request());
-        assert!(!Operation::QueryTransfersOp.is_valid_client_request());
-    }
-
-    #[test]
-    fn valid_client_request_count() {
-        let count = ALL_OPERATIONS
-            .iter()
-            .filter(|op| op.is_valid_client_request())
-            .count();
-        assert_eq!(count, 9);
-    }
-
-    #[test]
-    fn valid_client_request_definition() {
-        for op in ALL_OPERATIONS {
-            let expected = op.is_client_facing() && !op.is_deprecated();
-            assert_eq!(
-                op.is_valid_client_request(),
-                expected,
-                "{:?} validity mismatch",
-                op
-            );
-        }
-    }
-
-    #[test]
-    fn is_valid_discriminant_boundaries() {
-        assert!(!Operation::is_valid_discriminant(0));
-        assert!(!Operation::is_valid_discriminant(127));
-
-        assert!(Operation::is_valid_discriminant(OPERATION_MIN));
-        assert!(Operation::is_valid_discriminant(OPERATION_MAX));
-
-        assert!(!Operation::is_valid_discriminant(146));
-        assert!(!Operation::is_valid_discriminant(255));
-    }
-
-    #[test]
-    fn layout() {
-        assert_eq!(core::mem::size_of::<Operation>(), 1);
-        assert_eq!(core::mem::align_of::<Operation>(), 1);
-        assert_eq!(core::mem::size_of::<Option<Operation>>(), 1);
-    }
-
-    #[test]
-    #[allow(clippy::clone_on_copy)]
-    fn clone() {
-        for op in ALL_OPERATIONS {
-            let cloned = op.clone();
-            assert_eq!(op, cloned);
-        }
-    }
-
-    #[test]
-    fn copy() {
-        let op = Operation::CreateAccounts;
-        let copied = op; // Uses Copy
-        assert_eq!(op, copied);
-        assert_eq!(op.as_u8(), copied.as_u8());
-    }
-
-    #[test]
-    fn debug() {
-        assert_eq!(format!("{:?}", Operation::Pulse), "Pulse");
-        assert_eq!(format!("{:?}", Operation::CreateAccounts), "CreateAccounts");
-    }
-
-    #[test]
-    fn equality() {
-        assert_eq!(Operation::Pulse, Operation::Pulse);
-        assert_ne!(Operation::Pulse, Operation::CreateAccounts);
-    }
-
-    #[test]
-    fn hash() {
-        use std::collections::HashSet;
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut set = HashSet::new();
-        for op in ALL_OPERATIONS {
-            set.insert(op);
-        }
-        assert_eq!(set.len(), OPERATION_COUNT as usize);
-
-        for op in ALL_OPERATIONS {
-            let mut hasher1 = DefaultHasher::new();
-            op.hash(&mut hasher1);
-            let hash1 = hasher1.finish();
-
-            let mut hasher2 = DefaultHasher::new();
-            op.hash(&mut hasher2);
-            let hash2 = hasher2.finish();
-
-            assert_eq!(hash1, hash2, "{:?} hash is not deterministic", op);
-        }
-    }
-
-    #[test]
-    fn error_value() {
-        let err = InvalidOperation(42);
-        assert_eq!(err.value(), 42);
-    }
-
-    #[test]
-    fn error_range() {
-        let below = InvalidOperation(100);
-        assert!(below.is_below_range());
-        assert!(!below.is_above_range());
-
-        let above = InvalidOperation(200);
-        assert!(!above.is_below_range());
-        assert!(above.is_above_range());
-
-        let just_below = InvalidOperation(OPERATION_MIN - 1);
-        assert!(just_below.is_below_range());
-
-        let just_above = InvalidOperation(OPERATION_MAX + 1);
-        assert!(just_above.is_above_range());
-    }
-
-    #[test]
-    fn error_display() {
-        let err = InvalidOperation(127);
-        let msg = format!("{}", err);
-        assert!(msg.contains("127"));
-        assert!(msg.contains("128"));
-        assert!(msg.contains("145"));
-    }
-
-    #[test]
-    fn error_trait() {
-        fn assert_is_error<T: std::error::Error>() {}
-        assert_is_error::<InvalidOperation>();
-
-        use std::error::Error;
-        let err = InvalidOperation(127);
-        assert!(err.source().is_none());
-    }
-
-    #[test]
-    #[allow(clippy::clone_on_copy)]
-    fn error_clone() {
-        let err1 = InvalidOperation(255);
-        let err2 = err1.clone();
-        assert_eq!(err1, err2);
-    }
-
-    #[test]
-    fn error_debug() {
-        let err = InvalidOperation(99);
-        let debug_str = format!("{:?}", err);
-        assert!(debug_str.contains("99"));
-    }
-
-    #[test]
-    fn fuzz_try_from() {
-        for byte in 0..=255u8 {
-            let result = std::panic::catch_unwind(|| Operation::try_from(byte));
-            assert!(
-                result.is_ok(),
-                "try_from({}) panicked - must handle all bytes gracefully",
-                byte
-            );
-        }
-    }
-
-    #[test]
-    fn fuzz_as_u8() {
-        for op in ALL_OPERATIONS {
-            let result = std::panic::catch_unwind(|| op.as_u8());
-            assert!(result.is_ok(), "{:?}.as_u8() panicked", op);
-        }
-    }
-
-    #[test]
-    fn fuzz_is_valid_discriminant() {
-        for byte in 0..=255u8 {
-            let result = std::panic::catch_unwind(|| Operation::is_valid_discriminant(byte));
-            assert!(result.is_ok());
-        }
-    }
-
-    #[test]
-    fn fuzz_is_deprecated() {
-        for op in ALL_OPERATIONS {
-            let result = std::panic::catch_unwind(|| op.is_deprecated());
-            assert!(result.is_ok(), "{:?}.is_deprecated() panicked", op);
-        }
-    }
-
-    #[test]
-    fn fuzz_is_client_facing() {
-        for op in ALL_OPERATIONS {
-            let result = std::panic::catch_unwind(|| op.is_client_facing());
-            assert!(result.is_ok(), "{:?}.is_client_facing() panicked", op);
-        }
-    }
-
-    #[test]
-    fn fuzz_is_valid_client_request() {
-        for op in ALL_OPERATIONS {
-            let result = std::panic::catch_unwind(|| op.is_valid_client_request());
-            assert!(
-                result.is_ok(),
-                "{:?}.is_valid_client_request() panicked",
-                op
-            );
+        #[test]
+        fn proptest_from_vsr_returns_for_user_range(byte in 128u8..=255) {
+            let op = Operation::from_u8(byte);
+            let result = WideOp::from_vsr(op);
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().0, byte);
         }
     }
 }

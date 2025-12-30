@@ -9,7 +9,7 @@ use core::{mem, slice};
 use crate::{
     constants::{JOURNAL_SLOT_COUNT, VSR_VERSION},
     util::{Pod, Zeroable},
-    vsr::wire::{Checksum128, Command, Operation, checksum, constants, header::Release},
+    vsr::{Checksum128, Command, Operation, Release, checksum, constants},
 };
 
 #[cfg(not(target_endian = "little"))]
@@ -535,7 +535,7 @@ impl core::fmt::Debug for HeaderPrepare {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsr::wire::Operation;
+    use crate::vsr::Operation;
 
     #[test]
     fn test_zeroed() {
@@ -1063,7 +1063,7 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
-    use crate::vsr::wire::Operation;
+    use crate::vsr::Operation;
     use proptest::prelude::*;
 
     fn valid_normal_header_strategy() -> impl Strategy<Value = HeaderPrepare> {

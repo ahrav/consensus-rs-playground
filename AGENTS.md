@@ -4,7 +4,7 @@
 
 - `src/lib.rs`: crate entry point; wires public modules.
 - `src/constants.rs`: protocol constants and compile-time invariants.
-- `src/vsr/wire/`: Viewstamped Replication wire primitives (`Header`, `Command`, `Message`, framing, pools).
+- `src/vsr/`: Viewstamped Replication modules (wire primitives like `Header`, `Command`, `Message`, framing, pools).
 - `src/stdx/`: no-heap data structures (`RingBuffer`, `BitSet`, intrusive `List`/`Queue`).
 - `src/util/`: small helpers (e.g., zero-check utilities).
 - `src/io/`: async I/O backends (`io_uring` on Linux, GCD on macOS) guarded by `cfg(target_os = ...)`.
@@ -39,4 +39,4 @@
 
 - Commit subjects are short and imperative (common prefixes: “Add”, “Fix”, “Refactor”, “Update”, “Remove”); avoid trailing periods.
 - Keep commits focused and atomic; include rationale in the PR description.
-- PRs should note protocol/safety impact (especially under `src/vsr/wire/` and `src/io/`), list how you tested (commands + platform), and ensure CI is green.
+- PRs should note protocol/safety impact (especially under `src/vsr/` and `src/io/`), list how you tested (commands + platform), and ensure CI is green.

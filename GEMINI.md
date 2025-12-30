@@ -10,7 +10,7 @@
 
 *   **`src/lib.rs`**: Library entry point, wiring public modules.
 *   **`src/constants.rs`**: Protocol-wide constants (e.g., sizes, versions) and alignment helpers. Heavily utilizes compile-time assertions (`const _: () = assert!(...)`) to enforce invariants.
-*   **`src/vsr/wire/`**: Defines the wire protocol specifications.
+*   **`src/vsr/`**: Defines VSR modules, including wire protocol specifications.
     *   `header.rs`: Fixed-layout 256-byte `#[repr(C)]` message header with dual checksums.
     *   `command.rs`: Protocol message types with stable `#[repr(u8)]` discriminants.
     *   `checksum.rs`: Deterministic AEGIS-128L MAC implementation.

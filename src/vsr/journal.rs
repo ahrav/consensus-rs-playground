@@ -62,7 +62,7 @@ use crate::vsr::{
         // WAL_HEADER_SIZE,
     },
     storage::{Storage, Synchronicity},
-    // wire::{Command, Operation},
+    // Command, Operation,
 };
 
 /// A write range descriptor with intrusive linked-list support for wait queuing.

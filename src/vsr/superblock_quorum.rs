@@ -1009,8 +1009,8 @@ mod tests {
 
     mod quorums_tests {
         use super::*;
+        use crate::vsr::checksum;
         use crate::vsr::members::Members;
-        use crate::vsr::wire::checksum::checksum;
 
         // =====================================================================
         // Test Helpers

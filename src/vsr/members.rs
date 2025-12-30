@@ -5,7 +5,7 @@
 
 use std::mem;
 
-use crate::{constants, util::Pod, vsr::wire::checksum};
+use crate::{constants, util::Pod, vsr::checksum};
 
 const CLUSTER_CONFIG_FIELD_COUNT: usize = 17;
 
