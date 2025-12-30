@@ -40,13 +40,30 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
+#[allow(dead_code)]
 use core::mem::MaybeUninit;
 use core::ptr;
 
+#[allow(unused_imports)]
+use crate::constants;
 use crate::container_of;
-use crate::vsr::iops::IOPSType;
-use crate::vsr::journal_primitives::Ring;
-use crate::vsr::storage::{Storage, Synchronicity};
+use crate::stdx::BitSet;
+use crate::util::utils::AlignedSlice;
+use crate::vsr::{
+    Header,
+    HeaderPrepare,
+    chunk_tracking::HeaderChunkTracking,
+    iops::IOPSType,
+    journal_primitives::{
+        Ring,
+        SLOT_COUNT,
+        SLOT_COUNT_WORDS,
+        // HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_MESSAGE,
+        // WAL_HEADER_SIZE,
+    },
+    storage::{Storage, Synchronicity},
+    // wire::{Command, Operation},
+};
 
 /// A write range descriptor with intrusive linked-list support for wait queuing.
 ///
@@ -197,36 +214,38 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 /// # Layout
 ///
 /// `#[repr(C)]` is required for `container_of!` to recover `Write` from `Range`.
-///
-/// # Current Limitations
-///
-/// This is a minimal implementation for the range-locking machinery. The full
-/// Journal port will add: message pointer, high-level callback, and additional
-/// metadata.
 #[repr(C)]
 pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
     /// Back-pointer to the owning Journal. Set by `write_sectors`.
     pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
 
     /// Slot index within the log. Used to assert no concurrent writes to same slot.
-    // TODO: This will be replaced with full slot tracking in the complete Journal.
     pub slot_index: u32,
 
     /// The range descriptor containing buffer, offset, and locking state.
     pub range: Range<S, WRITE_OPS, WRITE_OPS_WORDS>,
 }
 
-/// WAL journal skeleton implementing range-locked sector writes.
+const _: () = {
+    assert!(size_of::<HeaderPrepare>() == size_of::<Header>());
+};
+
+/// Journal lifecycle state.
+#[derive(Clone, Copy)]
+pub enum Status<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+    /// Initial state before recovery begins.
+    Init,
+    /// Recovery in progress; callback invoked when complete.
+    Recovering(fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>)),
+    /// Recovery complete; journal is ready for normal operation.
+    Recovered,
+}
+
+/// WAL journal implementing range-locked sector writes.
 ///
 /// The `Journal` coordinates write operations to the Write-Ahead Log, ensuring
 /// that overlapping writes are serialized. It maintains a pool of `Write` objects
 /// and implements the range-locking protocol.
-///
-/// # Current Limitations
-///
-/// This is a partial implementation containing only the range-locking machinery.
-/// The full Journal will include: headers/prepares index arrays, dirty/faulty
-/// bitsets, view change state, and recovery logic.
 ///
 /// # Concurrency
 ///
@@ -240,8 +259,51 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Replica identifier for logging and debugging.
     pub replica: u8,
 
-    /// Pool of write operation descriptors.
+    /// Prepare headers indexed by slot, where `slot == header.op % SLOT_COUNT`.
+    ///
+    /// Each slot's header command is either `prepare` or `reserved`. When a slot
+    /// contains a `reserved` header, the header's `op` equals the slot index.
+    pub headers: AlignedSlice<HeaderPrepare>,
+
+    /// Redundant copy of prepare headers, updated after the corresponding prepare
+    /// is written to disk.
+    ///
+    /// This handles the case where a prepare is written before its header sector
+    /// is flushed, allowing recovery to detect and repair inconsistencies.
+    pub headers_redundant: AlignedSlice<HeaderPrepare>,
+
+    /// Staging buffers for writing header sectors to disk.
+    pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
+
+    /// Tracks which header chunks have been read/written during recovery.
+    pub header_chunk_tracking: HeaderChunkTracking,
+
+    /// Pool of write operation descriptors for the range-locking machinery.
     pub writes: IOPSType<Write<S, WRITE_OPS, WRITE_OPS_WORDS>, WRITE_OPS, WRITE_OPS_WORDS>,
+
+    /// Slots that need to be written to disk or repaired from other replicas.
+    ///
+    /// Similar to a dirty bit in a kernel page cache: indicates the in-memory
+    /// state differs from durable storage.
+    pub dirty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS>,
+
+    /// Slots that are dirty due to corruption, misdirected writes, or sector errors.
+    ///
+    /// A faulty bit always implies the corresponding dirty bit is set. Faulty
+    /// indicates the entry requires repair from another replica, not just a flush.
+    pub faulty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS>,
+
+    /// Checksums of prepare messages, used to respond to `request_prepare` messages.
+    ///
+    /// A checksum may be unavailable when the slot is reserved, being written, or corrupt.
+    /// Check `prepare_inhabited` to determine validity.
+    pub prepare_checksums: Vec<u128>,
+
+    /// Indicates whether each `prepare_checksums` entry contains a valid checksum.
+    pub prepare_inhabited: Vec<bool>,
+
+    /// Current journal state (initializing, recovering, or recovered).
+    pub status: Status<S, WRITE_OPS, WRITE_OPS_WORDS>,
 }
 
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
@@ -254,11 +316,65 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - `storage` must point to a valid `S` that outlives the Journal
     /// - The storage pointer must not be aliased elsewhere during Journal operations
     pub fn new(storage: *mut S, replica: u8) -> Self {
-        Self {
+        let headers = unsafe {
+            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+        };
+        let headers_redundant = unsafe {
+            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+        };
+        let write_headers_sectors = unsafe {
+            AlignedSlice::<[u8; constants::SECTOR_SIZE]>::new_zeroed_aligned(
+                constants::JOURNAL_IOPS_WRITE_MAX as usize,
+                constants::SECTOR_SIZE,
+            )
+        };
+
+        let dirty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS> = BitSet::full();
+        let faulty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS> = BitSet::full();
+
+        let prepare_checksums = vec![0u128; SLOT_COUNT];
+        let prepare_inhabited = vec![false; SLOT_COUNT];
+
+        let mut journal = Self {
             storage,
             replica,
+            headers,
+            headers_redundant,
+            write_headers_sectors,
+            header_chunk_tracking: HeaderChunkTracking::default(),
             writes: IOPSType::default(),
+            dirty,
+            faulty,
+            prepare_checksums,
+            prepare_inhabited,
+            status: Status::Init,
+        };
+
+        unsafe {
+            ptr::write_bytes(
+                journal.headers.as_mut_ptr() as *mut u8,
+                0,
+                SLOT_COUNT * size_of::<HeaderPrepare>(),
+            );
+            ptr::write_bytes(
+                journal.headers_redundant.as_mut_ptr() as *mut u8,
+                0,
+                SLOT_COUNT * size_of::<HeaderPrepare>(),
+            );
         }
+
+        assert!(journal.headers.iter().all(|h| !h.valid_checksum()));
+        assert!(
+            journal
+                .headers_redundant
+                .iter()
+                .all(|h| !h.valid_checksum())
+        );
+
+        journal.prepare_checksums.fill(0);
+        journal.prepare_inhabited.fill(false);
+
+        journal
     }
 
     /// Initiates a sector write operation with range locking.
@@ -1138,13 +1254,128 @@ mod tests {
         assert_eq!(retrieved, &[10, 20, 30, 40]);
     }
 
-    #[test]
-    fn journal_new_initializes_correctly() {
-        let mut storage = MockStorage::new();
-        let journal = TestJournal::new(&mut storage, 5);
+    // =========================================================================
+    // Journal::new Initialization Tests
+    // =========================================================================
 
+    #[test]
+    fn journal_new_initializes_all_fields_correctly() {
+        let mut storage = MockStorage::new();
+        let journal = TestJournal::new(&mut storage, 7);
+
+        // Basic pointer and replica fields
         assert_eq!(journal.storage, &mut storage as *mut _);
-        assert_eq!(journal.replica, 5);
+        assert_eq!(journal.replica, 7);
+
+        // Status should be Init
+        assert!(matches!(journal.status, Status::Init));
+
+        // BitSets should be full (all slots marked dirty/faulty initially)
+        assert!(
+            journal.dirty.is_full(),
+            "dirty BitSet should be full initially"
+        );
+        assert!(
+            journal.faulty.is_full(),
+            "faulty BitSet should be full initially"
+        );
+
+        // Verify dirty/faulty bitsets have correct capacity for all slots
+        assert_eq!(
+            BitSet::<SLOT_COUNT, SLOT_COUNT_WORDS>::capacity(),
+            SLOT_COUNT,
+            "dirty/faulty bitsets should track all journal slots"
+        );
+
+        // Vector lengths and contents - prepare_checksums
+        assert_eq!(
+            journal.prepare_checksums.len(),
+            SLOT_COUNT,
+            "prepare_checksums should have SLOT_COUNT entries"
+        );
+        assert!(
+            journal.prepare_checksums.iter().all(|&c| c == 0),
+            "all prepare_checksums should be zero"
+        );
+
+        // Vector lengths and contents - prepare_inhabited
+        assert_eq!(
+            journal.prepare_inhabited.len(),
+            SLOT_COUNT,
+            "prepare_inhabited should have SLOT_COUNT entries"
+        );
+        assert!(
+            journal.prepare_inhabited.iter().all(|&i| !i),
+            "all prepare_inhabited should be false"
+        );
+
+        // AlignedSlice lengths
+        assert_eq!(
+            journal.headers.len(),
+            SLOT_COUNT,
+            "headers should have SLOT_COUNT entries"
+        );
+        assert_eq!(
+            journal.headers_redundant.len(),
+            SLOT_COUNT,
+            "headers_redundant should have SLOT_COUNT entries"
+        );
+        assert_eq!(
+            journal.write_headers_sectors.len(),
+            constants::JOURNAL_IOPS_WRITE_MAX as usize,
+            "write_headers_sectors should have JOURNAL_IOPS_WRITE_MAX entries"
+        );
+
+        // IOPSType write pool should be empty (all 32 slots available)
+        assert_eq!(
+            journal.writes.available(),
+            32,
+            "writes pool should have all slots available"
+        );
+
+        // HeaderChunkTracking should be in default (not done) state
+        assert!(
+            !journal.header_chunk_tracking.done(),
+            "header_chunk_tracking should not be done initially"
+        );
+    }
+
+    #[test]
+    fn journal_new_headers_have_invalid_checksums() {
+        let mut storage = MockStorage::new();
+        let journal = TestJournal::new(&mut storage, 0);
+
+        // Critical safety invariant: headers must have invalid checksums initially.
+        // This prevents interpreting uninitialized/zeroed data as valid prepares,
+        // which could lead to data corruption during recovery.
+        assert!(
+            journal.headers.iter().all(|h| !h.valid_checksum()),
+            "all headers should have invalid checksums after initialization"
+        );
+        assert!(
+            journal
+                .headers_redundant
+                .iter()
+                .all(|h| !h.valid_checksum()),
+            "all redundant headers should have invalid checksums after initialization"
+        );
+    }
+
+    #[test]
+    fn journal_new_works_with_edge_case_replica_values() {
+        // Test minimum replica value (0)
+        let mut storage_min = MockStorage::new();
+        let journal_min = TestJournal::new(&mut storage_min, 0);
+        assert_eq!(journal_min.replica, 0);
+        assert!(matches!(journal_min.status, Status::Init));
+        assert!(journal_min.dirty.is_full());
+
+        // Test maximum replica value (255)
+        let mut storage_max = MockStorage::new();
+        let journal_max = TestJournal::new(&mut storage_max, 255);
+        assert_eq!(journal_max.replica, 255);
+        assert!(matches!(journal_max.status, Status::Init));
+        assert!(journal_max.faulty.is_full());
     }
 
     #[test]
