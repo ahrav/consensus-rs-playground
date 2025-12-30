@@ -1,54 +1,182 @@
 //! Wire-level VSR command identifiers.
 //!
-//! This enum is parsed from the on-the-wire `Header.command` byte.
-//! Discriminants are stable protocol bytes and MUST NOT change.
+//! This module defines the [`Command`] enum parsed from the on-the-wire
+//! `Header.command` byte. Discriminants are stable protocol bytes and
+//! **must not change** once assigned, as they are serialized directly
+//! to the network.
+//!
+//! The module also provides the [`CommandMarker`] trait for type-safe
+//! association between command types and their specialized headers.
 
+use crate::vsr::{HeaderPrepare, header::ProtoHeader};
+
+/// Associates a command type marker with its wire command and header layout.
+///
+/// This trait enables type-safe message construction by linking a zero-sized
+/// marker type (e.g., [`PrepareCmd`]) to:
+/// - Its [`Command`] discriminant for wire serialization
+/// - Its specialized [`ProtoHeader`] type with command-specific fields
+///
+/// # Implementors
+///
+/// Each VSR message type should have a corresponding marker implementing this
+/// trait. The marker types are used as type parameters to generic message
+/// handling code, ensuring compile-time verification that headers match their
+/// expected commands.
+///
+/// # Example
+///
+/// ```ignore
+/// fn process_message<C: CommandMarker>(msg: &Message<C>) {
+///     assert_eq!(msg.header().command(), C::COMMAND);
+///     // Type-safe access to command-specific header fields
+/// }
+/// ```
+pub trait CommandMarker {
+    /// The wire-level command discriminant for this message type.
+    const COMMAND: Command;
+    /// The header type containing command-specific fields.
+    type Header: ProtoHeader;
+}
+
+/// Marker type for [`Command::Prepare`] messages.
+///
+/// Used as a type parameter to access the associated [`HeaderPrepare`] header
+/// type and [`Command::Prepare`] discriminant via the [`CommandMarker`] trait.
+pub struct PrepareCmd;
+
+impl CommandMarker for PrepareCmd {
+    const COMMAND: Command = Command::Prepare;
+    type Header = HeaderPrepare;
+}
+
+/// VSR protocol command discriminant.
+///
+/// Each variant corresponds to a specific message type in the Viewstamped
+/// Replication protocol. Discriminants are stable wire-protocol values and
+/// **must not be changed** once assigned, as they are serialized directly
+/// to the network.
+///
+/// # Wire Representation
+///
+/// This enum is `#[repr(u8)]`, occupying exactly 1 byte on the wire. Valid
+/// values range from [`MIN`](Self::MIN) (0) to [`MAX`](Self::MAX) (24) inclusive.
+///
+/// # Deprecated Variants
+///
+/// Some discriminant values are reserved for backward compatibility with older
+/// protocol versions. These are named `Deprecated*` and return `true` from
+/// [`is_deprecated`](Self::is_deprecated). Implementations should reject messages
+/// with deprecated commands.
+///
+/// # Command Categories
+///
+/// - **Heartbeat**: [`Ping`](Self::Ping), [`Pong`](Self::Pong),
+///   [`PingClient`](Self::PingClient), [`PongClient`](Self::PongClient)
+/// - **Replication**: [`Request`](Self::Request), [`Prepare`](Self::Prepare),
+///   [`PrepareOk`](Self::PrepareOk), [`Reply`](Self::Reply), [`Commit`](Self::Commit)
+/// - **View change**: [`StartViewChange`](Self::StartViewChange),
+///   [`DoViewChange`](Self::DoViewChange), [`StartView`](Self::StartView)
+/// - **Recovery**: [`RequestStartView`](Self::RequestStartView),
+///   [`RequestHeaders`](Self::RequestHeaders), [`RequestPrepare`](Self::RequestPrepare),
+///   [`RequestReply`](Self::RequestReply), [`Headers`](Self::Headers)
+/// - **Storage**: [`RequestBlocks`](Self::RequestBlocks), [`Block`](Self::Block)
+/// - **Membership**: [`Eviction`](Self::Eviction)
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Command {
+    /// Reserved discriminant (0); indicates an uninitialized or invalid command.
+    ///
+    /// Messages with this command should be rejected.
     Reserved = 0,
 
+    /// Replica-to-replica heartbeat request.
     Ping = 1,
+    /// Replica-to-replica heartbeat response.
     Pong = 2,
 
+    /// Client-to-replica heartbeat request.
     PingClient = 3,
+    /// Replica-to-client heartbeat response.
     PongClient = 4,
 
+    /// Client request to be replicated.
     Request = 5,
+    /// Primary broadcasts a client request to backups for replication.
     Prepare = 6,
+    /// Backup acknowledges receipt of a prepare message.
     PrepareOk = 7,
+    /// Replica response to a client request.
     Reply = 8,
+    /// Primary notifies backups that an operation is committed.
     Commit = 9,
 
+    /// Replica initiates view change due to suspected primary failure.
     StartViewChange = 10,
+    /// Replica sends its log to the new primary during view change.
     DoViewChange = 11,
 
+    /// Deprecated; reserved for protocol backward compatibility.
     Deprecated12 = 12,
 
+    /// Replica requests the current view from another replica.
     RequestStartView = 13,
+    /// Replica requests headers for log entries it is missing.
     RequestHeaders = 14,
+    /// Replica requests a specific prepare message.
     RequestPrepare = 15,
+    /// Replica requests a cached reply for a client request.
     RequestReply = 16,
+    /// Response containing requested log headers.
     Headers = 17,
 
+    /// Primary evicts a misbehaving or unresponsive replica.
     Eviction = 18,
 
+    /// Replica requests storage blocks during recovery.
     RequestBlocks = 19,
+    /// Response containing requested storage blocks.
     Block = 20,
 
+    /// Deprecated; reserved for protocol backward compatibility.
     Deprecated21 = 21,
+    /// Deprecated; reserved for protocol backward compatibility.
     Deprecated22 = 22,
+    /// Deprecated; reserved for protocol backward compatibility.
     Deprecated23 = 23,
 
+    /// New primary broadcasts the authoritative log after view change completes.
     StartView = 24,
 }
 
 impl Command {
+    /// Minimum valid command discriminant (corresponds to [`Reserved`](Self::Reserved)).
     pub const MIN: u8 = 0;
+    /// Maximum valid command discriminant (corresponds to [`StartView`](Self::StartView)).
     pub const MAX: u8 = 24;
+    /// Total number of command variants (25).
+    ///
+    /// Equals `MAX - MIN + 1` and matches `ALL.len()`.
     pub const COUNT: u8 = Self::MAX - Self::MIN + 1;
 
-    /// All command variants in discriminant order (0..=24).
+    /// All command variants in discriminant order.
+    ///
+    /// Indexed by discriminant value: `ALL[cmd.as_u8() as usize] == cmd` for all
+    /// valid commands. This property is verified at compile time.
+    ///
+    /// # Usage
+    ///
+    /// Use this for iteration or O(1) lookup by discriminant:
+    ///
+    /// ```ignore
+    /// // Iterate all commands
+    /// for cmd in Command::ALL {
+    ///     println!("{:?} = {}", cmd, cmd.as_u8());
+    /// }
+    ///
+    /// // O(1) lookup (prefer try_from_u8 for untrusted input)
+    /// let cmd = Command::ALL[6]; // Command::Prepare
+    /// ```
     pub const ALL: [Self; Self::COUNT as usize] = [
         Self::Reserved,
         Self::Ping,
@@ -77,6 +205,7 @@ impl Command {
         Self::StartView,
     ];
 
+    // Compile-time invariant checks
     const _RESERVED: () = assert!(Self::Reserved as u8 == Self::MIN);
     const _START_VIEW: () = assert!(Self::StartView as u8 == Self::MAX);
     const _COUNT: () = assert!(Self::COUNT == 25);
@@ -89,13 +218,19 @@ impl Command {
         }
     };
 
-    /// Raw on-the-wire byte for this command.
+    /// Returns the raw wire byte for this command.
     #[inline]
     pub const fn as_u8(self) -> u8 {
         self as u8
     }
 
-    /// Returns true iff this is a reserved deprecated wire value.
+    /// Returns `true` if this command is deprecated and should not be used.
+    ///
+    /// Deprecated commands are placeholders for discriminants that were used in
+    /// previous protocol versions. They remain in the enum to preserve stable
+    /// discriminant assignments and allow detection of incompatible peers.
+    ///
+    /// Implementations should reject messages with deprecated commands.
     #[inline]
     pub const fn is_deprecated(self) -> bool {
         matches!(
@@ -104,7 +239,13 @@ impl Command {
         )
     }
 
-    /// Fast decoding from a wire byte.
+    /// Decodes a command from its wire byte representation.
+    ///
+    /// Returns `None` for bytes greater than [`MAX`](Self::MAX). Valid bytes
+    /// (0..=24) always succeed, including deprecated commands.
+    ///
+    /// This is an O(1) table lookup. For fallible conversions that return an
+    /// error type, use the [`TryFrom<u8>`] implementation instead.
     #[inline]
     pub fn try_from_u8(b: u8) -> Option<Self> {
         if b <= Self::MAX {
@@ -116,6 +257,8 @@ impl Command {
 }
 
 /// Error returned when converting an invalid byte to a [`Command`].
+///
+/// Contains the invalid byte value that was attempted to be converted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidCommand(pub u8);
 
@@ -130,6 +273,10 @@ impl std::error::Error for InvalidCommand {}
 impl TryFrom<u8> for Command {
     type Error = InvalidCommand;
 
+    /// Converts a byte to a command, returning an error for invalid values.
+    ///
+    /// Valid bytes are `0..=24`. For a non-error-returning version, use
+    /// [`Command::try_from_u8`].
     #[inline]
     fn try_from(b: u8) -> Result<Self, Self::Error> {
         Self::try_from_u8(b).ok_or(InvalidCommand(b))
@@ -137,6 +284,7 @@ impl TryFrom<u8> for Command {
 }
 
 impl From<Command> for u8 {
+    /// Converts a command to its wire byte representation.
     #[inline]
     fn from(cmd: Command) -> Self {
         cmd.as_u8()
