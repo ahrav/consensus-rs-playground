@@ -40,6 +40,7 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
+use core::cmp::min;
 #[allow(dead_code)]
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -52,18 +53,67 @@ use crate::util::utils::AlignedSlice;
 use crate::vsr::{
     Header,
     HeaderPrepare,
-    chunk_tracking::HeaderChunkTracking,
     iops::IOPSType,
     journal_primitives::{
-        Ring,
-        SLOT_COUNT,
-        SLOT_COUNT_WORDS,
-        // HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_MESSAGE,
-        // WAL_HEADER_SIZE,
+        HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_SIZE, Ring, SLOT_COUNT, SLOT_COUNT_WORDS,
+        WAL_HEADER_SIZE,
     },
     storage::{Storage, Synchronicity},
     // Command, Operation,
 };
+
+// Compile-time assertions to verify header chunk constant relationships.
+const _: () = {
+    // HEADERS_SIZE must be sector-aligned for I/O.
+    assert!(HEADERS_SIZE.is_multiple_of(constants::SECTOR_SIZE as u64));
+    // HEADERS_SIZE must be a multiple of header size for correct slicing.
+    assert!(HEADERS_SIZE.is_multiple_of(WAL_HEADER_SIZE as u64));
+    // MESSAGE_SIZE_MAX must be a multiple of header size.
+    assert!(constants::MESSAGE_SIZE_MAX.is_multiple_of(WAL_HEADER_SIZE as u32));
+    // MESSAGE_SIZE_MAX must be sector-aligned.
+    assert!((constants::MESSAGE_SIZE_MAX as usize).is_multiple_of(constants::SECTOR_SIZE));
+};
+
+/// Bitset tracking header chunk state. `HEADER_CHUNK_WORDS` is the number of `u64`s
+/// needed to store `HEADER_CHUNK_COUNT` bits.
+pub type HeaderChunks = BitSet<HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS>;
+
+/// Descriptor for a header chunk read request.
+///
+/// Returned by [`Journal::header_chunk_next_to_request`] to specify what to read.
+/// The caller issues the I/O and calls [`Journal::header_chunk_mark_recovered`]
+/// with the `index` on completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderChunk {
+    /// Chunk index in `[0, HEADER_CHUNK_COUNT)`.
+    pub index: usize,
+    /// Byte offset within the header region.
+    pub offset: u64,
+    /// Bytes to read (at most `MESSAGE_SIZE_MAX`).
+    pub len: usize,
+}
+
+impl HeaderChunk {
+    #[inline]
+    pub fn end(self) -> u64 {
+        self.offset + self.len as u64
+    }
+
+    #[inline]
+    pub fn assert_invariants(&self) {
+        assert!(self.index < HEADER_CHUNK_COUNT);
+        assert!(self.len > 0);
+        assert!(self.len <= constants::MESSAGE_SIZE_MAX as usize);
+
+        assert!(self.offset < HEADERS_SIZE);
+        assert!(self.end() <= HEADERS_SIZE);
+
+        assert!(self.offset.is_multiple_of(constants::SECTOR_SIZE as u64));
+        assert!(self.len.is_multiple_of(constants::SECTOR_SIZE));
+
+        assert!(self.len.is_multiple_of(WAL_HEADER_SIZE));
+    }
+}
 
 /// A write range descriptor with intrusive linked-list support for wait queuing.
 ///
@@ -275,8 +325,11 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
 
-    /// Tracks which header chunks have been read/written during recovery.
-    pub header_chunk_tracking: HeaderChunkTracking,
+    /// Chunks with outstanding or completed read requests.
+    pub header_chunks_requested: HeaderChunks,
+
+    /// Chunks whose reads have completed and data copied.
+    pub header_chunks_recovered: HeaderChunks,
 
     /// Pool of write operation descriptors for the range-locking machinery.
     pub writes: IOPSType<Write<S, WRITE_OPS, WRITE_OPS_WORDS>, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -341,7 +394,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             headers,
             headers_redundant,
             write_headers_sectors,
-            header_chunk_tracking: HeaderChunkTracking::default(),
+            header_chunks_requested: HeaderChunks::empty(),
+            header_chunks_recovered: HeaderChunks::empty(),
             writes: IOPSType::default(),
             dirty,
             faulty,
@@ -375,6 +429,155 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         journal.prepare_inhabited.fill(false);
 
         journal
+    }
+
+    // ---------------------------------------------------------------------
+    // Header chunk tracking (recovery)
+    // ---------------------------------------------------------------------
+
+    #[inline]
+    pub fn header_chunks_reset(&mut self) {
+        self.header_chunks_recovered = HeaderChunks::empty();
+        self.header_chunks_requested = HeaderChunks::empty();
+        self.header_chunks_assert_invariants();
+    }
+
+    #[inline]
+    pub fn header_chunks_done(&self) -> bool {
+        self.header_chunks_recovered.is_full()
+    }
+
+    /// Returns the byte offset for a given chunk index.
+    ///
+    /// Chunks are `MESSAGE_SIZE_MAX`-sized, so offset = index * MESSAGE_SIZE_MAX.
+    #[inline]
+    pub fn header_chunk_offset(chunk_index: usize) -> u64 {
+        assert!(chunk_index < HEADER_CHUNK_COUNT);
+        (chunk_index as u64)
+            .checked_mul(constants::MESSAGE_SIZE_MAX as u64)
+            .expect("chunk_offset overflow")
+    }
+
+    /// Returns the chunk length for a given offset.
+    ///
+    /// Returns `MESSAGE_SIZE_MAX` for all chunks except possibly the last,
+    /// which may be smaller if `HEADERS_SIZE` isn't evenly divisible.
+    #[inline]
+    pub fn header_chunk_len_for_offset(offset: u64) -> usize {
+        assert!(offset < HEADERS_SIZE);
+
+        let remaining = HEADERS_SIZE
+            .checked_sub(offset)
+            .expect("HEADER_SIZE - offset underflow");
+        let max_u64 = min(constants::MESSAGE_SIZE_MAX as u64, remaining);
+
+        assert!(max_u64 <= usize::MAX as u64);
+        let max = max_u64 as usize;
+
+        assert!(max > 0);
+        assert!(max.is_multiple_of(constants::SECTOR_SIZE));
+        assert!(max.is_multiple_of(WAL_HEADER_SIZE));
+
+        max
+    }
+
+    /// Returns the next chunk to read, marking it as requested.
+    ///
+    /// Returns `None` in two cases:
+    /// - All chunks recovered (done)
+    /// - All chunks requested but some not yet recovered (waiting for I/O)
+    #[inline]
+    pub fn header_chunk_next_to_request(&mut self) -> Option<HeaderChunk> {
+        self.header_chunks_assert_invariants();
+
+        if self.header_chunks_recovered.is_full() {
+            assert!(self.header_chunks_requested.is_full());
+            return None;
+        }
+
+        let Some(chunk_index) = self.header_chunks_requested.first_unset() else {
+            // All reads have been issued; waiting for completions.
+            return None;
+        };
+
+        assert!(!self.header_chunks_requested.is_set(chunk_index));
+        self.header_chunks_requested.set(chunk_index);
+
+        let offset = Self::header_chunk_offset(chunk_index);
+        assert!(offset < HEADERS_SIZE);
+
+        let len = Self::header_chunk_len_for_offset(offset);
+        let chunk = HeaderChunk {
+            index: chunk_index,
+            offset,
+            len,
+        };
+        chunk.assert_invariants();
+
+        self.header_chunks_assert_invariants();
+        Some(chunk)
+    }
+
+    /// Marks a chunk as recovered after its read completes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk was not previously requested or was already recovered.
+    #[inline]
+    pub fn header_chunk_mark_recovered(&mut self, chunk_index: usize) {
+        self.header_chunks_assert_invariants();
+
+        assert!(chunk_index < HEADER_CHUNK_COUNT);
+        assert!(self.header_chunks_requested.is_set(chunk_index));
+        assert!(!self.header_chunks_recovered.is_set(chunk_index));
+
+        self.header_chunks_recovered.set(chunk_index);
+        self.header_chunks_assert_invariants();
+    }
+
+    #[inline]
+    fn header_chunks_assert_invariants(&self) {
+        assert!(self.header_chunks_recovered.count() <= self.header_chunks_requested.count());
+        assert!(
+            self.header_chunks_recovered
+                .is_subset(&self.header_chunks_requested)
+        );
+        if self.header_chunks_recovered.is_full() {
+            assert!(self.header_chunks_requested.is_full());
+        }
+    }
+
+    /// Reinterprets a byte slice as a slice of headers.
+    ///
+    /// # Safety
+    ///
+    /// This is safe because:
+    /// - `HeaderPrepare` is `#[repr(C)]` with fixed `WAL_HEADER_SIZE` layout
+    /// - Alignment is verified at runtime before the cast
+    /// - Returned slice lifetime is tied to input slice
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `chunk_bytes.len()` is not a positive multiple of `WAL_HEADER_SIZE`
+    /// - `chunk_bytes` is not properly aligned for `HeaderPrepare`
+    #[inline]
+    pub fn header_chunk_bytes_as_headers(chunk_bytes: &[u8]) -> &[HeaderPrepare] {
+        assert!(chunk_bytes.len() >= WAL_HEADER_SIZE);
+        assert!(chunk_bytes.len().is_multiple_of(WAL_HEADER_SIZE));
+
+        // HeaderPrepare requires specific alignment (typically 16-byte).
+        const REQUIRED_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
+        assert!(
+            (chunk_bytes.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN),
+            "chunk_bytes must be {}-byte aligned for HeaderPrepare",
+            REQUIRED_ALIGN
+        );
+
+        let count = chunk_bytes.len() / WAL_HEADER_SIZE;
+        let headers = chunk_bytes.as_ptr() as *const HeaderPrepare;
+        // SAFETY: Length and alignment are verified by assertions above.
+        unsafe { std::slice::from_raw_parts(headers, count) }
     }
 
     /// Initiates a sector write operation with range locking.
@@ -554,892 +757,4 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::vsr::superblock;
-    use core::cell::RefCell;
-
-    // =========================================================================
-    // Test Infrastructure: MockStorage
-    // =========================================================================
-
-    /// Zone identifier for mock storage.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Zone {
-        SuperBlock,
-        WalHeaders,
-        WalPrepares,
-    }
-
-    /// Completion token for mock write operations.
-    /// The actual contents don't matter - we just need it to exist for container_of!
-    #[repr(C)]
-    struct MockWriteCompletion {
-        /// Callback to invoke on completion.
-        callback: fn(&mut MockWriteCompletion),
-    }
-
-    /// Record of a single write operation for verification.
-    #[derive(Debug, Clone)]
-    #[allow(dead_code)] // Fields used for future verification extensions.
-    struct WriteRecord {
-        zone: Zone,
-        offset: u64,
-        len: usize,
-    }
-
-    /// Mock storage implementation for deterministic testing.
-    ///
-    /// The `ASYNC` const generic controls the synchronicity model:
-    /// - `false`: AlwaysSynchronous (callbacks invoked immediately)
-    /// - `true`: AlwaysAsynchronous (callbacks deferred until `drain_callbacks`)
-    struct MockStorage<const ASYNC: bool> {
-        /// Log of all writes submitted to storage.
-        write_log: RefCell<Vec<WriteRecord>>,
-        /// Pending callbacks to invoke (for deferred mode).
-        pending_callbacks: RefCell<Vec<*mut MockWriteCompletion>>,
-    }
-
-    impl<const ASYNC: bool> MockStorage<ASYNC> {
-        /// Creates a new mock storage.
-        fn new() -> Self {
-            Self {
-                write_log: RefCell::new(Vec::new()),
-                pending_callbacks: RefCell::new(Vec::new()),
-            }
-        }
-
-        fn write_count(&self) -> usize {
-            self.write_log.borrow().len()
-        }
-
-        /// Invokes all pending callbacks in order.
-        #[allow(dead_code)] // Useful for future tests needing explicit completion control.
-        fn drain_callbacks(&self) {
-            let callbacks: Vec<_> = self.pending_callbacks.borrow_mut().drain(..).collect();
-            for write_ptr in callbacks {
-                // SAFETY: The pointer was stored from a valid &mut reference in write_sectors.
-                // The write completion structure is still alive (caller ensures lifetime).
-                unsafe {
-                    let write = &mut *write_ptr;
-                    (write.callback)(write);
-                }
-            }
-        }
-    }
-
-    impl<const ASYNC: bool> Storage for MockStorage<ASYNC> {
-        type Read = ();
-        type Write = MockWriteCompletion;
-        type Zone = Zone;
-
-        // We invoke callbacks (either immediately or deferred), so declare as Async.
-        // The assertion expects !locked after write_sectors returns.
-        const SYNCHRONICITY: Synchronicity = if ASYNC {
-            Synchronicity::AlwaysAsynchronous
-        } else {
-            Synchronicity::AlwaysSynchronous
-        };
-        const SUPERBLOCK_ZONE: Self::Zone = Zone::SuperBlock;
-        const WAL_HEADERS_ZONE: Self::Zone = Zone::WalHeaders;
-        const WAL_PREPARES_ZONE: Self::Zone = Zone::WalPrepares;
-
-        fn read_sectors(
-            &mut self,
-            _callback: fn(&mut Self::Read),
-            _read: &mut Self::Read,
-            _buffer: &mut [u8],
-            _zone: Self::Zone,
-            _offset: u64,
-        ) {
-            unimplemented!("read not used in journal tests")
-        }
-
-        fn write_sectors(
-            &mut self,
-            callback: fn(&mut Self::Write),
-            write: &mut Self::Write,
-            buffer: &[u8],
-            zone: Self::Zone,
-            offset: u64,
-        ) {
-            // Record the write operation.
-            self.write_log.borrow_mut().push(WriteRecord {
-                zone,
-                offset,
-                len: buffer.len(),
-            });
-
-            // Store callback for invocation.
-            write.callback = callback;
-
-            if ASYNC {
-                // Store for later invocation.
-                self.pending_callbacks.borrow_mut().push(write as *mut _);
-            } else {
-                // Immediately invoke callback.
-                (write.callback)(write);
-            }
-        }
-
-        unsafe fn context_from_read(_: &mut Self::Read) -> &mut superblock::Context<Self> {
-            unimplemented!("context_from_read not used in journal tests")
-        }
-
-        unsafe fn context_from_write(_: &mut Self::Write) -> &mut superblock::Context<Self> {
-            unimplemented!("context_from_write not used in journal tests")
-        }
-    }
-
-    // Type aliases for test convenience.
-    type TestMockStorage = MockStorage<false>;
-    type TestWrite = Write<TestMockStorage, 32, 1>;
-    type TestRange = Range<TestMockStorage, 32, 1>;
-    type TestJournal = Journal<TestMockStorage, 32, 1>;
-
-    /// Dummy callback for tests that don't need callback verification.
-    fn dummy_callback(_: *mut TestWrite) {}
-    fn dummy_callback_async(_: *mut Write<MockStorage<true>, 32, 1>) {}
-
-    // =========================================================================
-    // Range Overlap Detection (Property Tests)
-    // =========================================================================
-
-    mod overlap_properties {
-        use super::*;
-        use proptest::prelude::*;
-
-        /// Generates a valid Ring value for property tests.
-        fn ring_strategy() -> impl Strategy<Value = Ring> {
-            prop_oneof![Just(Ring::Headers), Just(Ring::Prepares)]
-        }
-
-        proptest! {
-            /// A range always overlaps with itself (reflexivity).
-            #[test]
-            fn overlaps_is_reflexive(
-                ring in ring_strategy(),
-                offset in 0u64..1_000_000,
-                len in 1usize..10_000
-            ) {
-                let buffer = vec![0u8; len];
-                let range = TestRange::new(dummy_callback, &buffer, ring, offset);
-                prop_assert!(range.overlaps(&range), "Range must overlap with itself");
-            }
-
-            /// If A overlaps B, then B overlaps A (symmetry).
-            #[test]
-            fn overlaps_is_symmetric(
-                ring in ring_strategy(),
-                offset_a in 0u64..1_000_000,
-                len_a in 1usize..10_000,
-                offset_b in 0u64..1_000_000,
-                len_b in 1usize..10_000
-            ) {
-                let buf_a = vec![0u8; len_a];
-                let buf_b = vec![0u8; len_b];
-                let range_a = TestRange::new(dummy_callback, &buf_a, ring, offset_a);
-                let range_b = TestRange::new(dummy_callback, &buf_b, ring, offset_b);
-
-                prop_assert_eq!(
-                    range_a.overlaps(&range_b),
-                    range_b.overlaps(&range_a),
-                    "Overlap detection must be symmetric"
-                );
-            }
-
-            /// Different rings never overlap regardless of offset/length.
-            #[test]
-            fn different_rings_never_overlap(
-                offset_a in 0u64..1_000_000,
-                len_a in 1usize..10_000,
-                offset_b in 0u64..1_000_000,
-                len_b in 1usize..10_000
-            ) {
-                let buf_a = vec![0u8; len_a];
-                let buf_b = vec![0u8; len_b];
-                let headers = TestRange::new(dummy_callback, &buf_a, Ring::Headers, offset_a);
-                let prepares = TestRange::new(dummy_callback, &buf_b, Ring::Prepares, offset_b);
-
-                prop_assert!(!headers.overlaps(&prepares), "Headers and Prepares must never overlap");
-                prop_assert!(!prepares.overlaps(&headers), "Prepares and Headers must never overlap");
-            }
-
-            /// Adjacent ranges [a, a+len) and [a+len, ...) do not overlap.
-            #[test]
-            fn adjacent_ranges_do_not_overlap(
-                ring in ring_strategy(),
-                offset in 0u64..1_000_000,
-                len_a in 1usize..10_000,
-                len_b in 1usize..10_000
-            ) {
-                let buf_a = vec![0u8; len_a];
-                let buf_b = vec![0u8; len_b];
-                let range_a = TestRange::new(dummy_callback, &buf_a, ring, offset);
-                let range_b = TestRange::new(dummy_callback, &buf_b, ring, offset + len_a as u64);
-
-                prop_assert!(!range_a.overlaps(&range_b), "Adjacent ranges must not overlap");
-                prop_assert!(!range_b.overlaps(&range_a), "Adjacent ranges must not overlap (symmetric)");
-            }
-
-            /// Ranges with partial overlap are correctly detected.
-            #[test]
-            fn partial_overlap_detected(
-                ring in ring_strategy(),
-                offset_a in 0u64..1_000_000,
-                len_a in 100usize..10_000,
-                overlap_pct in 1usize..99
-            ) {
-                let buf_a = vec![0u8; len_a];
-                let overlap_bytes = (len_a * overlap_pct) / 100;
-                prop_assume!(overlap_bytes > 0);
-                let offset_b = offset_a + (len_a - overlap_bytes) as u64;
-                let buf_b = vec![0u8; len_a];
-
-                let range_a = TestRange::new(dummy_callback, &buf_a, ring, offset_a);
-                let range_b = TestRange::new(dummy_callback, &buf_b, ring, offset_b);
-
-                prop_assert!(range_a.overlaps(&range_b), "Partial overlap must be detected");
-            }
-
-            /// If B is completely contained within A, they overlap.
-            #[test]
-            fn complete_containment_is_overlap(
-                ring in ring_strategy(),
-                outer_offset in 0u64..1_000_000,
-                outer_len in 1000usize..10_000,
-                inner_start_delta in 0usize..400,
-                inner_len in 1usize..400
-            ) {
-                prop_assume!(inner_start_delta + inner_len < outer_len);
-
-                let buf_outer = vec![0u8; outer_len];
-                let buf_inner = vec![0u8; inner_len];
-                let outer = TestRange::new(dummy_callback, &buf_outer, ring, outer_offset);
-                let inner = TestRange::new(
-                    dummy_callback,
-                    &buf_inner,
-                    ring,
-                    outer_offset + inner_start_delta as u64
-                );
-
-                prop_assert!(outer.overlaps(&inner), "Outer must overlap inner");
-                prop_assert!(inner.overlaps(&outer), "Inner must overlap outer");
-            }
-
-            /// Ranges near u64::MAX do not wrap and false-detect overlap with low offsets.
-            #[test]
-            fn high_offset_does_not_wrap(
-                ring in ring_strategy(),
-                len in 1usize..65536,
-                low_offset in 0u64..1_000_000
-            ) {
-                // Place a range near MAX such that offset + len would overflow without saturation.
-                let high_offset = u64::MAX - (len as u64 / 2);
-                let buf_high = vec![0u8; len];
-                let buf_low = vec![0u8; len];
-
-                let high_range = TestRange::new(dummy_callback, &buf_high, ring, high_offset);
-                let low_range = TestRange::new(dummy_callback, &buf_low, ring, low_offset);
-
-                // These ranges are at opposite ends of the address space; they must not overlap.
-                prop_assert!(!high_range.overlaps(&low_range), "High range must not wrap to overlap low");
-                prop_assert!(!low_range.overlaps(&high_range), "Low range must not overlap high");
-            }
-        }
-    }
-
-    // =========================================================================
-    // Locking Protocol (Unit Tests)
-    // =========================================================================
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn panics_on_overlapping_different_offset() {
-        // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::<true>::new();
-        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        // write1: [0, 8192), write2: [4096, 8192) - overlaps but different offset.
-        let buf1 = vec![1u8; 8192];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-
-            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
-            // write1 is now locked (callback deferred).
-            // This overlaps [0, 8192) but starts at 4096 - should panic.
-            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 4096);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn panics_on_overlapping_different_length() {
-        // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::<true>::new();
-        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        // Same offset but different length.
-        let buf1 = vec![1u8; 8192];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-
-            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
-            // write1 is now locked (callback deferred).
-            // Same offset (0) but different length - should panic.
-            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 0);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn panics_on_overlapping_prepares() {
-        // Use deferred callbacks so write1 stays locked when write2 is submitted.
-        let mut storage = MockStorage::<true>::new();
-        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        let buf1 = vec![1u8; 4096];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-
-            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Prepares, 0);
-            // write1 is now locked (callback deferred).
-            // Prepares writes must never overlap - should panic.
-            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Prepares, 0);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn panics_on_duplicate_slot_index() {
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        // Non-overlapping ranges but same slot index.
-        let buf1 = vec![1u8; 4096];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 42;
-            (*write2).slot_index = 42; // Same slot - should panic.
-
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
-        }
-    }
-
-    // =========================================================================
-    // Completion & Drain Logic (Unit Tests)
-    // =========================================================================
-
-    #[test]
-    fn completion_clears_wait_list() {
-        // Verify that after completion, the wait list is detached.
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        let buf1 = vec![1u8; 4096];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 0);
-
-            // After synchronous completion, next pointers should be null.
-            assert!(
-                (*write1).range.next.is_null(),
-                "Wait list should be cleared"
-            );
-            assert!(
-                (*write2).range.next.is_null(),
-                "Waiter's next should be cleared"
-            );
-        }
-    }
-
-    /// Verifies that overlapping writes queue and defer until the first completes.
-    #[test]
-    fn async_overlap_queuing_defers_until_completion() {
-        // Use async storage so callbacks are deferred.
-        let mut storage = MockStorage::<true>::new();
-        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-
-        let buf1 = vec![1u8; 4096];
-        let buf2 = vec![2u8; 4096];
-
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-
-            // Submit first write - becomes locked.
-            journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
-            assert!((*write1).range.locked, "First write should be locked");
-
-            // Submit second write at SAME offset - should queue, not submit.
-            journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 0);
-            assert!(
-                !(*write2).range.locked,
-                "Second write should be queued, not locked"
-            );
-
-            // First write should have second in its wait list.
-            assert!(
-                !(*write1).range.next.is_null(),
-                "First write should have waiter"
-            );
-
-            // Only 1 I/O should have been submitted so far.
-            assert_eq!(
-                storage.write_count(),
-                1,
-                "Only first write should be submitted"
-            );
-
-            // Complete first write - this dequeues and submits second.
-            storage.drain_callbacks();
-
-            // Second write is now in-flight (submitted when first completed).
-            assert_eq!(
-                storage.write_count(),
-                2,
-                "Second write should now be submitted"
-            );
-            assert!(!(*write1).range.locked, "First write should be unlocked");
-            assert!(
-                (*write2).range.locked,
-                "Second write should now be locked (in-flight)"
-            );
-
-            // Complete second write.
-            storage.drain_callbacks();
-
-            // Now both should be complete.
-            assert!(!(*write2).range.locked, "Second write should be unlocked");
-        }
-    }
-
-    // =========================================================================
-    // Integration Properties (Property Tests)
-    // =========================================================================
-
-    mod integration_properties {
-        use super::*;
-        use proptest::prelude::*;
-
-        proptest! {
-            /// N non-overlapping writes all complete successfully.
-            #[test]
-            fn all_non_overlapping_writes_complete(
-                write_count in 2usize..20
-            ) {
-                let mut storage = MockStorage::new();
-                let mut journal = TestJournal::new(&mut storage, 0);
-
-                let mut writes = Vec::new();
-                let mut buffers = Vec::new();
-
-                for i in 0..write_count {
-                    let write = journal.writes.acquire().unwrap();
-                    // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                    unsafe { (*write).slot_index = i as u32; }
-                    let buf = vec![i as u8; 4096];
-                    buffers.push(buf);
-                    writes.push(write);
-                }
-
-                for (i, write) in writes.iter().enumerate() {
-                    unsafe {
-                        journal.write_sectors(
-                            *write,
-                            dummy_callback,
-                            &buffers[i],
-                            Ring::Headers,
-                            (i * 8192) as u64
-                        );
-                    }
-                }
-
-                // All should complete.
-                prop_assert_eq!(storage.write_count(), write_count);
-            }
-
-            /// N exact overlapping writes serialize to N sequential I/Os.
-            #[test]
-            fn exact_overlaps_serialize_correctly(
-                overlap_count in 2usize..10
-            ) {
-                let mut storage = MockStorage::new();
-                let mut journal = TestJournal::new(&mut storage, 0);
-
-                let mut writes = Vec::new();
-                let mut buffers = Vec::new();
-
-                // All same offset/length.
-                for i in 0..overlap_count {
-                    let write = journal.writes.acquire().unwrap();
-                    // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                    unsafe { (*write).slot_index = i as u32; }
-                    let buf = vec![i as u8; 4096];
-                    buffers.push(buf);
-                    writes.push(write);
-                }
-
-                for (i, write) in writes.iter().enumerate() {
-                    unsafe {
-                        journal.write_sectors(
-                            *write,
-                            dummy_callback,
-                            &buffers[i],
-                            Ring::Headers,
-                            0 // All same offset
-                        );
-                    }
-                }
-
-                // All completed in sequence.
-                prop_assert_eq!(storage.write_count(), overlap_count);
-            }
-        }
-    }
-
-    // =========================================================================
-    // Callback Safety (Unit Tests)
-    // =========================================================================
-
-    #[test]
-    fn container_of_recovers_correct_write() {
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        let write = journal.writes.acquire().unwrap();
-        let buf = vec![1u8; 4096];
-
-        fn verifying_callback(w: *mut TestWrite) {
-            // This callback receives the correct write pointer.
-            assert!(!w.is_null(), "Callback should receive valid write pointer");
-        }
-
-        unsafe {
-            (*write).slot_index = 1;
-            journal.write_sectors(write, verifying_callback, &buf, Ring::Headers, 0);
-        }
-
-        // If we got here without panic, container_of worked correctly.
-        assert_eq!(storage.write_count(), 1);
-    }
-
-    // =========================================================================
-    // Edge Cases (Unit Tests)
-    // =========================================================================
-
-    #[test]
-    fn write_pool_exhaustion() {
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        // Acquire all 32 slots (WRITE_OPS = 32).
-        let mut writes = Vec::new();
-        for _ in 0..32 {
-            writes.push(journal.writes.acquire().unwrap());
-        }
-
-        // Next acquire should fail.
-        assert!(
-            journal.writes.acquire().is_none(),
-            "Pool should be exhausted"
-        );
-
-        // Release one and acquire again should work.
-        journal.writes.release(writes.pop().unwrap());
-        assert!(
-            journal.writes.acquire().is_some(),
-            "Should be able to acquire after release"
-        );
-    }
-
-    /// Regression test for UB: batch acquire then submit pattern.
-    #[test]
-    fn batch_acquire_then_submit_is_safe() {
-        let mut storage = MockStorage::new();
-        let mut journal = TestJournal::new(&mut storage, 0);
-
-        // Acquire multiple writes first (all have unsubmitted ranges).
-        let write1 = journal.writes.acquire().unwrap();
-        let write2 = journal.writes.acquire().unwrap();
-        let write3 = journal.writes.acquire().unwrap();
-
-        // Set slot indices (required by caller contract).
-        unsafe {
-            (*write1).slot_index = 1;
-            (*write2).slot_index = 2;
-            (*write3).slot_index = 3;
-        }
-
-        // Submit only the first write. lock_sectors will iterate write2 and write3,
-        // reading their range.locked fields. With zero-initialization, this is safe.
-        let buf1 = vec![1u8; 4096];
-        unsafe {
-            journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
-        }
-
-        // Submit the remaining writes.
-        let buf2 = vec![2u8; 4096];
-        let buf3 = vec![3u8; 4096];
-        unsafe {
-            journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
-            journal.write_sectors(write3, dummy_callback, &buf3, Ring::Headers, 16384);
-        }
-
-        // All writes should complete successfully.
-        assert_eq!(storage.write_count(), 3);
-    }
-
-    #[test]
-    #[should_panic(expected = "assertion failed")]
-    fn zero_length_buffer_panics() {
-        let buf: [u8; 0] = [];
-        let range = TestRange::new(dummy_callback, &buf, Ring::Headers, 0);
-        let _ = range.buffer(); // Should panic.
-    }
-
-    #[test]
-    fn range_new_stores_buffer_correctly() {
-        let buf = vec![1u8, 2, 3, 4, 5];
-        let range = TestRange::new(dummy_callback, &buf, Ring::Headers, 100);
-
-        assert_eq!(range.buffer_ptr, buf.as_ptr());
-        assert_eq!(range.buffer_len, 5);
-        assert_eq!(range.ring, Ring::Headers);
-        assert_eq!(range.offset, 100);
-        assert!(!range.locked);
-        assert!(range.next.is_null());
-    }
-
-    #[test]
-    fn range_buffer_returns_correct_slice() {
-        let buf = vec![10u8, 20, 30, 40];
-        let range = TestRange::new(dummy_callback, &buf, Ring::Prepares, 0);
-
-        let retrieved = range.buffer();
-        assert_eq!(retrieved, &[10, 20, 30, 40]);
-    }
-
-    // =========================================================================
-    // Journal::new Initialization Tests
-    // =========================================================================
-
-    #[test]
-    fn journal_new_initializes_all_fields_correctly() {
-        let mut storage = MockStorage::new();
-        let journal = TestJournal::new(&mut storage, 7);
-
-        // Basic pointer and replica fields
-        assert_eq!(journal.storage, &mut storage as *mut _);
-        assert_eq!(journal.replica, 7);
-
-        // Status should be Init
-        assert!(matches!(journal.status, Status::Init));
-
-        // BitSets should be full (all slots marked dirty/faulty initially)
-        assert!(
-            journal.dirty.is_full(),
-            "dirty BitSet should be full initially"
-        );
-        assert!(
-            journal.faulty.is_full(),
-            "faulty BitSet should be full initially"
-        );
-
-        // Verify dirty/faulty bitsets have correct capacity for all slots
-        assert_eq!(
-            BitSet::<SLOT_COUNT, SLOT_COUNT_WORDS>::capacity(),
-            SLOT_COUNT,
-            "dirty/faulty bitsets should track all journal slots"
-        );
-
-        // Vector lengths and contents - prepare_checksums
-        assert_eq!(
-            journal.prepare_checksums.len(),
-            SLOT_COUNT,
-            "prepare_checksums should have SLOT_COUNT entries"
-        );
-        assert!(
-            journal.prepare_checksums.iter().all(|&c| c == 0),
-            "all prepare_checksums should be zero"
-        );
-
-        // Vector lengths and contents - prepare_inhabited
-        assert_eq!(
-            journal.prepare_inhabited.len(),
-            SLOT_COUNT,
-            "prepare_inhabited should have SLOT_COUNT entries"
-        );
-        assert!(
-            journal.prepare_inhabited.iter().all(|&i| !i),
-            "all prepare_inhabited should be false"
-        );
-
-        // AlignedSlice lengths
-        assert_eq!(
-            journal.headers.len(),
-            SLOT_COUNT,
-            "headers should have SLOT_COUNT entries"
-        );
-        assert_eq!(
-            journal.headers_redundant.len(),
-            SLOT_COUNT,
-            "headers_redundant should have SLOT_COUNT entries"
-        );
-        assert_eq!(
-            journal.write_headers_sectors.len(),
-            constants::JOURNAL_IOPS_WRITE_MAX as usize,
-            "write_headers_sectors should have JOURNAL_IOPS_WRITE_MAX entries"
-        );
-
-        // IOPSType write pool should be empty (all 32 slots available)
-        assert_eq!(
-            journal.writes.available(),
-            32,
-            "writes pool should have all slots available"
-        );
-
-        // HeaderChunkTracking should be in default (not done) state
-        assert!(
-            !journal.header_chunk_tracking.done(),
-            "header_chunk_tracking should not be done initially"
-        );
-    }
-
-    #[test]
-    fn journal_new_headers_have_invalid_checksums() {
-        let mut storage = MockStorage::new();
-        let journal = TestJournal::new(&mut storage, 0);
-
-        // Critical safety invariant: headers must have invalid checksums initially.
-        // This prevents interpreting uninitialized/zeroed data as valid prepares,
-        // which could lead to data corruption during recovery.
-        assert!(
-            journal.headers.iter().all(|h| !h.valid_checksum()),
-            "all headers should have invalid checksums after initialization"
-        );
-        assert!(
-            journal
-                .headers_redundant
-                .iter()
-                .all(|h| !h.valid_checksum()),
-            "all redundant headers should have invalid checksums after initialization"
-        );
-    }
-
-    #[test]
-    fn journal_new_works_with_edge_case_replica_values() {
-        // Test minimum replica value (0)
-        let mut storage_min = MockStorage::new();
-        let journal_min = TestJournal::new(&mut storage_min, 0);
-        assert_eq!(journal_min.replica, 0);
-        assert!(matches!(journal_min.status, Status::Init));
-        assert!(journal_min.dirty.is_full());
-
-        // Test maximum replica value (255)
-        let mut storage_max = MockStorage::new();
-        let journal_max = TestJournal::new(&mut storage_max, 255);
-        assert_eq!(journal_max.replica, 255);
-        assert!(matches!(journal_max.status, Status::Init));
-        assert!(journal_max.faulty.is_full());
-    }
-
-    #[test]
-    fn async_writes_complete_correctly() {
-        let mut storage = MockStorage::<true>::new();
-        let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-
-        let write = journal.writes.acquire().unwrap();
-        let buf = vec![1u8; 4096];
-
-        unsafe {
-            (*write).slot_index = 1;
-            journal.write_sectors(write, dummy_callback_async, &buf, Ring::Headers, 0);
-
-            // Should be locked (Async).
-            assert!((*write).range.locked);
-            assert_eq!(storage.pending_callbacks.borrow().len(), 1);
-
-            storage.drain_callbacks();
-
-            // Should be unlocked.
-            assert!(!(*write).range.locked);
-        }
-
-        assert_eq!(storage.write_count(), 1);
-    }
-
-    #[test]
-    fn synchronous_callback_can_release_write() {
-        let mut storage = MockStorage::<false>::new();
-        let mut journal = Journal::<MockStorage<false>, 32, 1>::new(&mut storage, 0);
-
-        let write = journal.writes.acquire().unwrap();
-        let buf = vec![1u8; 4096];
-
-        fn releasing_callback(w: *mut TestWrite) {
-            unsafe {
-                let journal = &mut *(*w).journal;
-                // Release the write back to the pool.
-                // This makes the `w` pointer invalid for the caller of the callback.
-                journal.writes.release(w);
-            }
-        }
-
-        unsafe {
-            (*write).slot_index = 1;
-            // This should not panic or trigger UB (accessing released write).
-            journal.write_sectors(write, releasing_callback, &buf, Ring::Headers, 0);
-        }
-
-        // Verify the write was actually released.
-        // Capacity is 32, we acquired 1, then released it in callback.
-        // So available should be 32.
-        // We can't check `journal.writes.available()` directly as it's not exposed in `IOPSType`
-        // public interface easily without iteration or internal knowledge,
-        // but we can try to acquire 32 writes again to prove it's free.
-
-        let mut writes = Vec::new();
-        for _ in 0..32 {
-            if let Some(w) = journal.writes.acquire() {
-                writes.push(w);
-            } else {
-                panic!("Should be able to re-acquire all writes");
-            }
-        }
-    }
-}
+mod tests;
