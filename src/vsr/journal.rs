@@ -838,4 +838,5 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 }
 
 #[cfg(test)]
+#[path = "journal_tests.rs"]
 mod tests;
