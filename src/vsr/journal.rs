@@ -50,6 +50,8 @@ use crate::constants;
 use crate::container_of;
 use crate::stdx::BitSet;
 use crate::util::utils::AlignedSlice;
+use crate::vsr::journal_primitives::Slot;
+use crate::vsr::{Checksum128, Command, Operation};
 use crate::vsr::{
     Header,
     HeaderPrepare,
@@ -250,7 +252,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 /// `Write` represents a single in-flight write operation. It is allocated from
 /// the `Journal`'s `IOPSType` pool and contains:
 /// - A back-pointer to the owning `Journal`
-/// - A slot index for concurrent write detection assertions
+/// - The op number (from the prepare header) used for concurrent-slot detection assertions
 /// - The `Range` descriptor with buffer and locking state
 ///
 /// # Lifecycle
@@ -269,8 +271,11 @@ pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usiz
     /// Back-pointer to the owning Journal. Set by `write_sectors`.
     pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
 
-    /// Slot index within the log. Used to assert no concurrent writes to same slot.
-    pub slot_index: u32,
+    /// Operation number of the prepare whose slot is being written.
+    ///
+    /// Used to derive the slot (`op % SLOT_COUNT`) and assert that we never have
+    /// two concurrent writes to the same slot.
+    pub op: u64,
 
     /// The range descriptor containing buffer, offset, and locking state.
     pub range: Range<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -429,6 +434,79 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         journal.prepare_inhabited.fill(false);
 
         journal
+    }
+
+    // =========================================================================
+    // In-memory header helpers
+    // =========================================================================
+
+    #[inline]
+    fn slot_for_op(&self, op: u64) -> Slot {
+        Slot::from_op(op)
+    }
+
+    #[inline]
+    fn header_for_op(&self, op: u64) -> Option<&HeaderPrepare> {
+        let slot = self.slot_for_op(op);
+        let existing = &self.headers[slot.index()];
+        assert!(existing.command == Command::Prepare);
+
+        if existing.operation == Operation::RESERVED {
+            assert!(existing.op == slot.index() as u64);
+            None
+        } else {
+            assert_eq!(self.slot_for_op(existing.op).index(), slot.index());
+            Some(existing)
+        }
+    }
+
+    #[inline]
+    pub fn header_with_op(&self, op: u64) -> Option<&HeaderPrepare> {
+        if let Some(existing) = self.header_for_op(op)
+            && existing.op == op
+        {
+            Some(existing)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn header_with_op_and_checksum(
+        &self,
+        op: u64,
+        checksum: Checksum128,
+    ) -> Option<&HeaderPrepare> {
+        if let Some(existing) = self.header_with_op(op) {
+            assert!(existing.op == op);
+            Some(existing)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn previous_entry(&self, header: &HeaderPrepare) -> Option<&HeaderPrepare> {
+        if header.op == 0 {
+            None
+        } else {
+            self.header_with_op(header.op - 1)
+        }
+    }
+
+    #[inline]
+    pub fn next_entry(&self, header: &HeaderPrepare) -> Option<&HeaderPrepare> {
+        self.header_with_op(header.op + 1)
+    }
+
+    pub fn op_maximum(&self) -> u64 {
+        assert!(matches!(self.status, Status::Recovered));
+
+        self.headers
+            .iter()
+            .filter_map(|h| (h.operation != Operation::RESERVED).then_some(h.op))
+            .max()
+            .unwrap_or(0)
     }
 
     // ---------------------------------------------------------------------
