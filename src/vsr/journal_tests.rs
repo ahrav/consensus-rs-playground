@@ -1080,41 +1080,46 @@ mod header_helper_properties {
 
     proptest! {
         /// Property: header_with_op returns Some iff stored header.op == query op.
+        /// Only tests within the same slot to avoid accessing uninitialized headers.
         #[test]
         fn prop_header_with_op_returns_iff_op_matches(
-            stored_op in op_strategy(),
-            query_op in op_strategy()
+            slot in slot_strategy(),
+            epoch in 0u64..10
         ) {
             let mut storage = MockStorage::new();
             let mut journal = TestJournal::new(&mut storage, 0);
 
-            let slot = (stored_op % SLOT_COUNT as u64) as usize;
+            // Store a header at a specific op for this slot
+            let stored_op = slot as u64 + epoch * SLOT_COUNT as u64;
             journal.headers[slot] = make_header(stored_op, Operation::REGISTER);
 
-            let result = journal.header_with_op(query_op);
+            // Query with the exact op - should return the header
+            let result = journal.header_with_op(stored_op);
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, stored_op);
 
-            if stored_op == query_op {
-                prop_assert!(result.is_some());
-                prop_assert_eq!(result.unwrap().op, query_op);
-            } else if stored_op % SLOT_COUNT as u64 == query_op % SLOT_COUNT as u64 {
-                // Same slot, different op - should return None
-                prop_assert!(result.is_none());
-            }
+            // Query with a different epoch for the same slot - should return None
+            let different_epoch = if epoch == 0 { 1 } else { epoch - 1 };
+            let different_op = slot as u64 + different_epoch * SLOT_COUNT as u64;
+            let result_different = journal.header_with_op(different_op);
+            prop_assert!(result_different.is_none());
         }
 
         /// Property: reserved slots always return None regardless of query op.
         #[test]
         fn prop_reserved_slots_always_return_none(
             slot in slot_strategy(),
-            query_op in op_strategy()
+            epoch in 0u64..10
         ) {
             let mut storage = MockStorage::new();
-            let journal = TestJournal::new(&mut storage, 0);
+            let mut journal = TestJournal::new(&mut storage, 0);
 
-            // Slot is already reserved by default (journal.new initializes all as reserved)
-            // Just verify the query returns None for any op that maps to this slot
-            let adjusted_op = slot as u64 + (query_op / SLOT_COUNT as u64) * SLOT_COUNT as u64;
-            let result = journal.header_with_op(adjusted_op);
+            // Initialize the slot as reserved (default behavior but explicit here)
+            journal.headers[slot] = make_reserved_header(slot);
+
+            // Query for any op that maps to this slot - should return None
+            let query_op = slot as u64 + epoch * SLOT_COUNT as u64;
+            let result = journal.header_with_op(query_op);
             prop_assert!(result.is_none());
         }
 
