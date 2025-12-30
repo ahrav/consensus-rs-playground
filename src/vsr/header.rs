@@ -33,11 +33,30 @@ const CHECKSUM_SIZE: u32 = 16;
 const _: () = assert!(CHECKSUM_SIZE as usize == size_of::<Checksum128>());
 const _: () = assert!(HEADER_SIZE > CHECKSUM_SIZE);
 
+/// Common interface for VSR protocol headers.
+///
+/// This trait abstracts over different header layouts (e.g., [`Header`],
+/// [`super::HeaderPrepare`]) that share the same wire protocol structure but
+/// interpret command-specific regions differently.
+///
+/// # Safety
+///
+/// Implementers must guarantee:
+/// - The type is `#[repr(C)]` with a fixed 256-byte layout
+/// - The `command` field is at byte offset 114
+/// - The `size` field is at byte offset 96-99 (little-endian `u32`)
+/// - All bit patterns are valid (no padding bytes with invariants)
+///
+/// These guarantees enable safe zero-copy parsing from network buffers.
 pub unsafe trait ProtoHeader: Copy {
+    /// Returns the message command type (byte 114).
     fn command(&self) -> Command;
+    /// Sets the message command type.
     fn set_command(&mut self, command: Command);
 
+    /// Returns the total message size in bytes (header + body).
     fn size(&self) -> u32;
+    /// Sets the total message size in bytes.
     fn set_size(&mut self, size: u32);
 }
 
@@ -210,14 +229,21 @@ impl Header {
         self.size
     }
 
-    /// Reinterprets the header as a byte array.
+    /// Reinterprets the header as a raw byte slice for serialization.
     ///
-    /// # Safety
+    /// This enables zero-copy serialization for network transmission.
     ///
-    /// Safe because `Header` is `#[repr(C)]` with fixed 256-byte layout.
+    /// # Safety Rationale
+    ///
+    /// This transmutation is safe because:
+    /// - `Header` is `#[repr(C)]` ensuring a predictable memory layout
+    /// - Size is exactly 256 bytes (enforced by compile-time assertion)
+    /// - No padding bytes exist between fields that could contain uninitialized memory
+    /// - The lifetime of the returned slice is tied to `&self`
     #[inline]
     pub fn as_bytes(&self) -> &[u8; HEADER_SIZE_USIZE] {
         // SAFETY: Header is repr(C) with compile-time size assertion.
+        // All fields are primitives or arrays with no uninitialized padding.
         unsafe { &*(self as *const Self as *const [u8; HEADER_SIZE_USIZE]) }
     }
 
@@ -232,9 +258,15 @@ impl Header {
 
     /// Computes checksum over the message body.
     ///
+    /// This checksum covers only the body bytes, not the header. When setting
+    /// checksums on a header, compute and set `checksum_body` **before**
+    /// `checksum` since the header checksum covers the `checksum_body` field.
+    ///
     /// # Panics
     ///
-    /// Panics if `body.len()` doesn't match [`Self::body_len()`].
+    /// - Panics if `body.len()` exceeds `u32::MAX`
+    /// - Panics if `body.len()` doesn't match [`Self::body_len()`]
+    /// - Panics if `self.size < SIZE_MIN` (header size invariant violated)
     pub fn calculate_checksum_body(&self, body: &[u8]) -> Checksum128 {
         assert!(body.len() <= u32::MAX as usize);
         let body_len = body.len() as u32;
@@ -291,7 +323,18 @@ impl Header {
 
     /// Validates size bounds, protocol version, and reserved field invariants.
     ///
-    /// Does *not* verify checksums; use [`Self::is_valid_checksum()`] separately.
+    /// This performs structural validation only and does **not** verify checksums.
+    /// Call [`Self::is_valid_checksum()`] and [`Self::is_valid_checksum_body()`]
+    /// separately to verify message integrity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string describing the first validation failure:
+    /// - `"size < SIZE_MIN"` - Message too small to contain a valid header
+    /// - `"size > SIZE_MAX"` - Message exceeds maximum allowed size
+    /// - `"protocol mismatch"` - Protocol version does not match [`VSR_VERSION`]
+    /// - `"reserved_frame not zero"` - Reserved frame bytes contain non-zero values
+    /// - `"reserved_command not zero"` - Reserved command bytes contain non-zero values
     pub fn validate_basic(&self) -> Result<(), &'static str> {
         if self.size < Self::SIZE_MIN {
             return Err("size < SIZE_MIN");
@@ -317,13 +360,33 @@ impl Header {
 
     /// Deserializes a header from raw bytes.
     ///
-    /// The resulting header may contain invalid data; call [`Self::validate_basic()`]
-    /// and [`Self::is_valid_checksum()`] before trusting the contents.
+    /// This performs a bitwise copy from the input buffer into a `Header` struct.
+    /// The resulting header may contain semantically invalid data (wrong protocol
+    /// version, out-of-range size, non-zero reserved fields, or corrupted checksums).
     ///
-    /// # Safety
+    /// # Validation Requirements
     ///
-    /// Safe because `Header` is `#[repr(C)]` and all bit patterns are valid
-    /// (no padding bytes with invariants, no enums with restricted values).
+    /// Callers **must** validate the header before trusting its contents:
+    /// 1. Call [`Self::validate_basic()`] to check size bounds, protocol version,
+    ///    and reserved field invariants
+    /// 2. Call [`Self::is_valid_checksum()`] to verify header integrity
+    /// 3. If the message has a body, call [`Self::is_valid_checksum_body()`]
+    ///
+    /// Skipping validation may lead to:
+    /// - Processing messages from incompatible protocol versions
+    /// - Buffer overflows if `size` exceeds actual data length
+    /// - Accepting corrupted or tampered messages
+    ///
+    /// # Safety Rationale
+    ///
+    /// This operation is safe because:
+    /// - `Header` is `#[repr(C)]` with a fixed memory layout
+    /// - All field types accept arbitrary bit patterns:
+    ///   - Integers (`u32`, `u128`, `u16`, `u8`) have no invalid values
+    ///   - [`Command`] is `#[repr(u8)]` and accepts all byte values
+    ///   - [`Release`] is `#[repr(transparent)]` over `u32`
+    ///   - Arrays of `u8` have no invalid states
+    /// - No padding bytes exist that could contain uninitialized memory
     pub fn from_bytes(bytes: &[u8; HEADER_SIZE_USIZE]) -> Self {
         let header = {
             let mut h = core::mem::MaybeUninit::<Header>::uninit();

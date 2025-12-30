@@ -30,6 +30,13 @@ const _: () = {
     assert!(HeaderPrepare::SIZE == mem::size_of::<HeaderPrepare>());
 };
 
+/// # Safety
+///
+/// `HeaderPrepare` satisfies the `ProtoHeader` safety requirements:
+/// - `#[repr(C, align(16))]` with fixed 256-byte layout (verified by compile-time assertion)
+/// - `command` field is at the standard byte offset 114
+/// - `size` field is at the standard byte offset 96-99 (little-endian `u32`)
+/// - All bit patterns are valid for all field types
 unsafe impl ProtoHeader for HeaderPrepare {
     fn command(&self) -> Command {
         self.command
@@ -127,27 +134,37 @@ pub struct HeaderPrepare {
     pub reserved: [u8; 3],
 }
 
-// SAFETY: HeaderPrepare is repr(C, align(16)) with fixed 256-byte layout.
-// All fields are primitives (u8, u16, u32, u64, u128) or arrays thereof,
-// which are Pod. The struct has no padding bytes due to careful field ordering
-// and explicit padding fields (checksum_padding, etc.).
+/// # Safety
+///
+/// `HeaderPrepare` satisfies the `Pod` requirements:
+/// - `#[repr(C, align(16))]` ensures a stable, predictable memory layout
+/// - All fields are primitives (`u8`, `u16`, `u32`, `u64`, `u128`) or arrays thereof
+/// - No implicit padding bytes due to careful field ordering and explicit padding fields
 unsafe impl Pod for HeaderPrepare {}
 
-// SAFETY: HeaderPrepare is #[repr(C)] with only primitive types and arrays thereof.
-// All-zeros is a valid bit pattern for every field, as validated by `HeaderPrepare::zeroed()`.
+/// # Safety
+///
+/// `HeaderPrepare` satisfies the `Zeroable` requirements:
+/// - `#[repr(C)]` with only primitive types and arrays
+/// - All-zeros is a valid bit pattern for every field
+/// - Validated by `HeaderPrepare::zeroed()` which asserts checksum == 0
 unsafe impl Zeroable for HeaderPrepare {}
 
 impl HeaderPrepare {
+    /// Size of the header in bytes (256).
     pub const SIZE: usize = 256;
 
+    /// Minimum valid message size (header only, no body).
     pub const SIZE_MIN: u32 = Self::SIZE as u32;
 
     /// Returns a strictly zero-initialized header.
     ///
-    /// # Safety
-    /// Validates that `mem::zeroed` produces a valid initial state (e.g. 0 checksums).
+    /// All fields are set to zero, including `size` and `protocol`. This is
+    /// primarily useful as a base for further initialization; the result will
+    /// not pass [`invalid()`](Self::invalid) validation until properly configured.
     #[inline]
     pub fn zeroed() -> Self {
+        // SAFETY: HeaderPrepare is Zeroable - all-zeros is a valid bit pattern.
         let header = unsafe { mem::zeroed::<Self>() };
         assert_eq!(header.checksum, 0);
         assert_eq!(header.size, 0);
@@ -224,13 +241,21 @@ impl HeaderPrepare {
 
     /// Checks protocol invariants and structural validity.
     ///
-    /// Validates:
-    /// - Protocol version and message size.
-    /// - Zero padding (reserved fields).
-    /// - Operation-specific logic (e.g. `Pulse` vs `Register` vs `Root`).
+    /// Validates (in order, for fast rejection):
+    /// 1. Protocol version matches [`VSR_VERSION`]
+    /// 2. Message size is within `[SIZE_MIN, MESSAGE_SIZE_MAX]`
+    /// 3. All padding fields are zero
+    /// 4. Epoch is zero (reconfiguration not yet supported)
+    /// 5. Reserved frame bytes are zero
+    /// 6. Command is [`Command::Prepare`]
+    /// 7. Operation-specific invariants (via [`invalid_header`](Self::invalid_header))
     ///
-    /// NOTE: Does NOT validate `checksum`. `Root` and `Reserved` entries expect
-    /// `checksum_body` to match an empty body due to their fixed size.
+    /// Returns `None` if the header is valid, or `Some(error_message)` describing
+    /// the first validation failure.
+    ///
+    /// **Note**: Does NOT validate `checksum`. Use [`valid_checksum()`](Self::valid_checksum)
+    /// separately. `Root` and `Reserved` entries expect `checksum_body` to match
+    /// an empty body.
     pub fn invalid(&self) -> Option<&'static str> {
         // Protocol version check (likely to catch version mismatches early)
         if self.protocol != VSR_VERSION {
@@ -274,7 +299,21 @@ impl HeaderPrepare {
         self.invalid_header()
     }
 
-    /// Validates operation-specific invariants (Prepare command logic).
+    /// Validates operation-specific invariants for Prepare commands.
+    ///
+    /// This is called by [`invalid()`](Self::invalid) after basic structural checks pass.
+    /// It validates Prepare-specific fields based on the operation type:
+    ///
+    /// - **Reserved**: Placeholder slot; most fields must be zero
+    /// - **Root**: Genesis entry; `op=0`, `parent=0`, no client
+    /// - **Normal operations**: Must link to parent, have valid client/op/commit relationships
+    ///
+    /// # Precondition
+    ///
+    /// Asserts that `self.command == Command::Prepare`. Called internally by
+    /// [`invalid()`](Self::invalid) which checks this first.
+    ///
+    /// Returns `None` if valid, or `Some(error_message)` on failure.
     pub fn invalid_header(&self) -> Option<&'static str> {
         // Precondition: must be a Prepare command
         assert!(
@@ -461,13 +500,27 @@ impl HeaderPrepare {
 
     /// Creates a placeholder header to mark a journal slot as occupied but uncommitted.
     ///
-    ///  Used during log initialization or slot pre-allocation where the actual
+    /// Used during log initialization or slot pre-allocation where the actual
     /// operation hasn't been received yet. The header passes validation but carries
     /// no meaningful payload.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster` - The cluster identifier for this header
+    /// * `slot` - The journal slot index (stored in the `op` field)
     ///
     /// # Panics
     ///
     /// Panics if `slot >= JOURNAL_SLOT_COUNT`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let header = HeaderPrepare::reserve(cluster_id, 42);
+    /// assert_eq!(header.operation, Operation::RESERVED);
+    /// assert_eq!(header.op, 42);
+    /// assert!(header.invalid().is_none());
+    /// ```
     pub fn reserve(cluster: u128, slot: u64) -> Self {
         assert!(slot < JOURNAL_SLOT_COUNT as u64);
 
@@ -493,6 +546,23 @@ impl HeaderPrepare {
     /// Every replica's log starts with this deterministic header. Subsequent
     /// entries link back via [`Self::parent`], ensuring log integrity from
     /// the first operation onward.
+    ///
+    /// The root header is fully deterministic: given the same `cluster`, all
+    /// replicas will produce identical headers with matching checksums.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster` - The cluster identifier for this header
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let root = HeaderPrepare::root(cluster_id);
+    /// assert_eq!(root.operation, Operation::ROOT);
+    /// assert_eq!(root.op, 0);
+    /// assert_eq!(root.parent, 0);
+    /// assert!(root.invalid().is_none());
+    /// ```
     pub fn root(cluster: u128) -> Self {
         let mut h = Self::new();
 
