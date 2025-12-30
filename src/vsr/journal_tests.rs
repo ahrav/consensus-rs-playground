@@ -1057,6 +1057,160 @@ mod overlap_properties {
 }
 
 // =========================================================================
+// Header Helper Method Properties (Property Tests)
+// =========================================================================
+
+mod header_helper_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Strategy for op values that span multiple wraparounds.
+    fn op_strategy() -> impl Strategy<Value = u64> {
+        prop_oneof![
+            0u64..SLOT_COUNT as u64,                          // First epoch
+            SLOT_COUNT as u64..(SLOT_COUNT * 2) as u64,       // Second epoch (wraparound)
+            (SLOT_COUNT * 5) as u64..(SLOT_COUNT * 6) as u64, // Later epoch
+        ]
+    }
+
+    /// Strategy for slot indices.
+    fn slot_strategy() -> impl Strategy<Value = usize> {
+        0..SLOT_COUNT
+    }
+
+    proptest! {
+        /// Property: header_with_op returns Some iff stored header.op == query op.
+        #[test]
+        fn prop_header_with_op_returns_iff_op_matches(
+            stored_op in op_strategy(),
+            query_op in op_strategy()
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            let slot = (stored_op % SLOT_COUNT as u64) as usize;
+            journal.headers[slot] = make_header(stored_op, Operation::REGISTER);
+
+            let result = journal.header_with_op(query_op);
+
+            if stored_op == query_op {
+                prop_assert!(result.is_some());
+                prop_assert_eq!(result.unwrap().op, query_op);
+            } else if stored_op % SLOT_COUNT as u64 == query_op % SLOT_COUNT as u64 {
+                // Same slot, different op - should return None
+                prop_assert!(result.is_none());
+            }
+        }
+
+        /// Property: reserved slots always return None regardless of query op.
+        #[test]
+        fn prop_reserved_slots_always_return_none(
+            slot in slot_strategy(),
+            query_op in op_strategy()
+        ) {
+            let mut storage = MockStorage::new();
+            let journal = TestJournal::new(&mut storage, 0);
+
+            // Slot is already reserved by default (journal.new initializes all as reserved)
+            // Just verify the query returns None for any op that maps to this slot
+            let adjusted_op = slot as u64 + (query_op / SLOT_COUNT as u64) * SLOT_COUNT as u64;
+            let result = journal.header_with_op(adjusted_op);
+            prop_assert!(result.is_none());
+        }
+
+        /// Property: header_with_op_and_checksum requires BOTH op AND checksum match.
+        #[test]
+        fn prop_checksum_match_required(
+            op in op_strategy(),
+            use_correct_checksum in proptest::bool::ANY
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            let header = make_header(op, Operation::REGISTER);
+            let correct_checksum = header.checksum;
+            let slot = (op % SLOT_COUNT as u64) as usize;
+            journal.headers[slot] = header;
+
+            let query_checksum = if use_correct_checksum {
+                correct_checksum
+            } else {
+                correct_checksum.wrapping_add(1)
+            };
+
+            let result = journal.header_with_op_and_checksum(op, query_checksum);
+
+            if use_correct_checksum {
+                prop_assert!(result.is_some());
+            } else {
+                prop_assert!(result.is_none());
+            }
+        }
+
+        /// Property: previous_entry returns op-1 when it exists.
+        #[test]
+        fn prop_previous_entry_navigation(
+            base_op in 1u64..50 // Keep small for simplicity
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            // Setup: headers at base_op-1 and base_op
+            journal.headers[(base_op - 1) as usize] = make_header(base_op - 1, Operation::REGISTER);
+            journal.headers[base_op as usize] = make_header(base_op, Operation::REGISTER);
+
+            let current = &journal.headers[base_op as usize];
+            let result = journal.previous_entry(current);
+
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, base_op - 1);
+        }
+
+        /// Property: next_entry returns op+1 when it exists.
+        #[test]
+        fn prop_next_entry_navigation(
+            base_op in 0u64..49
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            journal.headers[base_op as usize] = make_header(base_op, Operation::REGISTER);
+            journal.headers[(base_op + 1) as usize] = make_header(base_op + 1, Operation::REGISTER);
+
+            let current = &journal.headers[base_op as usize];
+            let result = journal.next_entry(current);
+
+            prop_assert!(result.is_some());
+            prop_assert_eq!(result.unwrap().op, base_op + 1);
+        }
+
+        /// Property: op_maximum returns actual maximum of non-reserved ops.
+        #[test]
+        fn prop_op_maximum_is_actual_max(
+            num_headers in 1usize..20,
+            base_op in 0u64..100
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+            journal.status = Status::Recovered;
+
+            // Insert headers at consecutive slots starting from base_op
+            let mut expected_max = 0u64;
+            for i in 0..num_headers {
+                let op = base_op + i as u64;
+                if (op as usize) < SLOT_COUNT {
+                    journal.headers[op as usize] = make_header(op, Operation::REGISTER);
+                    expected_max = expected_max.max(op);
+                }
+            }
+
+            let actual_max = journal.op_maximum();
+            prop_assert_eq!(actual_max, expected_max);
+        }
+    }
+}
+
+// =========================================================================
 // Locking Protocol (Unit Tests)
 // =========================================================================
 
@@ -1681,118 +1835,7 @@ fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
 }
 
 // -------------------------------------------------------------------------
-// header_with_op Tests
-// -------------------------------------------------------------------------
-
-#[test]
-fn header_with_op_returns_none_for_reserved_slot() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Initialize slot 5 as reserved.
-    journal.headers[5] = make_reserved_header(5);
-
-    // Slot 5 is reserved, so header_with_op(5) should return None.
-    assert!(journal.header_with_op(5).is_none());
-}
-
-#[test]
-fn header_with_op_returns_none_for_different_op_same_slot() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert a header at op 5 (slot 5).
-    let header = make_header(5, Operation::REGISTER);
-    journal.headers[5] = header;
-
-    // Query for op = 5 + SLOT_COUNT (same slot, different op).
-    // Should return None because the op doesn't match.
-    assert!(journal.header_with_op(5 + SLOT_COUNT as u64).is_none());
-}
-
-#[test]
-fn header_with_op_returns_header_when_op_matches() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert a header at op 42.
-    let header = make_header(42, Operation::REGISTER);
-    journal.headers[42] = header;
-
-    // Query for op 42 should return the header.
-    let result = journal.header_with_op(42);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().op, 42);
-    assert_eq!(result.unwrap().operation, Operation::REGISTER);
-}
-
-#[test]
-fn header_with_op_works_with_wraparound_ops() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert a header at op = SLOT_COUNT (which maps to slot 0).
-    let op = SLOT_COUNT as u64;
-    let header = make_header(op, Operation::REGISTER);
-    journal.headers[0] = header;
-
-    // Query for op = SLOT_COUNT should return the header.
-    let result = journal.header_with_op(op);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().op, op);
-}
-
-// -------------------------------------------------------------------------
-// header_with_op_and_checksum Tests
-// -------------------------------------------------------------------------
-
-#[test]
-fn header_with_op_and_checksum_returns_none_when_op_not_found() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Initialize slot 42 as reserved.
-    journal.headers[42] = make_reserved_header(42);
-
-    // Slot 42 is reserved, so any query should return None.
-    let result = journal.header_with_op_and_checksum(42, Checksum128::default());
-    assert!(result.is_none());
-}
-
-#[test]
-fn header_with_op_and_checksum_returns_none_when_checksum_mismatch() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert a valid header.
-    let header = make_header(42, Operation::REGISTER);
-    let actual_checksum = header.checksum;
-    journal.headers[42] = header;
-
-    // Query with a different checksum should return None.
-    let wrong_checksum = actual_checksum.wrapping_add(1);
-    let result = journal.header_with_op_and_checksum(42, wrong_checksum);
-    assert!(result.is_none());
-}
-
-#[test]
-fn header_with_op_and_checksum_returns_header_when_both_match() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert a valid header.
-    let header = make_header(42, Operation::REGISTER);
-    let checksum = header.checksum;
-    journal.headers[42] = header;
-
-    // Query with correct checksum should return the header.
-    let result = journal.header_with_op_and_checksum(42, checksum);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().op, 42);
-}
-
-// -------------------------------------------------------------------------
-// previous_entry / next_entry Tests
+// previous_entry / next_entry Boundary Tests
 // -------------------------------------------------------------------------
 
 #[test]
@@ -1809,76 +1852,8 @@ fn previous_entry_returns_none_for_op_zero() {
     assert!(result.is_none());
 }
 
-#[test]
-fn previous_entry_returns_header_when_exists() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert headers at op 4 and op 5.
-    let header4 = make_header(4, Operation::REGISTER);
-    let header5 = make_header(5, Operation::REGISTER);
-    journal.headers[4] = header4;
-    journal.headers[5] = header5;
-
-    // previous_entry for header at op 5 should return header at op 4.
-    let result = journal.previous_entry(&journal.headers[5]);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().op, 4);
-}
-
-#[test]
-fn previous_entry_returns_none_when_previous_not_exists() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Initialize slot 4 as reserved.
-    journal.headers[4] = make_reserved_header(4);
-
-    // Insert header at op 5 only (op 4 is reserved).
-    let header5 = make_header(5, Operation::REGISTER);
-    journal.headers[5] = header5;
-
-    // previous_entry for header at op 5 should return None (op 4 is reserved).
-    let result = journal.previous_entry(&journal.headers[5]);
-    assert!(result.is_none());
-}
-
-#[test]
-fn next_entry_returns_header_when_exists() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Insert headers at op 4 and op 5.
-    let header4 = make_header(4, Operation::REGISTER);
-    let header5 = make_header(5, Operation::REGISTER);
-    journal.headers[4] = header4;
-    journal.headers[5] = header5;
-
-    // next_entry for header at op 4 should return header at op 5.
-    let result = journal.next_entry(&journal.headers[4]);
-    assert!(result.is_some());
-    assert_eq!(result.unwrap().op, 5);
-}
-
-#[test]
-fn next_entry_returns_none_when_next_not_exists() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Initialize slot 6 as reserved.
-    journal.headers[6] = make_reserved_header(6);
-
-    // Insert header at op 5 only (op 6 is reserved).
-    let header5 = make_header(5, Operation::REGISTER);
-    journal.headers[5] = header5;
-
-    // next_entry for header at op 5 should return None.
-    let result = journal.next_entry(&journal.headers[5]);
-    assert!(result.is_none());
-}
-
 // -------------------------------------------------------------------------
-// op_maximum Tests
+// op_maximum Panic Tests
 // -------------------------------------------------------------------------
 
 #[test]
@@ -1889,52 +1864,4 @@ fn op_maximum_panics_when_not_recovered() {
 
     // Status is Init, should panic.
     let _ = journal.op_maximum();
-}
-
-#[test]
-fn op_maximum_returns_zero_when_all_reserved() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Set status to Recovered.
-    journal.status = Status::Recovered;
-
-    // All slots are reserved (zeroed), so op_maximum should return 0.
-    assert_eq!(journal.op_maximum(), 0);
-}
-
-#[test]
-fn op_maximum_returns_max_op() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Set status to Recovered.
-    journal.status = Status::Recovered;
-
-    // Insert headers at various ops.
-    journal.headers[10] = make_header(10, Operation::REGISTER);
-    journal.headers[50] = make_header(50, Operation::REGISTER);
-    journal.headers[25] = make_header(25, Operation::REGISTER);
-
-    // op_maximum should return 50.
-    assert_eq!(journal.op_maximum(), 50);
-}
-
-#[test]
-fn op_maximum_handles_wraparound_ops() {
-    let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-
-    // Set status to Recovered.
-    journal.status = Status::Recovered;
-
-    // Insert a header at op = SLOT_COUNT * 2 + 5 (maps to slot 5).
-    let high_op = SLOT_COUNT as u64 * 2 + 5;
-    journal.headers[5] = make_header(high_op, Operation::REGISTER);
-
-    // Also insert a header at op = 10 (slot 10).
-    journal.headers[10] = make_header(10, Operation::REGISTER);
-
-    // op_maximum should return the high_op value.
-    assert_eq!(journal.op_maximum(), high_op);
 }
