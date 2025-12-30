@@ -3,6 +3,20 @@
 //! This enum is parsed from the on-the-wire `Header.command` byte.
 //! Discriminants are stable protocol bytes and MUST NOT change.
 
+use crate::vsr::{HeaderPrepare, header::ProtoHeader};
+
+pub trait CommandMarker {
+    const COMMAND: Command;
+    type Header: ProtoHeader;
+}
+
+pub struct PrepareCmd;
+
+impl CommandMarker for PrepareCmd {
+    const COMMAND: Command = Command::Prepare;
+    type Header = HeaderPrepare;
+}
+
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 pub enum Command {

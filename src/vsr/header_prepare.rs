@@ -9,7 +9,7 @@ use core::{mem, slice};
 use crate::{
     constants::{JOURNAL_SLOT_COUNT, VSR_VERSION},
     util::{Pod, Zeroable},
-    vsr::{Checksum128, Command, Operation, Release, checksum, constants},
+    vsr::{Checksum128, Command, Operation, Release, checksum, constants, header::ProtoHeader},
 };
 
 #[cfg(not(target_endian = "little"))]
@@ -29,6 +29,24 @@ const _: () = {
     assert!(HeaderPrepare::SIZE == 256);
     assert!(HeaderPrepare::SIZE == mem::size_of::<HeaderPrepare>());
 };
+
+unsafe impl ProtoHeader for HeaderPrepare {
+    fn command(&self) -> Command {
+        self.command
+    }
+
+    fn set_command(&mut self, command: Command) {
+        self.command = command
+    }
+
+    fn size(&self) -> u32 {
+        self.size
+    }
+
+    fn set_size(&mut self, size: u32) {
+        self.size = size
+    }
+}
 
 /// Specialized header for `Command::Prepare` messages.
 ///

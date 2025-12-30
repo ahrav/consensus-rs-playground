@@ -33,6 +33,14 @@ const CHECKSUM_SIZE: u32 = 16;
 const _: () = assert!(CHECKSUM_SIZE as usize == size_of::<Checksum128>());
 const _: () = assert!(HEADER_SIZE > CHECKSUM_SIZE);
 
+pub unsafe trait ProtoHeader: Copy {
+    fn command(&self) -> Command;
+    fn set_command(&mut self, command: Command);
+
+    fn size(&self) -> u32;
+    fn set_size(&mut self, size: u32);
+}
+
 /// Software release version for coordinating rolling upgrades.
 ///
 /// Not currently used; reserved for future protocol evolution.
