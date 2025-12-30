@@ -53,6 +53,14 @@ unsafe impl ProtoHeader for HeaderPrepare {
     fn set_size(&mut self, size: u32) {
         self.size = size
     }
+
+    fn protocol(&self) -> u16 {
+        self.protocol
+    }
+
+    fn set_protocol(&mut self, protocol: u16) {
+        self.protocol = protocol
+    }
 }
 
 /// Specialized header for `Command::Prepare` messages.

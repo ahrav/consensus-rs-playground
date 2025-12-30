@@ -184,6 +184,7 @@ impl MessagePool {
     /// - Header bytes zeroed
     /// - Command set to `C::COMMAND`
     /// - Size set to [`constants::HEADER_SIZE`] (header only, no body)
+    /// - Protocol set to [`constants::VSR_VERSION`]
     ///
     /// The message has a reference count of 1 (unique ownership).
     pub fn try_get<C: CommandMarker>(&self) -> Option<Message<C>> {
@@ -198,6 +199,7 @@ impl MessagePool {
         let header = unsafe { &mut *(buf as *mut C::Header) };
         header.set_command(C::COMMAND);
         header.set_size(constants::HEADER_SIZE);
+        header.set_protocol(constants::VSR_VERSION);
 
         Some(Message {
             inner,
@@ -244,6 +246,19 @@ pub struct Message<C: CommandMarker> {
     inner: NonNull<MessageInner>,
     pool: Rc<MessagePoolInner>,
     _marker: PhantomData<C>,
+}
+
+impl<C: CommandMarker> std::fmt::Debug for Message<C>
+where
+    C::Header: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("header", self.header())
+            .field("used_len", &self.used_len())
+            .field("is_unique", &self.is_unique())
+            .finish()
+    }
 }
 
 /// Cloning a `Message` increments the reference count, creating a shared
@@ -464,14 +479,18 @@ impl<C: CommandMarker> Message<C> {
     /// - All header bytes are zeroed
     /// - `command` is set to `C::COMMAND`
     /// - `size` is set to `HEADER_SIZE` (header only, no body)
+    /// - `protocol` is set to [`constants::VSR_VERSION`]
     ///
     /// # Panics
     ///
-    /// Panics if the message is shared (via [`header_mut`](Self::header_mut)).
+    /// Panics if the message is shared (reference count > 1).
     pub fn reset_header(&mut self) {
+        assert!(self.is_unique(), "message is shared; cannot reset header");
         let buf = self.buffer_ptr();
         // SAFETY: Buffer is valid for at least `HEADER_SIZE` bytes.
+        // We verified exclusive ownership above via is_unique().
         unsafe { std::ptr::write_bytes(buf, 0, constants::HEADER_SIZE_USIZE) };
+        // SAFETY: We have exclusive ownership (verified above), so header_mut() won't panic.
         let h = self.header_mut();
         h.set_command(C::COMMAND);
         h.set_size(constants::HEADER_SIZE);

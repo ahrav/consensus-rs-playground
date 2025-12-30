@@ -58,6 +58,11 @@ pub unsafe trait ProtoHeader: Copy {
     fn size(&self) -> u32;
     /// Sets the total message size in bytes.
     fn set_size(&mut self, size: u32);
+
+    /// Returns the protocol version (bytes 112-113).
+    fn protocol(&self) -> u16;
+    /// Sets the protocol version.
+    fn set_protocol(&mut self, protocol: u16);
 }
 
 /// Software release version for coordinating rolling upgrades.
