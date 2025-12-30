@@ -1,7 +1,6 @@
 pub use crate::constants;
 
 pub mod checksum;
-pub mod chunk_tracking;
 pub mod client_operation;
 pub mod command;
 pub mod framing;
