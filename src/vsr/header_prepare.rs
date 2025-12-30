@@ -323,7 +323,7 @@ impl HeaderPrepare {
         if self.checkpoint_id != 0 {
             return Some("reserved: checkpoint_id != 0");
         }
-        // Zig: `maybe(self.op == 0)` - op may be 0 or non-zero (slot index)
+        // op may be 0 or non-zero (slot index)
         if self.commit != 0 {
             return Some("reserved: commit != 0");
         }

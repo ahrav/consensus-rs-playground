@@ -191,13 +191,16 @@ pub struct CheckpointState {
     pub client_sessions_last_block_checksum: Checksum128,
     pub client_sessions_last_block_checksum_padding: Checksum128,
 
-    pub free_set_blocks_acquired_last_block_address: u64,
-    pub free_set_blocks_released_last_block_address: u64,
-    pub client_sessions_last_block_address: u64,
+    // --- Manifest block chain ---
+    pub manifest_oldest_checksum: Checksum128,
+    pub manifest_oldest_checksum_padding: Checksum128,
 
-    pub free_set_blocks_acquired_size: u64,
-    pub free_set_blocks_released_size: u64,
-    pub client_sessions_size: u64,
+    pub manifest_newest_checksum: Checksum128,
+    pub manifest_newest_checksum_padding: Checksum128,
+
+    // --- Snapshots ---
+    pub snapshots_block_checksum: Checksum128,
+    pub snapshots_block_checksum_padding: Checksum128,
 
     /// Rolling checksum over all acquired block data.
     pub free_set_blocks_acquired_checksum: Checksum128,
@@ -210,30 +213,28 @@ pub struct CheckpointState {
     pub parent_checkpoint_id: u128,
     pub grandparent_checkpoint_id: u128,
 
-    // --- Manifest block chain ---
-    pub manifest_oldest_checksum: Checksum128,
-    pub manifest_oldest_checksum_padding: Checksum128,
-    pub manifest_oldest_address: u64,
+    pub free_set_blocks_acquired_last_block_address: u64,
+    pub free_set_blocks_released_last_block_address: u64,
+    pub client_sessions_last_block_address: u64,
 
-    pub manifest_newest_checksum: Checksum128,
-    pub manifest_newest_checksum_padding: Checksum128,
+    pub manifest_oldest_address: u64,
     pub manifest_newest_address: u64,
 
-    pub manifest_block_count: u32,
-    pub reserved_manifest: [u8; 4],
-
-    // --- Snapshots ---
-    pub snapshots_block_checksum: Checksum128,
-    pub snapshots_block_checksum_padding: Checksum128,
     pub snapshots_block_address: u64,
 
     pub storage_size: u64,
+
+    pub free_set_blocks_acquired_size: u64,
+    pub free_set_blocks_released_size: u64,
+    pub client_sessions_size: u64,
+
+    pub manifest_block_count: u32,
 
     /// Detects unclean shutdown when reopening the data file.
     pub release: Release,
 
     /// Reserved for future protocol versions. Must be zero.
-    pub reserved: [u8; 388],
+    pub reserved: [u8; 408],
 }
 
 // SAFETY: CheckpointState is repr(C) with fixed 1024-byte layout.
@@ -269,8 +270,7 @@ impl CheckpointState {
         assert!(state.manifest_oldest_checksum_padding == 0);
         assert!(state.manifest_newest_checksum_padding == 0);
         assert!(state.snapshots_block_checksum_padding == 0);
-        assert!(state.reserved_manifest == [0u8; 4]);
-        assert!(state.reserved == [0u8; 388]);
+        assert!(state.reserved == [0u8; 408]);
 
         state
     }
@@ -305,11 +305,7 @@ impl CheckpointState {
             self.snapshots_block_checksum_padding == 0,
             "snapshots_block padding non-zero"
         );
-        assert!(
-            self.reserved_manifest == [0u8; 4],
-            "reserved_manifest non-zero"
-        );
-        assert!(self.reserved == [0u8; 388], "checkpoint reserved non-zero");
+        assert!(self.reserved == [0u8; 408], "checkpoint reserved non-zero");
     }
 
     /// Computes the checkpoint ID as the checksum of the entire CheckpointState.
@@ -443,7 +439,6 @@ impl VsrState {
             manifest_newest_address: 0,
 
             manifest_block_count: 0,
-            reserved_manifest: [0u8; 4],
 
             snapshots_block_checksum: 0,
             snapshots_block_checksum_padding: 0,
@@ -452,7 +447,7 @@ impl VsrState {
             storage_size: constants::DATA_FILE_SIZE_MIN,
             release: opts.release,
 
-            reserved: [0u8; 388],
+            reserved: [0u8; 408],
         };
 
         assert!(checkpoint.storage_size >= constants::DATA_FILE_SIZE_MIN);
@@ -820,19 +815,39 @@ impl VsrState {
             opts.view,
             opts.log_view
         );
+        if let Some(view_attrs) = &opts.view_attributes {
+            assert!(view_attrs.view == opts.view);
+            assert!(view_attrs.log_view == opts.log_view);
+        }
+        if opts.view_attributes.is_none() {
+            assert!(
+                opts.view == self.view,
+                "view must not change without view_attributes"
+            );
+            assert!(
+                opts.log_view == self.log_view,
+                "log_view must not change without view_attributes"
+            );
+        }
 
-        // Adopt the provided checkpoint state.
-        self.checkpoint = opts.checkpoint;
+        // Adopt the provided checkpoint state, but rebuild the chain and release.
+        let mut checkpoint = opts.checkpoint;
+        checkpoint.parent_checkpoint_id = old.checkpoint.checkpoint_id();
+        checkpoint.grandparent_checkpoint_id = old.checkpoint.parent_checkpoint_id;
+        checkpoint.release = opts.release;
+        self.checkpoint = checkpoint;
 
         // Update VSR-level fields.
-        self.view = opts.view;
-        self.log_view = opts.log_view;
         self.commit_max = opts.commit_max;
         self.sync_op_min = opts.sync_op_min;
         self.sync_op_max = opts.sync_op_max;
+        if opts.view_attributes.is_some() {
+            self.view = opts.view;
+            self.log_view = opts.log_view;
+        }
 
-        // Update sync_view to log_view at checkpoint time.
-        self.sync_view = opts.log_view;
+        // sync_view is unused; keep it at zero.
+        self.sync_view = 0;
 
         assert!(
             Self::monotonic(&old, self),
@@ -873,25 +888,32 @@ impl VsrState {
 
         // Apply view/commit durability.
         self.commit_max = opts.commit_max;
-        self.sync_op_min = opts.commit_max;
-        self.sync_op_max = opts.commit_max;
         self.view = opts.view;
         self.log_view = opts.log_view;
-        self.sync_view = opts.log_view;
 
         if let Some(sync) = &opts.sync_checkpoint {
-            assert!(opts.log_view == opts.view);
-            assert!(sync.checkpoint.header.op == opts.commit_max);
             assert!(sync.sync_op_min <= sync.sync_op_max);
 
             assert!(sync.checkpoint.header.op > old.checkpoint.header.op);
-            assert!(sync.checkpoint.release.value() >= old.checkpoint.release.value());
-            assert!(sync.checkpoint.parent_checkpoint_id == old.checkpoint.checkpoint_id());
+            let checkpoint_next = checkpoint_after(old.checkpoint.header.op);
+            let checkpoint_next_next = checkpoint_after(checkpoint_next);
+            if sync.checkpoint.header.op == checkpoint_next {
+                assert!(
+                    sync.checkpoint.parent_checkpoint_id == old.checkpoint.checkpoint_id(),
+                    "sync checkpoint parent must match current checkpoint id"
+                );
+            } else if sync.checkpoint.header.op == checkpoint_next_next {
+                assert!(
+                    sync.checkpoint.grandparent_checkpoint_id == old.checkpoint.checkpoint_id(),
+                    "sync checkpoint grandparent must match current checkpoint id"
+                );
+            } else {
+                panic!("sync checkpoint op must match next or next+1 checkpoint");
+            }
 
             self.checkpoint = sync.checkpoint;
             self.sync_op_min = sync.sync_op_min;
             self.sync_op_max = sync.sync_op_max;
-            self.sync_view = opts.view;
         }
 
         assert!(Self::would_be_updated_by(&old, self));
@@ -955,6 +977,39 @@ fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
     )
 }
 
+/// Returns the next checkpoint op after `checkpoint`.
+///
+/// Checkpoints are only valid at compaction bar boundaries, and the next
+/// checkpoint is `VSR_CHECKPOINT_OPS` ops later.
+#[inline]
+fn checkpoint_after(checkpoint: u64) -> u64 {
+    let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
+    assert!(lsm_compaction_ops > 0);
+
+    let valid = if checkpoint == 0 {
+        true
+    } else if let Some(next) = checkpoint.checked_add(1) {
+        next % lsm_compaction_ops == 0
+    } else {
+        false
+    };
+    assert!(valid, "checkpoint op {} not on bar boundary", checkpoint);
+
+    let vsr_checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
+    assert!(vsr_checkpoint_ops > 0);
+
+    let result = if checkpoint == 0 {
+        vsr_checkpoint_ops - 1
+    } else {
+        checkpoint
+            .checked_add(vsr_checkpoint_ops)
+            .expect("checkpoint_after overflow")
+    };
+
+    assert!((result + 1).is_multiple_of(lsm_compaction_ops));
+    result
+}
+
 #[cfg(test)]
 fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
     use crate::vsr::wire::{Command, Operation};
@@ -990,33 +1045,6 @@ mod tests {
     // =========================================================================
     // Helper functions for checkpoint boundary calculations
     // =========================================================================
-
-    #[inline]
-    fn checkpoint_valid(op: u64) -> bool {
-        // Checkpoints are only valid at compaction bar boundaries.
-        op == 0 || (op + 1).is_multiple_of(constants::LSM_COMPACTION_OPS)
-    }
-
-    #[inline]
-    fn checkpoint_after(checkpoint: u64) -> u64 {
-        assert!(checkpoint_valid(checkpoint));
-
-        let vsr_checkpoint_ops = constants::VSR_CHECKPOINT_OPS as u64;
-        assert!(vsr_checkpoint_ops > 0);
-
-        let result = if checkpoint == 0 {
-            vsr_checkpoint_ops - 1
-        } else {
-            checkpoint
-                .checked_add(vsr_checkpoint_ops)
-                .expect("checkpoint_after overflow")
-        };
-
-        assert!((result + 1).is_multiple_of(constants::LSM_COMPACTION_OPS));
-        assert!(checkpoint_valid(result));
-
-        result
-    }
 
     // =========================================================================
     // Helper function to create valid RootOptions for testing
@@ -1253,14 +1281,6 @@ mod tests {
     fn test_padding_snapshots() {
         let mut state = CheckpointState::zeroed();
         state.snapshots_block_checksum_padding = 1;
-        state.assert_padding_zeroed();
-    }
-
-    #[test]
-    #[should_panic(expected = "reserved_manifest non-zero")]
-    fn test_padding_reserved_manifest() {
-        let mut state = CheckpointState::zeroed();
-        state.reserved_manifest[0] = 1;
         state.assert_padding_zeroed();
     }
 
@@ -2593,11 +2613,10 @@ mod tests {
         assert_eq!(state.log_view, 1);
         assert_eq!(state.view, 2);
         assert_eq!(state.checkpoint.header.op, 0);
-        // sync_op_min/max are set to commit_max in view_change (without sync_checkpoint)
-        assert_eq!(state.sync_op_min, 10);
-        assert_eq!(state.sync_op_max, 10);
-        // sync_view is set to log_view
-        assert_eq!(state.sync_view, 1);
+        // sync bounds remain unchanged without a sync checkpoint
+        assert_eq!(state.sync_op_min, 0);
+        assert_eq!(state.sync_op_max, 0);
+        assert_eq!(state.sync_view, 0);
     }
 
     #[test]
@@ -2636,8 +2655,8 @@ mod tests {
         assert_eq!(state.checkpoint.parent_checkpoint_id, current_checkpoint_id);
         assert_eq!(state.sync_op_min, 10);
         assert_eq!(state.sync_op_max, 12);
-        // With sync_checkpoint, sync_view is set to opts.view
-        assert_eq!(state.sync_view, 1);
+        // sync_view is unchanged
+        assert_eq!(state.sync_view, 7);
     }
 
     #[test]
