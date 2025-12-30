@@ -191,13 +191,16 @@ pub struct CheckpointState {
     pub client_sessions_last_block_checksum: Checksum128,
     pub client_sessions_last_block_checksum_padding: Checksum128,
 
-    pub free_set_blocks_acquired_last_block_address: u64,
-    pub free_set_blocks_released_last_block_address: u64,
-    pub client_sessions_last_block_address: u64,
+    // --- Manifest block chain ---
+    pub manifest_oldest_checksum: Checksum128,
+    pub manifest_oldest_checksum_padding: Checksum128,
 
-    pub free_set_blocks_acquired_size: u64,
-    pub free_set_blocks_released_size: u64,
-    pub client_sessions_size: u64,
+    pub manifest_newest_checksum: Checksum128,
+    pub manifest_newest_checksum_padding: Checksum128,
+
+    // --- Snapshots ---
+    pub snapshots_block_checksum: Checksum128,
+    pub snapshots_block_checksum_padding: Checksum128,
 
     /// Rolling checksum over all acquired block data.
     pub free_set_blocks_acquired_checksum: Checksum128,
@@ -210,30 +213,28 @@ pub struct CheckpointState {
     pub parent_checkpoint_id: u128,
     pub grandparent_checkpoint_id: u128,
 
-    // --- Manifest block chain ---
-    pub manifest_oldest_checksum: Checksum128,
-    pub manifest_oldest_checksum_padding: Checksum128,
-    pub manifest_oldest_address: u64,
+    pub free_set_blocks_acquired_last_block_address: u64,
+    pub free_set_blocks_released_last_block_address: u64,
+    pub client_sessions_last_block_address: u64,
 
-    pub manifest_newest_checksum: Checksum128,
-    pub manifest_newest_checksum_padding: Checksum128,
+    pub manifest_oldest_address: u64,
     pub manifest_newest_address: u64,
 
-    pub manifest_block_count: u32,
-    pub reserved_manifest: [u8; 4],
-
-    // --- Snapshots ---
-    pub snapshots_block_checksum: Checksum128,
-    pub snapshots_block_checksum_padding: Checksum128,
     pub snapshots_block_address: u64,
 
     pub storage_size: u64,
+
+    pub free_set_blocks_acquired_size: u64,
+    pub free_set_blocks_released_size: u64,
+    pub client_sessions_size: u64,
+
+    pub manifest_block_count: u32,
 
     /// Detects unclean shutdown when reopening the data file.
     pub release: Release,
 
     /// Reserved for future protocol versions. Must be zero.
-    pub reserved: [u8; 388],
+    pub reserved: [u8; 408],
 }
 
 // SAFETY: CheckpointState is repr(C) with fixed 1024-byte layout.
@@ -269,8 +270,7 @@ impl CheckpointState {
         assert!(state.manifest_oldest_checksum_padding == 0);
         assert!(state.manifest_newest_checksum_padding == 0);
         assert!(state.snapshots_block_checksum_padding == 0);
-        assert!(state.reserved_manifest == [0u8; 4]);
-        assert!(state.reserved == [0u8; 388]);
+        assert!(state.reserved == [0u8; 408]);
 
         state
     }
@@ -305,11 +305,7 @@ impl CheckpointState {
             self.snapshots_block_checksum_padding == 0,
             "snapshots_block padding non-zero"
         );
-        assert!(
-            self.reserved_manifest == [0u8; 4],
-            "reserved_manifest non-zero"
-        );
-        assert!(self.reserved == [0u8; 388], "checkpoint reserved non-zero");
+        assert!(self.reserved == [0u8; 408], "checkpoint reserved non-zero");
     }
 
     /// Computes the checkpoint ID as the checksum of the entire CheckpointState.
@@ -443,7 +439,6 @@ impl VsrState {
             manifest_newest_address: 0,
 
             manifest_block_count: 0,
-            reserved_manifest: [0u8; 4],
 
             snapshots_block_checksum: 0,
             snapshots_block_checksum_padding: 0,
@@ -452,7 +447,7 @@ impl VsrState {
             storage_size: constants::DATA_FILE_SIZE_MIN,
             release: opts.release,
 
-            reserved: [0u8; 388],
+            reserved: [0u8; 408],
         };
 
         assert!(checkpoint.storage_size >= constants::DATA_FILE_SIZE_MIN);
@@ -1253,14 +1248,6 @@ mod tests {
     fn test_padding_snapshots() {
         let mut state = CheckpointState::zeroed();
         state.snapshots_block_checksum_padding = 1;
-        state.assert_padding_zeroed();
-    }
-
-    #[test]
-    #[should_panic(expected = "reserved_manifest non-zero")]
-    fn test_padding_reserved_manifest() {
-        let mut state = CheckpointState::zeroed();
-        state.reserved_manifest[0] = 1;
         state.assert_padding_zeroed();
     }
 
