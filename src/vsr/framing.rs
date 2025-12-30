@@ -315,7 +315,7 @@ impl MessageBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsr::wire::Command;
+    use crate::vsr::Command;
 
     fn make_valid_message(command: Command, body: &[u8]) -> Vec<u8> {
         let mut header = Header::new(command, 1, 0);
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn decode_message_with_max_body_size() {
-        use crate::vsr::wire::constants::MESSAGE_BODY_SIZE_MAX;
+        use crate::vsr::MESSAGE_BODY_SIZE_MAX;
 
         let mut buf = MessageBuffer::new();
         let mut pool: MessagePool<4> = MessagePool::new();

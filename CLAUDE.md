@@ -26,7 +26,7 @@ orb cargo test --all-features --lib io::backend_linux # Run Linux tests (require
 
 - **`constants`**: Protocol constants (sizes, versions) with compile-time validation. Uses `u32` for portability across 32/64-bit platforms.
 
-- **`vsr::wire`**: Wire protocol primitives
+- **`vsr`**: VSR modules, including wire protocol primitives
   - `header`: 256-byte fixed-layout `#[repr(C)]` message header with dual checksums
   - `command`: Stable `#[repr(u8)]` discriminants for protocol messages (0-20)
   - `checksum`: Deterministic AEGIS-128L MAC (zero key/nonce for reproducibility)

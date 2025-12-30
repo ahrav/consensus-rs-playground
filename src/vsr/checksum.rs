@@ -13,7 +13,7 @@ pub type Checksum128 = u128;
 ///
 /// # Examples
 /// ```
-/// use consensus::vsr::wire::checksum;
+/// use consensus::vsr::checksum;
 ///
 /// let tag = checksum::checksum(b"message");
 /// assert_eq!(tag, checksum::checksum(b"message"));

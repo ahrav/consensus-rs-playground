@@ -19,18 +19,16 @@ use crate::{
     constants,
     util::{AlignedBox, Zeroable, align_up, as_bytes_unchecked, as_bytes_unchecked_mut},
     vsr::{
-        Header, ViewChangeArray, ViewChangeCommand, ViewChangeSlice, VsrState, storage,
-        wire::Checksum128,
+        Checksum128, Header, ViewChangeArray, ViewChangeCommand, ViewChangeSlice, VsrState, storage,
     },
 };
 use crate::{
     constants::SUPERBLOCK_VERSION,
     vsr::{
-        HeaderPrepare,
+        HeaderPrepare, Release, checksum,
         members::{Members, member_index},
         state::{CheckpointOptions, RootOptions, ViewChangeOptions},
         superblock_quorum::{Quorums, RepairIterator, Threshold},
-        wire::{checksum, header::Release},
     },
 };
 
@@ -2794,10 +2792,10 @@ mod tests {
     // Checkpoint Tests
     // =========================================================================
 
-    use crate::vsr::{HeaderPrepare, Members, ViewChangeArray, wire::checksum};
+    use crate::vsr::{HeaderPrepare, Members, ViewChangeArray, checksum};
 
     fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
-        use crate::vsr::wire::{Command, Operation};
+        use crate::vsr::{Command, Operation};
 
         assert!(op > 0);
 
@@ -2859,7 +2857,7 @@ mod tests {
 
     /// Initializes a SuperBlock with a formatted working header for checkpoint testing.
     fn setup_formatted_superblock() -> SuperBlock<MockStorage> {
-        use crate::vsr::wire::header::Release;
+        use crate::vsr::Release;
 
         let storage = MockStorage::new();
         let mut sb = SuperBlock::new(storage);

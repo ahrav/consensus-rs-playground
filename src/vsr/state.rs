@@ -10,8 +10,8 @@ use crate::{
     constants,
     util::{Pod, as_bytes, equal_bytes},
     vsr::{
-        HeaderPrepare, Members, ViewChangeArray, member_index, valid_members,
-        wire::{Checksum128, checksum, header::Release},
+        Checksum128, HeaderPrepare, Members, Release, ViewChangeArray, checksum, member_index,
+        valid_members,
     },
 };
 
@@ -1012,7 +1012,7 @@ fn checkpoint_after(checkpoint: u64) -> u64 {
 
 #[cfg(test)]
 fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
-    use crate::vsr::wire::{Command, Operation};
+    use crate::vsr::{Command, Operation};
 
     assert!(op > 0);
 
@@ -1039,7 +1039,7 @@ fn make_prepare_header(cluster: u128, op: u64) -> HeaderPrepare {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vsr::wire::header::Release;
+    use crate::vsr::Release;
     use crate::vsr::{ViewChangeArray, ViewChangeCommand};
 
     // =========================================================================
@@ -2806,7 +2806,7 @@ mod tests {
 #[cfg(test)]
 mod proptests {
     use super::*;
-    use crate::vsr::wire::header::Release;
+    use crate::vsr::Release;
     use proptest::prelude::*;
 
     /// Strategy for generating valid replica configurations

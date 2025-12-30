@@ -7,7 +7,7 @@
 use crate::{
     constants,
     stdx::bounded_array::BoundedArray,
-    vsr::{header_prepare::HeaderPrepare, wire::Command},
+    vsr::{Command, header_prepare::HeaderPrepare},
 };
 
 // Sanity bounds: VIEW_HEADERS_MAX must be reasonable and total memory bounded to 1MB.
