@@ -57,6 +57,7 @@ use crate::vsr::{
     journal_primitives::{
         Ring,
         SLOT_COUNT,
+        SLOT_COUNT_WORDS,
         // HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_MESSAGE,
         // WAL_HEADER_SIZE,
     },
@@ -284,13 +285,13 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     ///
     /// Similar to a dirty bit in a kernel page cache: indicates the in-memory
     /// state differs from durable storage.
-    pub dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
+    pub dirty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS>,
 
     /// Slots that are dirty due to corruption, misdirected writes, or sector errors.
     ///
     /// A faulty bit always implies the corresponding dirty bit is set. Faulty
     /// indicates the entry requires repair from another replica, not just a flush.
-    pub faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS>,
+    pub faulty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS>,
 
     /// Checksums of prepare messages, used to respond to `request_prepare` messages.
     ///
@@ -328,8 +329,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             )
         };
 
-        let dirty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
-        let faulty: BitSet<WRITE_OPS, WRITE_OPS_WORDS> = BitSet::full();
+        let dirty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS> = BitSet::full();
+        let faulty: BitSet<SLOT_COUNT, SLOT_COUNT_WORDS> = BitSet::full();
 
         let prepare_checksums = vec![0u128; SLOT_COUNT];
         let prepare_inhabited = vec![false; SLOT_COUNT];
@@ -1277,6 +1278,13 @@ mod tests {
         assert!(
             journal.faulty.is_full(),
             "faulty BitSet should be full initially"
+        );
+
+        // Verify dirty/faulty bitsets have correct capacity for all slots
+        assert_eq!(
+            BitSet::<SLOT_COUNT, SLOT_COUNT_WORDS>::capacity(),
+            SLOT_COUNT,
+            "dirty/faulty bitsets should track all journal slots"
         );
 
         // Vector lengths and contents - prepare_checksums

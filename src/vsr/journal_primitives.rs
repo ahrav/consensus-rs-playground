@@ -41,6 +41,9 @@ pub const WAL_HEADER_SIZE: usize = size_of::<Header>();
 /// Total slots in the journal's circular buffers.
 pub const SLOT_COUNT: usize = constants::JOURNAL_SLOT_COUNT;
 
+/// Number of u64 words needed to store SLOT_COUNT bits in a BitSet.
+pub const SLOT_COUNT_WORDS: usize = SLOT_COUNT.div_ceil(64);
+
 /// Size in bytes of the headers ring.
 pub const HEADERS_SIZE: u64 = constants::JOURNAL_SIZE_HEADERS;
 
