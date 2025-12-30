@@ -1,8 +1,7 @@
 //! Deterministic AEGIS-128L tag used as the wire-format checksum.
 //!
-//! Mirrors the Zig reference implementation: both key and nonce are zeroed so tags
-//! are reproducible across implementations. This detects corruption but is not a
-//! secret-key authenticator.
+//! Both key and nonce are zeroed so tags are reproducible across implementations.
+//! This detects corruption but is not a secret-key authenticator.
 
 pub type Checksum128 = u128;
 

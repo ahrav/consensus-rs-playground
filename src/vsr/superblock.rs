@@ -217,11 +217,12 @@ impl SuperBlockHeader {
 
     /// Returns a content-addressable identifier for this superblock state.
     ///
-    /// The checkpoint ID is the header checksum, making it deterministic and
-    /// collision-resistant. Two headers with identical VSR state produce the
-    /// same ID regardless of which copy slot they occupy.
+    /// The checkpoint ID is the checksum of the checkpoint state, making it
+    /// deterministic and collision-resistant. Two headers with identical
+    /// checkpoint state produce the same ID regardless of which copy slot
+    /// they occupy.
     pub fn checkpoint_id(&self) -> Checksum128 {
-        self.calculate_checksum()
+        self.vsr_state.checkpoint.checkpoint_id()
     }
 
     /// Returns true if the stored checksum matches the computed value.
@@ -616,8 +617,19 @@ impl<S: storage::Storage> SuperBlock<S> {
         assert!(!self.updating(Caller::ViewChange));
 
         assert!(opts.log_view <= opts.view);
-        assert!(opts.log_view >= self.staging.vsr_state.log_view);
-        assert!(opts.view >= self.staging.vsr_state.view);
+        if opts.view_attributes.is_none() {
+            assert!(
+                opts.log_view == self.staging.vsr_state.log_view,
+                "log_view must not change without view_attributes"
+            );
+            assert!(
+                opts.view == self.staging.vsr_state.view,
+                "view must not change without view_attributes"
+            );
+        } else {
+            assert!(opts.log_view >= self.staging.vsr_state.log_view);
+            assert!(opts.view >= self.staging.vsr_state.view);
+        }
         assert!(opts.commit_max >= self.staging.vsr_state.commit_max);
         assert!(opts.sync_op_min <= opts.sync_op_max);
         assert!(opts.storage_size >= constants::DATA_FILE_SIZE_MIN);
@@ -635,7 +647,7 @@ impl<S: storage::Storage> SuperBlock<S> {
 
         // Build view headers from staging (important for queued ops).
         let view_headers = if let Some(view_attrs) = &opts.view_attributes {
-            // Debug-contract checks, like Zig.
+            // Debug-contract checks.
             view_attrs.headers.verify();
             assert!(view_attrs.view == opts.view);
             assert!(view_attrs.log_view == opts.log_view);
