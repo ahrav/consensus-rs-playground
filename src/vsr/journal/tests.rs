@@ -1075,8 +1075,8 @@ fn panics_on_overlapping_different_offset() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
         // write1 is now locked (callback deferred).
@@ -1100,8 +1100,8 @@ fn panics_on_overlapping_different_length() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
         // write1 is now locked (callback deferred).
@@ -1124,8 +1124,8 @@ fn panics_on_overlapping_prepares() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Prepares, 0);
         // write1 is now locked (callback deferred).
@@ -1136,20 +1136,21 @@ fn panics_on_overlapping_prepares() {
 
 #[test]
 #[should_panic(expected = "assertion failed")]
-fn panics_on_duplicate_slot_index() {
+fn panics_on_duplicate_slot() {
     let mut storage = MockStorage::new();
     let mut journal = TestJournal::new(&mut storage, 0);
 
     let write1 = journal.writes.acquire().unwrap();
     let write2 = journal.writes.acquire().unwrap();
 
-    // Non-overlapping ranges but same slot index.
+    // Non-overlapping ranges but ops map to the same slot.
+    // op 42 and op 42 + SLOT_COUNT both map to slot 42.
     let buf1 = vec![1u8; 4096];
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 42;
-        (*write2).slot_index = 42; // Same slot - should panic.
+        (*write1).op = 42;
+        (*write2).op = 42 + SLOT_COUNT as u64; // Same slot - should panic.
 
         journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
         journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
@@ -1173,8 +1174,8 @@ fn completion_clears_wait_list() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
         journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 0);
@@ -1205,8 +1206,8 @@ fn async_overlap_queuing_defers_until_completion() {
     let buf2 = vec![2u8; 4096];
 
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
+        (*write1).op = 1;
+        (*write2).op = 2;
 
         // Submit first write - becomes locked.
         journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
@@ -1277,8 +1278,8 @@ mod integration_properties {
 
             for i in 0..write_count {
                 let write = journal.writes.acquire().unwrap();
-                // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                unsafe { (*write).slot_index = i as u32; }
+                // Set op immediately to avoid conflicts during lock_sectors iteration.
+                unsafe { (*write).op = i as u64; }
                 let buf = vec![i as u8; 4096];
                 buffers.push(buf);
                 writes.push(write);
@@ -1314,8 +1315,8 @@ mod integration_properties {
             // All same offset/length.
             for i in 0..overlap_count {
                 let write = journal.writes.acquire().unwrap();
-                // Set slot_index immediately to avoid conflicts during lock_sectors iteration.
-                unsafe { (*write).slot_index = i as u32; }
+                // Set op immediately to avoid conflicts during lock_sectors iteration.
+                unsafe { (*write).op = i as u64; }
                 let buf = vec![i as u8; 4096];
                 buffers.push(buf);
                 writes.push(write);
@@ -1357,7 +1358,7 @@ fn container_of_recovers_correct_write() {
     }
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         journal.write_sectors(write, verifying_callback, &buf, Ring::Headers, 0);
     }
 
@@ -1405,11 +1406,11 @@ fn batch_acquire_then_submit_is_safe() {
     let write2 = journal.writes.acquire().unwrap();
     let write3 = journal.writes.acquire().unwrap();
 
-    // Set slot indices (required by caller contract).
+    // Set op values (required by caller contract).
     unsafe {
-        (*write1).slot_index = 1;
-        (*write2).slot_index = 2;
-        (*write3).slot_index = 3;
+        (*write1).op = 1;
+        (*write2).op = 2;
+        (*write3).op = 3;
     }
 
     // Submit only the first write. lock_sectors will iterate write2 and write3,
@@ -1596,7 +1597,7 @@ fn async_writes_complete_correctly() {
     let buf = vec![1u8; 4096];
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         journal.write_sectors(write, dummy_callback_async, &buf, Ring::Headers, 0);
 
         // Should be locked (Async).
@@ -1630,7 +1631,7 @@ fn synchronous_callback_can_release_write() {
     }
 
     unsafe {
-        (*write).slot_index = 1;
+        (*write).op = 1;
         // This should not panic or trigger UB (accessing released write).
         journal.write_sectors(write, releasing_callback, &buf, Ring::Headers, 0);
     }
@@ -1650,4 +1651,290 @@ fn synchronous_callback_can_release_write() {
             panic!("Should be able to re-acquire all writes");
         }
     }
+}
+
+// =========================================================================
+// Header Helper Method Tests
+// =========================================================================
+
+/// Creates a valid HeaderPrepare with the given op and operation.
+fn make_header(op: u64, operation: Operation) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = operation;
+    header.op = op;
+    header.size = HeaderPrepare::SIZE as u32;
+    header.set_checksum();
+    header
+}
+
+/// Creates a reserved header for the given slot index.
+/// Reserved headers have operation = RESERVED and op = slot_index.
+fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = Operation::RESERVED;
+    header.op = slot_index as u64;
+    header.size = HeaderPrepare::SIZE as u32;
+    header.set_checksum();
+    header
+}
+
+// -------------------------------------------------------------------------
+// header_with_op Tests
+// -------------------------------------------------------------------------
+
+#[test]
+fn header_with_op_returns_none_for_reserved_slot() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Initialize slot 5 as reserved.
+    journal.headers[5] = make_reserved_header(5);
+
+    // Slot 5 is reserved, so header_with_op(5) should return None.
+    assert!(journal.header_with_op(5).is_none());
+}
+
+#[test]
+fn header_with_op_returns_none_for_different_op_same_slot() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert a header at op 5 (slot 5).
+    let header = make_header(5, Operation::REGISTER);
+    journal.headers[5] = header;
+
+    // Query for op = 5 + SLOT_COUNT (same slot, different op).
+    // Should return None because the op doesn't match.
+    assert!(journal.header_with_op(5 + SLOT_COUNT as u64).is_none());
+}
+
+#[test]
+fn header_with_op_returns_header_when_op_matches() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert a header at op 42.
+    let header = make_header(42, Operation::REGISTER);
+    journal.headers[42] = header;
+
+    // Query for op 42 should return the header.
+    let result = journal.header_with_op(42);
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().op, 42);
+    assert_eq!(result.unwrap().operation, Operation::REGISTER);
+}
+
+#[test]
+fn header_with_op_works_with_wraparound_ops() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert a header at op = SLOT_COUNT (which maps to slot 0).
+    let op = SLOT_COUNT as u64;
+    let header = make_header(op, Operation::REGISTER);
+    journal.headers[0] = header;
+
+    // Query for op = SLOT_COUNT should return the header.
+    let result = journal.header_with_op(op);
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().op, op);
+}
+
+// -------------------------------------------------------------------------
+// header_with_op_and_checksum Tests
+// -------------------------------------------------------------------------
+
+#[test]
+fn header_with_op_and_checksum_returns_none_when_op_not_found() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Initialize slot 42 as reserved.
+    journal.headers[42] = make_reserved_header(42);
+
+    // Slot 42 is reserved, so any query should return None.
+    let result = journal.header_with_op_and_checksum(42, Checksum128::default());
+    assert!(result.is_none());
+}
+
+#[test]
+fn header_with_op_and_checksum_returns_none_when_checksum_mismatch() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert a valid header.
+    let header = make_header(42, Operation::REGISTER);
+    let actual_checksum = header.checksum;
+    journal.headers[42] = header;
+
+    // Query with a different checksum should return None.
+    let wrong_checksum = actual_checksum.wrapping_add(1);
+    let result = journal.header_with_op_and_checksum(42, wrong_checksum);
+    assert!(result.is_none());
+}
+
+#[test]
+fn header_with_op_and_checksum_returns_header_when_both_match() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert a valid header.
+    let header = make_header(42, Operation::REGISTER);
+    let checksum = header.checksum;
+    journal.headers[42] = header;
+
+    // Query with correct checksum should return the header.
+    let result = journal.header_with_op_and_checksum(42, checksum);
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().op, 42);
+}
+
+// -------------------------------------------------------------------------
+// previous_entry / next_entry Tests
+// -------------------------------------------------------------------------
+
+#[test]
+fn previous_entry_returns_none_for_op_zero() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert header at op 0.
+    let header = make_header(0, Operation::ROOT);
+    journal.headers[0] = header;
+
+    // previous_entry for op 0 should return None.
+    let result = journal.previous_entry(&journal.headers[0]);
+    assert!(result.is_none());
+}
+
+#[test]
+fn previous_entry_returns_header_when_exists() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert headers at op 4 and op 5.
+    let header4 = make_header(4, Operation::REGISTER);
+    let header5 = make_header(5, Operation::REGISTER);
+    journal.headers[4] = header4;
+    journal.headers[5] = header5;
+
+    // previous_entry for header at op 5 should return header at op 4.
+    let result = journal.previous_entry(&journal.headers[5]);
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().op, 4);
+}
+
+#[test]
+fn previous_entry_returns_none_when_previous_not_exists() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Initialize slot 4 as reserved.
+    journal.headers[4] = make_reserved_header(4);
+
+    // Insert header at op 5 only (op 4 is reserved).
+    let header5 = make_header(5, Operation::REGISTER);
+    journal.headers[5] = header5;
+
+    // previous_entry for header at op 5 should return None (op 4 is reserved).
+    let result = journal.previous_entry(&journal.headers[5]);
+    assert!(result.is_none());
+}
+
+#[test]
+fn next_entry_returns_header_when_exists() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Insert headers at op 4 and op 5.
+    let header4 = make_header(4, Operation::REGISTER);
+    let header5 = make_header(5, Operation::REGISTER);
+    journal.headers[4] = header4;
+    journal.headers[5] = header5;
+
+    // next_entry for header at op 4 should return header at op 5.
+    let result = journal.next_entry(&journal.headers[4]);
+    assert!(result.is_some());
+    assert_eq!(result.unwrap().op, 5);
+}
+
+#[test]
+fn next_entry_returns_none_when_next_not_exists() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Initialize slot 6 as reserved.
+    journal.headers[6] = make_reserved_header(6);
+
+    // Insert header at op 5 only (op 6 is reserved).
+    let header5 = make_header(5, Operation::REGISTER);
+    journal.headers[5] = header5;
+
+    // next_entry for header at op 5 should return None.
+    let result = journal.next_entry(&journal.headers[5]);
+    assert!(result.is_none());
+}
+
+// -------------------------------------------------------------------------
+// op_maximum Tests
+// -------------------------------------------------------------------------
+
+#[test]
+#[should_panic]
+fn op_maximum_panics_when_not_recovered() {
+    let mut storage = MockStorage::new();
+    let journal = TestJournal::new(&mut storage, 0);
+
+    // Status is Init, should panic.
+    let _ = journal.op_maximum();
+}
+
+#[test]
+fn op_maximum_returns_zero_when_all_reserved() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Set status to Recovered.
+    journal.status = Status::Recovered;
+
+    // All slots are reserved (zeroed), so op_maximum should return 0.
+    assert_eq!(journal.op_maximum(), 0);
+}
+
+#[test]
+fn op_maximum_returns_max_op() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Set status to Recovered.
+    journal.status = Status::Recovered;
+
+    // Insert headers at various ops.
+    journal.headers[10] = make_header(10, Operation::REGISTER);
+    journal.headers[50] = make_header(50, Operation::REGISTER);
+    journal.headers[25] = make_header(25, Operation::REGISTER);
+
+    // op_maximum should return 50.
+    assert_eq!(journal.op_maximum(), 50);
+}
+
+#[test]
+fn op_maximum_handles_wraparound_ops() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+
+    // Set status to Recovered.
+    journal.status = Status::Recovered;
+
+    // Insert a header at op = SLOT_COUNT * 2 + 5 (maps to slot 5).
+    let high_op = SLOT_COUNT as u64 * 2 + 5;
+    journal.headers[5] = make_header(high_op, Operation::REGISTER);
+
+    // Also insert a header at op = 10 (slot 10).
+    journal.headers[10] = make_header(10, Operation::REGISTER);
+
+    // op_maximum should return the high_op value.
+    assert_eq!(journal.op_maximum(), high_op);
 }

@@ -479,10 +479,11 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ) -> Option<&HeaderPrepare> {
         if let Some(existing) = self.header_with_op(op) {
             assert!(existing.op == op);
-            Some(existing)
-        } else {
-            None
+            if existing.checksum == checksum {
+                return Some(existing);
+            }
         }
+        None
     }
 
     #[inline]
@@ -717,7 +718,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             // SAFETY: All `Write` pointers from the iterator are valid pool entries.
             unsafe {
                 // Never allow concurrent writes to the same slot.
-                assert!((*other).slot_index != (*write).slot_index);
+                let other_slot = Slot::from_op((*other).op);
+                let write_slot = Slot::from_op((*write).op);
+                assert!(other_slot != write_slot);
 
                 if !(*other).range.locked {
                     continue;
