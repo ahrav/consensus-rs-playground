@@ -177,7 +177,46 @@ impl MessagePool {
         }))
     }
 
-    // TODO: pub fn try_get<C: CommandMarker>(&self) -> Option<Message<C>>
+    /// Attempts to acquire a message buffer from the pool.
+    ///
+    /// Returns `None` if the pool is exhausted (all buffers are in use).
+    /// The returned message is initialized with:
+    /// - Header bytes zeroed
+    /// - Command set to `C::COMMAND`
+    /// - Size set to [`constants::HEADER_SIZE`] (header only, no body)
+    ///
+    /// The message has a reference count of 1 (unique ownership).
+    pub fn try_get<C: CommandMarker>(&self) -> Option<Message<C>> {
+        let inner = self.0.pop_free()?;
+
+        let m = unsafe { inner.as_ref() };
+        m.refs.set(1);
+
+        let buf = m.buf_ptr();
+        unsafe { std::ptr::write_bytes(buf, 0, constants::HEADER_SIZE_USIZE) };
+
+        let header = unsafe { &mut *(buf as *mut C::Header) };
+        header.set_command(C::COMMAND);
+        header.set_size(constants::HEADER_SIZE);
+
+        Some(Message {
+            inner,
+            pool: self.0.clone(),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Acquires a message buffer from the pool.
+    ///
+    /// This is a convenience wrapper around [`try_get`](Self::try_get) that panics
+    /// if no buffers are available.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool is exhausted (all buffers are in use).
+    pub fn get<C: CommandMarker>(&self) -> Message<C> {
+        self.try_get().expect("message pool is empty")
+    }
 }
 
 /// A reference-counted handle to a pooled message buffer.
