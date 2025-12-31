@@ -40,8 +40,8 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
-use core::cmp::min;
 #[allow(dead_code)]
+use core::cmp::min;
 use core::mem::MaybeUninit;
 use core::ptr;
 
@@ -496,6 +496,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot for `op` only if a header with that exact op exists.
     #[inline]
+    #[allow(dead_code)]
     fn slot_with_op(&self, op: u64) -> Option<Slot> {
         self.header_with_op(op).map(|_| self.slot_for_op(op))
     }
@@ -518,6 +519,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot only if this EXACT header (op + checksum) exists.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_with_op_and_checksum(&self, op: u64, checksum: Checksum128) -> Option<Slot> {
         self.header_with_op_and_checksum(op, checksum)
             .map(|_| self.slot_for_op(op))
@@ -545,6 +547,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot for a header known to exist. Asserts presence.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_for_header(&self, header: &HeaderPrepare) -> Slot {
         assert!(self.slot_with_op(header.op).is_some());
         self.slot_for_op(header.op)
@@ -552,6 +555,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot only if this exact header exists in the journal.
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_with_header(&self, header: &HeaderPrepare) -> Option<Slot> {
         self.slot_with_op_and_checksum(header.op, header.checksum)
     }
@@ -561,12 +565,14 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     // =========================================================================
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn has_header(&self, header: &HeaderPrepare) -> bool {
         self.header_with_op_and_checksum(header.op, header.checksum)
             .is_some()
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn has_dirty(&self, header: &HeaderPrepare) -> bool {
         assert!(self.has_header(header));
         let slot = self.slot_for_header(header);

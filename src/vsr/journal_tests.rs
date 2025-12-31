@@ -1079,6 +1079,16 @@ mod header_helper_properties {
     }
 
     proptest! {
+        /// Property: slot_for_op maps to op % SLOT_COUNT.
+        #[test]
+        fn prop_slot_for_op_maps_to_modulo(op in any::<u64>()) {
+            let mut storage = MockStorage::new();
+            let journal = TestJournal::new(&mut storage, 0);
+
+            let slot = journal.slot_for_op(op);
+            prop_assert_eq!(slot.index(), (op % SLOT_COUNT as u64) as usize);
+        }
+
         /// Property: header_with_op returns Some iff stored header.op == query op.
         /// Only tests within the same slot to avoid accessing uninitialized headers.
         #[test]
@@ -1093,16 +1103,37 @@ mod header_helper_properties {
             let stored_op = slot as u64 + epoch * SLOT_COUNT as u64;
             journal.headers[slot] = make_header(stored_op, Operation::REGISTER);
 
+            let slot_from_op = journal.slot_for_op(stored_op);
+            prop_assert_eq!(slot_from_op.index(), slot);
+
             // Query with the exact op - should return the header
             let result = journal.header_with_op(stored_op);
             prop_assert!(result.is_some());
             prop_assert_eq!(result.unwrap().op, stored_op);
+
+            let slot_with_op = journal.slot_with_op(stored_op);
+            prop_assert_eq!(slot_with_op.map(|slot| slot.index()), Some(slot));
+
+            let header_for_op = journal.header_for_op(stored_op).unwrap();
+            prop_assert_eq!(header_for_op.op, stored_op);
+
+            let slot_for_header = journal.slot_for_header(header_for_op);
+            prop_assert_eq!(slot_for_header.index(), slot);
 
             // Query with a different epoch for the same slot - should return None
             let different_epoch = if epoch == 0 { 1 } else { epoch - 1 };
             let different_op = slot as u64 + different_epoch * SLOT_COUNT as u64;
             let result_different = journal.header_with_op(different_op);
             prop_assert!(result_different.is_none());
+
+            let different_slot = journal.slot_for_op(different_op);
+            prop_assert_eq!(different_slot.index(), slot);
+
+            let header_for_different_op = journal.header_for_op(different_op).unwrap();
+            prop_assert_eq!(header_for_different_op.op, stored_op);
+
+            let slot_with_different_op = journal.slot_with_op(different_op);
+            prop_assert!(slot_with_different_op.is_none());
         }
 
         /// Property: reserved slots always return None regardless of query op.
@@ -1115,12 +1146,29 @@ mod header_helper_properties {
             let mut journal = TestJournal::new(&mut storage, 0);
 
             // Initialize the slot as reserved (default behavior but explicit here)
-            journal.headers[slot] = make_reserved_header(slot);
+            let reserved = make_reserved_header(slot);
+            journal.headers[slot] = reserved;
 
             // Query for any op that maps to this slot - should return None
             let query_op = slot as u64 + epoch * SLOT_COUNT as u64;
             let result = journal.header_with_op(query_op);
             prop_assert!(result.is_none());
+
+            let header_for_op = journal.header_for_op(query_op);
+            prop_assert!(header_for_op.is_none());
+
+            let slot_with_op = journal.slot_with_op(query_op);
+            prop_assert!(slot_with_op.is_none());
+
+            let slot_with_op_and_checksum =
+                journal.slot_with_op_and_checksum(query_op, reserved.checksum);
+            prop_assert!(slot_with_op_and_checksum.is_none());
+
+            let slot_with_header = journal.slot_with_header(&reserved);
+            prop_assert!(slot_with_header.is_none());
+
+            let has_header = journal.has_header(&reserved);
+            prop_assert!(!has_header);
         }
 
         /// Property: header_with_op_and_checksum requires BOTH op AND checksum match.
@@ -1144,12 +1192,47 @@ mod header_helper_properties {
             };
 
             let result = journal.header_with_op_and_checksum(op, query_checksum);
+            let slot_result = journal.slot_with_op_and_checksum(op, query_checksum);
+
+            let query_header = if use_correct_checksum {
+                header
+            } else {
+                let mut mutated = header;
+                mutated.checksum = query_checksum;
+                mutated
+            };
+
+            let slot_with_header = journal.slot_with_header(&query_header);
+            let has_header = journal.has_header(&query_header);
 
             if use_correct_checksum {
                 prop_assert!(result.is_some());
+                prop_assert_eq!(slot_result.map(|slot| slot.index()), Some(slot));
+                prop_assert_eq!(slot_with_header.map(|slot| slot.index()), Some(slot));
+                prop_assert!(has_header);
             } else {
                 prop_assert!(result.is_none());
+                prop_assert!(slot_result.is_none());
+                prop_assert!(slot_with_header.is_none());
+                prop_assert!(!has_header);
             }
+        }
+
+        /// Property: has_dirty reflects the dirty bit for an existing header.
+        #[test]
+        fn prop_has_dirty_tracks_dirty_bit(
+            op in op_strategy(),
+            is_dirty in proptest::bool::ANY
+        ) {
+            let mut storage = MockStorage::new();
+            let mut journal = TestJournal::new(&mut storage, 0);
+
+            let header = make_header(op, Operation::REGISTER);
+            let slot = (op % SLOT_COUNT as u64) as usize;
+            journal.headers[slot] = header;
+            journal.dirty.set_value(slot, is_dirty);
+
+            prop_assert_eq!(journal.has_dirty(&header), is_dirty);
         }
 
         /// Property: previous_entry returns op-1 when it exists.
