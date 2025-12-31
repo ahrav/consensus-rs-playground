@@ -1299,6 +1299,173 @@ mod header_helper_properties {
 }
 
 // =========================================================================
+// Journal Internal State (Unit Tests)
+// =========================================================================
+
+#[test]
+fn set_header_as_dirty_updates_reserved_slot() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+    journal.dirty = BitSet::empty();
+    journal.faulty = BitSet::empty();
+
+    let op = 5u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    journal.headers[slot] = make_reserved_header(slot);
+    let redundant_before = journal.headers_redundant[slot];
+
+    let header = make_header(op, Operation::REGISTER);
+    journal.set_header_as_dirty(&header);
+
+    assert_eq!(journal.headers[slot], header);
+    assert!(journal.dirty.is_set(slot));
+    assert_eq!(journal.headers_redundant[slot], redundant_before);
+    assert_eq!(journal.headers_redundant[slot].checksum, 0);
+    assert!(!journal.faulty.is_set(slot));
+}
+
+#[test]
+fn set_header_as_dirty_overwrite_clears_faulty_and_resets_redundant() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+    journal.dirty = BitSet::empty();
+    journal.faulty = BitSet::empty();
+
+    let op = 7u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let existing = make_header(op, Operation::REGISTER);
+    journal.headers[slot] = existing;
+    journal.faulty.set(slot);
+    journal.headers_redundant[slot] = make_header(op + 1, Operation::ROOT);
+
+    let mut header = make_header(op, Operation::RECONFIGURE);
+    header.cluster = 7u128;
+    header.set_checksum();
+
+    journal.set_header_as_dirty(&header);
+
+    assert_eq!(journal.headers[slot], header);
+    assert!(journal.dirty.is_set(slot));
+    assert!(!journal.faulty.is_set(slot));
+    assert_eq!(
+        journal.headers_redundant[slot],
+        HeaderPrepare::reserve(header.cluster, slot as u64)
+    );
+}
+
+#[test]
+fn set_header_as_dirty_noop_when_header_exists() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+    journal.dirty = BitSet::empty();
+    journal.faulty = BitSet::empty();
+
+    let op = 9u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header = make_header(op, Operation::REGISTER);
+    journal.headers[slot] = header;
+    journal.dirty.set(slot);
+    journal.faulty.set(slot);
+    let redundant = make_header(op + 1, Operation::NOOP);
+    journal.headers_redundant[slot] = redundant;
+
+    journal.set_header_as_dirty(&header);
+
+    assert_eq!(journal.headers[slot], header);
+    assert!(journal.dirty.is_set(slot));
+    assert!(journal.faulty.is_set(slot));
+    assert_eq!(journal.headers_redundant[slot], redundant);
+}
+
+#[test]
+fn writing_returns_none_when_no_matching_slot() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let header = make_header(3, Operation::REGISTER);
+    let write = journal.writes.acquire().unwrap();
+    unsafe {
+        (*write).op = header.op + 1;
+        (*write).checksum = header.checksum;
+    }
+
+    assert_eq!(journal.writing(&header), Writing::None);
+}
+
+#[test]
+fn writing_returns_exact_when_checksum_matches() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let header = make_header(11, Operation::REGISTER);
+    let write = journal.writes.acquire().unwrap();
+    unsafe {
+        (*write).op = header.op;
+        (*write).checksum = header.checksum;
+    }
+
+    assert_eq!(journal.writing(&header), Writing::Exact);
+}
+
+#[test]
+fn writing_returns_slot_when_checksum_differs() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let header = make_header(12, Operation::REGISTER);
+    let write = journal.writes.acquire().unwrap();
+    unsafe {
+        (*write).op = header.op;
+        (*write).checksum = header.checksum.wrapping_add(1);
+    }
+
+    assert_eq!(journal.writing(&header), Writing::Slot);
+}
+
+#[test]
+#[should_panic(expected = "assertion failed")]
+fn writing_panics_on_multiple_writes_same_slot() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let header = make_header(13, Operation::REGISTER);
+    let write1 = journal.writes.acquire().unwrap();
+    let write2 = journal.writes.acquire().unwrap();
+    unsafe {
+        (*write1).op = header.op;
+        (*write1).checksum = header.checksum;
+        (*write2).op = header.op;
+        (*write2).checksum = header.checksum;
+    }
+
+    let _ = journal.writing(&header);
+}
+
+#[test]
+#[should_panic(expected = "assertion failed")]
+fn writing_panics_on_same_slot_different_op() {
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let header = make_header(1, Operation::REGISTER);
+    let write = journal.writes.acquire().unwrap();
+    unsafe {
+        (*write).op = header.op + SLOT_COUNT as u64;
+        (*write).checksum = header.checksum;
+    }
+
+    let _ = journal.writing(&header);
+}
+
+// =========================================================================
 // Locking Protocol (Unit Tests)
 // =========================================================================
 
