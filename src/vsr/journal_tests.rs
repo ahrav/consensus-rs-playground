@@ -1,4 +1,5 @@
 use super::*;
+use crate::message_pool::MessagePool;
 use crate::storage::AlignedBuf;
 use crate::vsr::superblock;
 use core::cell::RefCell;
@@ -147,6 +148,33 @@ type TestJournal = Journal<TestMockStorage, 32, 1>;
 /// Dummy callback for tests that don't need callback verification.
 fn dummy_callback(_: *mut TestWrite) {}
 fn dummy_callback_async(_: *mut Write<MockStorage<true>, 32, 1>) {}
+
+thread_local! {
+    static PREPARE_CALLBACKS: RefCell<Vec<Option<*mut MessagePrepare>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn record_prepare_callback(
+    _journal: *mut TestJournal,
+    message: Option<*mut MessagePrepare>,
+) {
+    PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
+}
+
+fn record_prepare_callback_async(
+    _journal: *mut Journal<MockStorage<true>, 32, 1>,
+    message: Option<*mut MessagePrepare>,
+) {
+    PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
+}
+
+fn reset_prepare_callbacks() {
+    PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+}
+
+fn take_prepare_callbacks() -> Vec<Option<*mut MessagePrepare>> {
+    PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().drain(..).collect())
+}
 
 // =========================================================================
 // HeaderChunk Unit Tests
@@ -1665,6 +1693,233 @@ fn async_overlap_queuing_defers_until_completion() {
     }
 }
 
+#[test]
+fn async_overlap_queuing_handles_multiple_waiters() {
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+
+    let write1 = journal.writes.acquire().unwrap();
+    let write2 = journal.writes.acquire().unwrap();
+    let write3 = journal.writes.acquire().unwrap();
+
+    let buf1 = vec![1u8; 4096];
+    let buf2 = vec![2u8; 4096];
+    let buf3 = vec![3u8; 4096];
+
+    unsafe {
+        (*write1).op = 1;
+        (*write2).op = 2;
+        (*write3).op = 3;
+
+        journal.write_sectors(write1, dummy_callback_async, &buf1, Ring::Headers, 0);
+        journal.write_sectors(write2, dummy_callback_async, &buf2, Ring::Headers, 0);
+        journal.write_sectors(write3, dummy_callback_async, &buf3, Ring::Headers, 0);
+
+        assert_eq!(storage.write_count(), 1);
+        assert!((*write1).range.locked);
+        assert!(!(*write2).range.locked);
+        assert!(!(*write3).range.locked);
+
+        storage.drain_callbacks();
+        assert_eq!(storage.write_count(), 2);
+        assert!(!(*write1).range.locked);
+        assert!((*write2).range.locked);
+        assert!(!(*write3).range.locked);
+
+        storage.drain_callbacks();
+        assert_eq!(storage.write_count(), 3);
+        assert!(!(*write2).range.locked);
+        assert!((*write3).range.locked);
+
+        storage.drain_callbacks();
+        assert!(!(*write3).range.locked);
+    }
+}
+
+// =========================================================================
+// Write Prepare Path (Unit Tests)
+// =========================================================================
+
+#[test]
+fn write_prepare_skips_clean_slot() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 5u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header =
+        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+
+    journal.headers[slot] = header;
+    journal.headers_redundant[slot] = header;
+    journal.prepare_inhabited[slot] = true;
+    journal.prepare_checksums[slot] = header.checksum;
+    journal.dirty.unset(slot);
+    journal.faulty.unset(slot);
+
+    let mut message = make_prepare_message(&pool, header);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback, message_ptr);
+
+    assert_eq!(storage.write_count(), 0);
+    assert_eq!(take_prepare_callbacks(), vec![None]);
+    assert!(!journal.dirty.is_set(slot));
+    assert!(!journal.faulty.is_set(slot));
+    assert!(journal.prepare_inhabited[slot]);
+    assert_eq!(journal.prepare_checksums[slot], header.checksum);
+    assert_eq!(journal.headers_redundant[slot], header);
+}
+
+#[test]
+fn write_prepare_returns_none_when_pool_exhausted() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 1u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header =
+        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    journal.headers[slot] = header;
+
+    let mut busy = Vec::new();
+    for _ in 0..32 {
+        busy.push(journal.writes.acquire().unwrap());
+    }
+    assert!(journal.writes.acquire().is_none());
+
+    let mut message = make_prepare_message(&pool, header);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback, message_ptr);
+
+    assert_eq!(storage.write_count(), 0);
+    assert_eq!(take_prepare_callbacks(), vec![None]);
+
+    for write in busy {
+        journal.writes.release(write);
+    }
+}
+
+#[test]
+fn write_prepare_happy_path_updates_state_and_writes() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 7u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header =
+        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    journal.headers[slot] = header;
+
+    let mut message = make_prepare_message(&pool, header);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback, message_ptr);
+
+    let log = storage.write_log.borrow();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].zone, Zone::WalPrepares);
+    assert_eq!(log[0].offset, (constants::MESSAGE_SIZE_MAX as u64) * slot as u64);
+    assert_eq!(log[0].len, constants::SECTOR_SIZE);
+
+    let expected_header_offset =
+        (slot / HEADERS_PER_SECTOR * constants::SECTOR_SIZE) as u64;
+    assert_eq!(log[1].zone, Zone::WalHeaders);
+    assert_eq!(log[1].offset, expected_header_offset);
+    assert_eq!(log[1].len, constants::SECTOR_SIZE);
+    drop(log);
+
+    assert!(!journal.dirty.is_set(slot));
+    assert!(!journal.faulty.is_set(slot));
+    assert_eq!(journal.headers_redundant[slot], header);
+    assert!(journal.prepare_inhabited[slot]);
+    assert_eq!(journal.prepare_checksums[slot], header.checksum);
+    assert_eq!(take_prepare_callbacks(), vec![Some(message_ptr)]);
+}
+
+#[test]
+fn write_prepare_aborts_when_header_changes_during_payload_write() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 9u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header =
+        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    journal.headers[slot] = header;
+
+    let mut message = make_prepare_message(&pool, header);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback_async, message_ptr);
+    assert_eq!(storage.write_count(), 1);
+    assert_eq!(storage.pending_callbacks.borrow().len(), 1);
+
+    let new_header =
+        make_prepare_header_with_size(op, Operation::ROOT, constants::SECTOR_SIZE);
+    journal.headers[slot] = new_header;
+
+    storage.drain_callbacks();
+
+    assert_eq!(storage.write_count(), 1);
+    assert_eq!(storage.pending_callbacks.borrow().len(), 0);
+    assert!(journal.dirty.is_set(slot));
+    assert_eq!(take_prepare_callbacks(), vec![None]);
+}
+
+#[test]
+fn write_prepare_aborts_on_header_write_mismatch() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 11u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+    let header =
+        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    journal.headers[slot] = header;
+
+    let mut message = make_prepare_message(&pool, header);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback_async, message_ptr);
+    assert_eq!(storage.write_count(), 1);
+
+    storage.drain_callbacks();
+    assert_eq!(storage.write_count(), 2);
+    assert_eq!(storage.pending_callbacks.borrow().len(), 1);
+
+    journal.headers_redundant[slot].checksum = header.checksum.wrapping_add(1);
+
+    storage.drain_callbacks();
+
+    assert_eq!(storage.write_count(), 2);
+    assert_eq!(storage.pending_callbacks.borrow().len(), 0);
+    assert!(journal.dirty.is_set(slot));
+    assert!(journal.faulty.is_set(slot));
+    assert_eq!(take_prepare_callbacks(), vec![None]);
+}
+
 // =========================================================================
 // Integration Properties (Property Tests)
 // =========================================================================
@@ -2087,6 +2342,31 @@ fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
     header.size = HeaderPrepare::SIZE as u32;
     header.set_checksum();
     header
+}
+
+/// Creates a valid Prepare header with a sector-aligned size.
+fn make_prepare_header_with_size(op: u64, operation: Operation, size: usize) -> HeaderPrepare {
+    assert!(size.is_multiple_of(constants::SECTOR_SIZE));
+    assert!(size >= HeaderPrepare::SIZE);
+
+    let mut header = HeaderPrepare::new();
+    header.command = Command::Prepare;
+    header.operation = operation;
+    header.op = op;
+    header.size = size as u32;
+
+    let body_len = size - HeaderPrepare::SIZE;
+    let body = vec![0u8; body_len];
+    header.set_checksum_body(&body);
+    header.set_checksum();
+
+    header
+}
+
+fn make_prepare_message(pool: &MessagePool, header: HeaderPrepare) -> Box<MessagePrepare> {
+    let mut message = Box::new(pool.get::<PrepareCmd>());
+    *message.header_mut() = header;
+    message
 }
 
 // -------------------------------------------------------------------------

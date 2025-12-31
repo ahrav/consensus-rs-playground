@@ -857,6 +857,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `message` is null or not a non-reserved `Prepare` header
     /// - The header does not exist in memory or a write is already in flight
+    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare(
         &mut self,
         callback: WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -867,7 +868,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
         let header = unsafe { (*message).header() };
         assert!(header.command == Command::Prepare);
-        assert!(!(header.operation == Operation::RESERVED));
+        assert!(header.operation != Operation::RESERVED);
 
         let message_buffer = unsafe { (*message).as_bytes() };
         let header_size = header.size as usize;
@@ -934,6 +935,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// submits a header sector write. If the in-memory header changed while the
     /// payload write was in flight, the slot is left dirty and the write is
     /// released without completing the prepare.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
         let journal = unsafe { &mut *(*write).journal };
         assert!(matches!(journal.status, Status::Recovered));
@@ -971,7 +973,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let buffer_ptr = buffer.as_ptr();
         let buffer_len = buffer.len();
 
-        let offset = (slot.index() * constants::SECTOR_SIZE) as u64;
+        let offset = Ring::Headers.offset(slot);
         assert!(offset.is_multiple_of(constants::SECTOR_SIZE as u64));
 
         // SAFETY: buffer_ptr/buffer_len come from header_sector which returns a slice
@@ -998,6 +1000,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Panics if the sector index is out of range or `write` does not come from
     /// the journal's write pool.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn header_sector(
         &mut self,
         sector_index: usize,
@@ -1027,9 +1030,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             &self.headers_redundant[sector_slot.index()..sector_slot.index() + HEADERS_PER_SECTOR],
         );
 
-        for i in 0..HEADERS_PER_SECTOR {
+        for (i, sh) in sector_headers.iter().enumerate() {
             let slot = Slot::new(sector_slot.index() + i);
-            let sh = &sector_headers[i];
 
             if sh.operation == Operation::RESERVED && sh.checksum == 0 {
                 assert!(self.faulty.is_set(slot.index()));
@@ -1046,6 +1048,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// Verifies the header still matches the in-memory slot and redundant copy,
     /// clears dirty/faulty flags, and releases the write. If any check fails, the
     /// write is released without marking the slot durable.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_on_write_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
         let journal = unsafe { &mut *(*write).journal };
         assert!(matches!(journal.status, Status::Recovered));
@@ -1086,6 +1089,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// The IOP is returned to the pool before calling into user code to avoid
     /// reentrancy issues and to allow immediate reuse.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_release(
         journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
         write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>,
