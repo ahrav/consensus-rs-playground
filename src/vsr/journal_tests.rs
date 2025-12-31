@@ -38,7 +38,6 @@ struct MockReadCompletion {
 
 /// Record of a single write operation for verification.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future verification extensions.
 struct WriteRecord {
     zone: Zone,
     offset: u64,
@@ -47,7 +46,7 @@ struct WriteRecord {
 
 /// Record of a single read operation for verification.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future verification extensions.
+#[allow(dead_code)] // zone/offset fields reserved for future verification extensions.
 struct ReadRecord {
     zone: Zone,
     offset: u64,
@@ -104,8 +103,16 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
             .insert(ReadKey { zone, offset }, data);
     }
 
+    fn store_write_data(&self, zone: Zone, offset: u64, data: &[u8]) {
+        let mut map = self.read_data.borrow_mut();
+        let entry = map.entry(ReadKey { zone, offset }).or_default();
+        if entry.len() < data.len() {
+            entry.resize(data.len(), 0);
+        }
+        entry[..data.len()].copy_from_slice(data);
+    }
+
     /// Invokes all pending callbacks in order.
-    #[allow(dead_code)] // Useful for future tests needing explicit completion control.
     fn drain_callbacks(&self) {
         let callbacks: Vec<_> = self.pending_callbacks.borrow_mut().drain(..).collect();
         for write_ptr in callbacks {
@@ -119,7 +126,6 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
     }
 
     /// Invokes all pending read callbacks in order.
-    #[allow(dead_code)] // Useful for future tests needing explicit completion control.
     fn drain_read_callbacks(&self) {
         let callbacks: Vec<_> = self.pending_read_callbacks.borrow_mut().drain(..).collect();
         for read_ptr in callbacks {
@@ -197,6 +203,7 @@ impl<const ASYNC: bool> Storage for MockStorage<ASYNC> {
             offset,
             len: buffer.len(),
         });
+        self.store_write_data(zone, offset, buffer);
 
         // Store callback for invocation.
         write.callback = callback;
@@ -2500,6 +2507,134 @@ fn write_prepare_aborts_on_header_write_mismatch() {
     assert!(journal.dirty.is_set(slot));
     assert!(journal.faulty.is_set(slot));
     assert_eq!(take_prepare_callbacks(), vec![None]);
+}
+
+// =========================================================================
+// Write + Read Integration (Unit Tests)
+// =========================================================================
+
+#[test]
+fn write_then_read_prepare_round_trip() {
+    reset_prepare_callbacks();
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(2);
+    let op = 24u64;
+    let cluster = 9u128;
+    let body = vec![0x9a, 0xbc, 0xde, 0xf0, 0x11];
+
+    let mut header = HeaderPrepare::new();
+    header.command = Command::Prepare;
+    header.operation = Operation::REGISTER;
+    header.op = op;
+    header.cluster = cluster;
+    header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    header.set_checksum_body(&body);
+    header.set_checksum();
+
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()] = header;
+
+    let mut write_message = Box::new(pool.get::<PrepareCmd>());
+    write_message.set_used_len(header.size as usize);
+    write_message.body_used_mut().copy_from_slice(&body);
+    *write_message.header_mut() = header;
+    let write_message_ptr = write_message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback, write_message_ptr);
+
+    assert_eq!(storage.write_count(), 2);
+    assert_eq!(take_prepare_callbacks(), vec![Some(write_message_ptr)]);
+    assert!(journal.prepare_inhabited[slot.index()]);
+    assert_eq!(journal.prepare_checksums[slot.index()], header.checksum);
+
+    let mut read_message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let read_message_ptr = read_message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, read_message_ptr, options);
+
+    assert_eq!(storage.read_count(), 1);
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(read_message_ptr), options)]
+    );
+    assert_eq!(read_message.header().op, header.op);
+    assert_eq!(read_message.header().checksum, header.checksum);
+    assert_eq!(read_message.header().size, header.size);
+    assert_eq!(read_message.body_used(), body.as_slice());
+}
+
+#[test]
+fn async_write_then_read_prepare_round_trip() {
+    reset_prepare_callbacks();
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(2);
+    let op = 41u64;
+    let cluster = 5u128;
+    let body = vec![0xa1, 0xb2, 0xc3, 0xd4];
+
+    let mut header = HeaderPrepare::new();
+    header.command = Command::Prepare;
+    header.operation = Operation::REGISTER;
+    header.op = op;
+    header.cluster = cluster;
+    header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    header.set_checksum_body(&body);
+    header.set_checksum();
+
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()] = header;
+
+    let mut write_message = Box::new(pool.get::<PrepareCmd>());
+    write_message.set_used_len(header.size as usize);
+    write_message.body_used_mut().copy_from_slice(&body);
+    *write_message.header_mut() = header;
+    let write_message_ptr = write_message.as_mut() as *mut MessagePrepare;
+
+    journal.write_prepare(record_prepare_callback_async, write_message_ptr);
+
+    assert_eq!(storage.pending_callbacks.borrow().len(), 1);
+    storage.drain_callbacks();
+    assert_eq!(storage.pending_callbacks.borrow().len(), 1);
+    storage.drain_callbacks();
+
+    assert_eq!(storage.write_count(), 2);
+    assert_eq!(take_prepare_callbacks(), vec![Some(write_message_ptr)]);
+    assert!(journal.prepare_inhabited[slot.index()]);
+    assert_eq!(journal.prepare_checksums[slot.index()], header.checksum);
+
+    let mut read_message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let read_message_ptr = read_message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(
+        record_read_prepare_callback_async,
+        read_message_ptr,
+        options,
+    );
+
+    assert_eq!(storage.pending_read_callbacks.borrow().len(), 1);
+    storage.drain_read_callbacks();
+
+    assert_eq!(storage.read_count(), 1);
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(read_message_ptr), options)]
+    );
+    assert_eq!(read_message.header().op, header.op);
+    assert_eq!(read_message.header().checksum, header.checksum);
+    assert_eq!(read_message.header().size, header.size);
+    assert_eq!(read_message.body_used(), body.as_slice());
 }
 
 // =========================================================================
