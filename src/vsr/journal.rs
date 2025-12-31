@@ -77,7 +77,7 @@ const READ_OPS: usize = constants::JOURNAL_IOPS_READ_MAX as usize;
 
 /// `IOPSType` uses a bitset internally; `READ_OPS_WORDS` is the number of `u64` words
 /// required to represent `READ_OPS` bits.
-const READ_OPS_WORDS: usize = (READ_OPS + 63) / 64;
+const READ_OPS_WORDS: usize = READ_OPS.div_ceil(64);
 
 /// Reads reserved for commit path (`destination_replica == None`).
 const READS_COMMIT_COUNT_MAX: usize = 2;
@@ -290,6 +290,7 @@ pub struct ReadOptions {
 
 impl ReadOptions {
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn commit(op: u64, checksum: Checksum128) -> Self {
         Self {
             op,
@@ -299,6 +300,7 @@ impl ReadOptions {
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     fn repair(op: u64, checksum: Checksum128, destination_replica: u8) -> Self {
         Self {
             op,
@@ -951,6 +953,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// On failure, the callback is invoked with `None` and **no read I/O is issued**.
     /// This includes cases where the in-memory slot is not inhabited or no exact match exists.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -991,6 +994,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
     /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
     /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1108,6 +1112,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// on-disk prepare (header, body, padding) against the expected identity.
     /// On validation failure, marks the slot faulty/dirty if it still refers to
     /// the same prepare, then invokes the callback with `None`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare_with_op_and_checksum_on_read(completion: &mut S::Read) {
         let read: *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> =
             container_of!(completion, Read<S, WRITE_OPS, WRITE_OPS_WORDS>, completion);
@@ -1211,6 +1216,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     }
 
     #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
     /// Debug hook for read-path notices; intentionally a no-op in production builds.
     fn read_prepare_log(&self, op: u64, checksum: Option<Checksum128>, notice: &str) {
         let _ = (op, checksum, notice);
