@@ -1921,7 +1921,10 @@ fn read_prepare_works_with_fresh_message_buffer() {
     journal.read_prepare(record_read_prepare_callback, message_ptr, options);
 
     assert_eq!(storage.read_count(), 1);
-    assert_eq!(take_read_prepare_callbacks(), vec![(Some(message_ptr), options)]);
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
     assert_eq!(message.header().size, header.size);
     assert_eq!(message.body_used(), body.as_slice());
 }
