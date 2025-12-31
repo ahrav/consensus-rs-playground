@@ -41,30 +41,24 @@
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
 #[allow(dead_code)]
-use core::cmp::min;
-use core::mem::MaybeUninit;
-use core::ptr;
+use core::{cmp::min, mem::MaybeUninit, ptr};
 
 #[allow(unused_imports)]
-use crate::constants;
-use crate::container_of;
-use crate::message_pool::Message;
-use crate::stdx::BitSet;
-use crate::util::utils::AlignedSlice;
-use crate::util::zero;
-use crate::vsr::command::PrepareCmd;
-use crate::vsr::journal_primitives::{HEADERS_PER_SECTOR, Slot};
-use crate::vsr::{Checksum128, Command, Operation};
-use crate::vsr::{
-    Header,
-    HeaderPrepare,
-    iops::IOPSType,
-    journal_primitives::{
-        HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_SIZE, Ring, SLOT_COUNT, SLOT_COUNT_WORDS,
-        WAL_HEADER_SIZE,
+use crate::{
+    constants, container_of,
+    message_pool::Message,
+    stdx::BitSet,
+    util::{utils::AlignedSlice, zero},
+    vsr::{
+        Checksum128, Command, Header, HeaderPrepare, Operation,
+        command::PrepareCmd,
+        iops::IOPSType,
+        journal_primitives::{
+            HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_SECTOR, HEADERS_SIZE, Ring,
+            SLOT_COUNT, SLOT_COUNT_WORDS, Slot, WAL_HEADER_SIZE,
+        },
+        storage::{Storage, Synchronicity},
     },
-    storage::{Storage, Synchronicity},
-    // Command, Operation,
 };
 
 // ============================================================================
@@ -534,6 +528,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             write_headers_sectors,
             header_chunks_requested: HeaderChunks::empty(),
             header_chunks_recovered: HeaderChunks::empty(),
+            reads: IOPSType::default(),
+            reads_commit_count: 0,
+            reads_repair_count: 0,
             writes: IOPSType::default(),
             dirty,
             faulty,
@@ -1038,7 +1035,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             } else {
                 // As an optimization, read only the exact message size (sector-aligned).
                 message_size = constants::sector_ceil(exact.size as usize);
-                assert!(message_size <= constants::MESSAGE_BODY_SIZE_MAX_USIZE);
+                assert!(message_size <= constants::MESSAGE_SIZE_MAX_USIZE);
             }
         }
 
@@ -1171,13 +1168,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 return Some("checksum changed during read");
             }
 
-            let bytes = unsafe { (*message).as_bytes() };
             let size = header.size as usize;
-
-            if size < size_of::<HeaderPrepare>() || size > constants::MESSAGE_BODY_SIZE_MAX_USIZE {
+            if size < size_of::<HeaderPrepare>() || size > constants::MESSAGE_SIZE_MAX_USIZE {
                 return Some("invalid message size");
             }
 
+            let bytes = unsafe { core::slice::from_raw_parts((*message).buffer_ptr(), size) };
             let body_used = &bytes[size_of::<HeaderPrepare>()..size];
             if !header.valid_checksum_body(body_used) {
                 return Some("corrupt body after read");
@@ -1185,12 +1181,14 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             let padded = constants::sector_ceil(size);
             assert!(padded.is_multiple_of(constants::SECTOR_SIZE));
-            if padded > bytes.len() {
+            if padded > constants::MESSAGE_SIZE_MAX_USIZE {
                 return Some("invalid message size");
             }
 
             // Padding must be zero to detect torn or partial writes.
-            let padding = &bytes[size..padded];
+            let padding = unsafe {
+                core::slice::from_raw_parts((*message).buffer_ptr().add(size), padded - size)
+            };
             if !zero::is_all_zeros(padding) {
                 return Some("corrupt sector padding");
             }
