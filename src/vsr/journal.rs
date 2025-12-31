@@ -805,6 +805,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// If a write is found:
     /// - `Writing::Exact` when the checksum matches `header`
     /// - `Writing::Slot` when the slot/op matches but the checksum differs
+    ///
     /// Otherwise returns `Writing::None`.
     ///
     /// # Panics
