@@ -1895,6 +1895,38 @@ fn read_prepare_returns_none_when_prepare_not_inhabited() {
 }
 
 #[test]
+fn read_prepare_works_with_fresh_message_buffer() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 3u64;
+    let cluster = 42u128;
+    let body = vec![0x11, 0x22, 0x33];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let mut message = Box::new(pool.get::<PrepareCmd>());
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(storage.read_count(), 1);
+    assert_eq!(take_read_prepare_callbacks(), vec![(Some(message_ptr), options)]);
+    assert_eq!(message.header().size, header.size);
+    assert_eq!(message.body_used(), body.as_slice());
+}
+
+#[test]
 fn read_prepare_header_only_fast_path_skips_io() {
     reset_read_prepare_callbacks();
 

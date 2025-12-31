@@ -1018,10 +1018,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 // Header-only prepare; no disk required. Populate the message buffer
                 // with the header and zero the remainder of the first sector.
                 unsafe {
-                    let (buf_ptr, buf_len) = {
-                        let bytes: &[u8] = (*message).as_bytes();
-                        (bytes.as_ptr() as *mut u8, bytes.len())
-                    };
+                    let buf_ptr = (*message).buffer_ptr();
+                    let buf_len = constants::MESSAGE_SIZE_MAX_USIZE;
                     assert!(buf_len >= constants::SECTOR_SIZE);
 
                     ptr::copy_nonoverlapping(
@@ -1085,10 +1083,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             ptr::addr_of_mut!((*read).callback).write(callback);
         }
 
-        let (buf_ptr, buf_len_total) = unsafe {
-            let bytes: &[u8] = (*message).as_bytes();
-            (bytes.as_ptr() as *mut u8, bytes.len())
-        };
+        let buf_ptr = unsafe { (*message).buffer_ptr() };
+        let buf_len_total = constants::MESSAGE_SIZE_MAX_USIZE;
         assert!(message_size <= buf_len_total);
 
         let buffer: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf_ptr, message_size) };
