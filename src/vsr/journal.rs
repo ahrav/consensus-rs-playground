@@ -48,8 +48,10 @@ use core::ptr;
 #[allow(unused_imports)]
 use crate::constants;
 use crate::container_of;
+use crate::message_pool::Message;
 use crate::stdx::BitSet;
 use crate::util::utils::AlignedSlice;
+use crate::vsr::command::PrepareCmd;
 use crate::vsr::journal_primitives::Slot;
 use crate::vsr::{Checksum128, Command, Operation};
 use crate::vsr::{
@@ -247,6 +249,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     }
 }
 
+pub type MessagePrepare = Message<PrepareCmd>;
+
+/// Callback invoked when `write_prepare` completes.
+pub type WritePrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
+    fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>);
+
 /// A write operation descriptor for the range-locking machinery.
 ///
 /// `Write` represents a single in-flight write operation. It is allocated from
@@ -271,11 +279,22 @@ pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usiz
     /// Back-pointer to the owning Journal. Set by `write_sectors`.
     pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
 
+    /// User callback for `write_prepare`.
+    ///
+    /// `None` for plain `write_sectors` tests; always `Some` for the `write_prepare` flow.
+    pub prepare_callback: Option<WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>>,
+
+    /// Prepare message being written.
+    pub message: *mut MessagePrepare,
+
     /// Operation number of the prepare whose slot is being written.
     ///
     /// Used to derive the slot (`op % SLOT_COUNT`) and assert that we never have
     /// two concurrent writes to the same slot.
     pub op: u64,
+
+    /// Cached checksum of `message.header.checksum` (used by `writing()`).
+    pub checksum: Checksum128,
 
     /// The range descriptor containing buffer, offset, and locking state.
     pub range: Range<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -294,6 +313,13 @@ pub enum Status<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize
     Recovering(fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>)),
     /// Recovery complete; journal is ready for normal operation.
     Recovered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Writing {
+    None,
+    Slot,
+    Exact,
 }
 
 /// WAL journal implementing range-locked sector writes.
@@ -437,14 +463,18 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     }
 
     // =========================================================================
-    // In-memory header helpers
+    // Slot/Header Lookup: Pure Calculation (no verification)
     // =========================================================================
 
+    /// Returns the slot where `op` would be stored. Does NOT verify occupancy.
     #[inline]
     fn slot_for_op(&self, op: u64) -> Slot {
         Slot::from_op(op)
     }
 
+    /// Returns whatever header occupies the slot for `op`.
+    /// Returns `None` only if the slot is reserved.
+    /// The returned header may have a DIFFERENT op (circular buffer wrap).
     #[inline]
     fn header_for_op(&self, op: u64) -> Option<&HeaderPrepare> {
         let slot = self.slot_for_op(op);
@@ -460,6 +490,17 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
     }
 
+    // =========================================================================
+    // Slot/Header Lookup: Op Verification (checks op matches)
+    // =========================================================================
+
+    /// Returns the slot for `op` only if a header with that exact op exists.
+    #[inline]
+    fn slot_with_op(&self, op: u64) -> Option<Slot> {
+        self.header_with_op(op).map(|_| self.slot_for_op(op))
+    }
+
+    /// Returns the header only if it exists AND has the requested op.
     #[inline]
     pub fn header_with_op(&self, op: u64) -> Option<&HeaderPrepare> {
         if let Some(existing) = self.header_for_op(op)
@@ -471,6 +512,18 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
     }
 
+    // =========================================================================
+    // Slot/Header Lookup: Identity Verification (checks op AND checksum)
+    // =========================================================================
+
+    /// Returns the slot only if this EXACT header (op + checksum) exists.
+    #[inline]
+    fn slot_with_op_and_checksum(&self, op: u64, checksum: Checksum128) -> Option<Slot> {
+        self.header_with_op_and_checksum(op, checksum)
+            .map(|_| self.slot_for_op(op))
+    }
+
+    /// Returns the header only if it matches EXACTLY (op + checksum).
     #[inline]
     pub fn header_with_op_and_checksum(
         &self,
@@ -485,6 +538,44 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
         None
     }
+
+    // =========================================================================
+    // Slot/Header Lookup: From Header Reference
+    // =========================================================================
+
+    /// Returns the slot for a header known to exist. Asserts presence.
+    #[inline]
+    fn slot_for_header(&self, header: &HeaderPrepare) -> Slot {
+        assert!(self.slot_with_op(header.op).is_some());
+        self.slot_for_op(header.op)
+    }
+
+    /// Returns the slot only if this exact header exists in the journal.
+    #[inline]
+    fn slot_with_header(&self, header: &HeaderPrepare) -> Option<Slot> {
+        self.slot_with_op_and_checksum(header.op, header.checksum)
+    }
+
+    // =========================================================================
+    // Header Predicates
+    // =========================================================================
+
+    #[inline]
+    fn has_header(&self, header: &HeaderPrepare) -> bool {
+        self.header_with_op_and_checksum(header.op, header.checksum)
+            .is_some()
+    }
+
+    #[inline]
+    fn has_dirty(&self, header: &HeaderPrepare) -> bool {
+        assert!(self.has_header(header));
+        let slot = self.slot_for_header(header);
+        self.dirty.is_set(slot.index())
+    }
+
+    // =========================================================================
+    // Header Traversal
+    // =========================================================================
 
     #[inline]
     pub fn previous_entry(&self, header: &HeaderPrepare) -> Option<&HeaderPrepare> {

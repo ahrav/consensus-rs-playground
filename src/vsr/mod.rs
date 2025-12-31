@@ -23,6 +23,7 @@ pub use crate::constants::{
     ClusterId, HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_BODY_SIZE_MAX, MESSAGE_BODY_SIZE_MAX_USIZE,
     MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE, VSR_VERSION,
 };
+use crate::message_pool::Message;
 #[cfg(target_os = "linux")]
 pub use checksum::checksum_aegis_mac;
 pub use checksum::{Checksum128, checksum};
@@ -31,7 +32,6 @@ pub use framing::{DecodeError, MessageBuffer};
 pub use header::{Header, Release};
 pub use header_prepare::HeaderPrepare;
 pub use members::{Members, member_index, valid_members};
-pub use message::Message;
 pub use operation::{Operation, StateMachineOperation};
 pub use pool::{MessageHandle, MessagePool};
 pub use state::VsrState;
