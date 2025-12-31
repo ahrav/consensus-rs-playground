@@ -993,6 +993,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
     /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
+    /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1104,9 +1105,115 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         );
     }
 
-    fn read_prepare_with_op_and_checksum_on_read(completion: &mut S::Read) {}
+    /// Completion callback for prepare reads.
+    ///
+    /// Recovers the read descriptor, updates IOP accounting, and validates the
+    /// on-disk prepare (header, body, padding) against the expected identity.
+    /// On validation failure, marks the slot faulty/dirty if it still refers to
+    /// the same prepare, then invokes the callback with `None`.
+    fn read_prepare_with_op_and_checksum_on_read(completion: &mut S::Read) {
+        let read: *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> =
+            container_of!(completion, Read<S, WRITE_OPS, WRITE_OPS_WORDS>, completion);
+
+        let journal = unsafe { &mut *(*read).journal };
+        assert!(matches!(journal.status, Status::Recovered));
+
+        let callback = unsafe { (*read).callback };
+        let message = unsafe { (*read).message };
+        let options = unsafe { (*read).options };
+
+        // Release IOP accounting before invoking user callbacks.
+        if options.destination_replica.is_none() {
+            assert!(journal.reads_commit_count > 0);
+            journal.reads_commit_count -= 1;
+        } else {
+            assert!(journal.reads_repair_count > 0);
+            journal.reads_repair_count -= 1;
+        }
+        journal.reads.release(read);
+
+        // The prepare may have been re-written since the read began.
+        let slot = journal.slot_for_op(options.op);
+        let checksum_inhabited = journal.prepare_inhabited[slot.index()];
+        let checksum_match = journal.prepare_checksums[slot.index()] == options.checksum;
+        if !checksum_inhabited || !checksum_match {
+            journal.read_prepare_log(
+                options.op,
+                Some(options.checksum),
+                "prepare changed during read",
+            );
+            callback(journal as *mut _, None, options);
+            return;
+        }
+
+        // Validate header identity and message integrity.
+        let header = unsafe { (*message).header() };
+        let expected_cluster = journal.headers[slot.index()].cluster;
+
+        let error_reason: Option<&'static str> = (|| {
+            if !header.valid_checksum() {
+                return Some("corrupt header after read");
+            }
+
+            if header.command != Command::Prepare {
+                return Some("wrong command");
+            }
+
+            if header.cluster != expected_cluster {
+                return Some("wrong cluster");
+            }
+
+            if header.op != options.op {
+                return Some("op changed during read");
+            }
+
+            if header.checksum != options.checksum {
+                return Some("checksum changed during read");
+            }
+
+            let bytes = unsafe { (*message).as_bytes() };
+            let size = header.size as usize;
+
+            if size < size_of::<HeaderPrepare>() || size > constants::MESSAGE_BODY_SIZE_MAX_USIZE {
+                return Some("invalid message size");
+            }
+
+            let body_used = &bytes[size_of::<HeaderPrepare>()..size];
+            if !header.valid_checksum_body(body_used) {
+                return Some("corrupt body after read");
+            }
+
+            let padded = constants::sector_ceil(size);
+            assert!(padded.is_multiple_of(constants::SECTOR_SIZE));
+            if padded > bytes.len() {
+                return Some("invalid message size");
+            }
+
+            // Padding must be zero to detect torn or partial writes.
+            let padding = &bytes[size..padded];
+            if !zero::is_all_zeros(padding) {
+                return Some("corrupt sector padding");
+            }
+
+            None
+        })();
+
+        if let Some(reason) = error_reason {
+            // Mark the slot faulty if the exact header still matches what we were trying to read.
+            if let Some(slot) = journal.slot_with_op_and_checksum(options.op, options.checksum) {
+                journal.faulty.set(slot.index());
+                journal.dirty.set(slot.index());
+            }
+
+            journal.read_prepare_log(options.op, Some(options.checksum), reason);
+            callback(journal as *mut _, None, options);
+        } else {
+            callback(journal as *mut _, Some(message), options);
+        }
+    }
 
     #[inline]
+    /// Debug hook for read-path notices; intentionally a no-op in production builds.
     fn read_prepare_log(&self, op: u64, checksum: Option<Checksum128>, notice: &str) {
         let _ = (op, checksum, notice);
     }
