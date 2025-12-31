@@ -4,7 +4,7 @@
 //! Messages are acquired from the pool, passed around via [`MessageHandle`],
 //! and returned when the reference count drops to zero.
 
-use super::Message;
+use super::message::Message;
 use crate::stdx::RingBuffer;
 use core::ptr::NonNull;
 
