@@ -51,8 +51,9 @@ use crate::container_of;
 use crate::message_pool::Message;
 use crate::stdx::BitSet;
 use crate::util::utils::AlignedSlice;
+use crate::util::zero;
 use crate::vsr::command::PrepareCmd;
-use crate::vsr::journal_primitives::Slot;
+use crate::vsr::journal_primitives::{HEADERS_PER_SECTOR, Slot};
 use crate::vsr::{Checksum128, Command, Operation};
 use crate::vsr::{
     Header,
@@ -838,6 +839,285 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
 
         found
+    }
+
+    /// Writes a prepare message and its header to the WAL.
+    ///
+    /// This is a two-stage write:
+    /// 1. Write the prepare payload to the Prepares ring
+    /// 2. Update the header sector in the Headers ring
+    ///
+    /// If the slot is already durable or no IOP is available, the callback is
+    /// invoked with `None` and no I/O is issued. The callback receives `Some(message)`
+    /// only when both writes complete and the in-memory header still matches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The journal is not in `Status::Recovered`
+    /// - `message` is null or not a non-reserved `Prepare` header
+    /// - The header does not exist in memory or a write is already in flight
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_prepare(
+        &mut self,
+        callback: WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+        message: *mut MessagePrepare,
+    ) {
+        assert!(matches!(self.status, Status::Recovered));
+        assert!(!message.is_null());
+
+        let header = unsafe { (*message).header() };
+        assert!(header.command == Command::Prepare);
+        assert!(header.operation != Operation::RESERVED);
+
+        let header_size = header.size as usize;
+        assert!(header_size <= constants::MESSAGE_SIZE_MAX as usize);
+
+        assert!(self.has_header(header));
+        assert!(self.writing(header) == Writing::None);
+
+        let slot = self
+            .slot_with_header(header)
+            .expect("write_prepare expects the header to exist in memory");
+
+        if !self.dirty.is_set(slot.index()) {
+            assert!(!self.faulty.is_set(slot.index()));
+            assert!(self.prepare_inhabited[slot.index()]);
+            assert!(self.prepare_checksums[slot.index()] == header.checksum);
+            assert!(self.headers_redundant[slot.index()].checksum == header.checksum);
+
+            // Already durable; no I/O required.
+            callback(self as *mut _, None);
+            return;
+        }
+
+        assert!(self.has_dirty(header));
+
+        let Some(write) = self.writes.acquire() else {
+            // No IOP available; caller must retry later.
+            callback(self as *mut _, None);
+            return;
+        };
+
+        // Don't read the data within `Write`, as it may be uninitialized.
+        // Doing so will drop the old value which could lead to undefined behavior.
+        // Write directly to the fields of the `Write` struct.
+        unsafe {
+            ptr::addr_of_mut!((*write).journal).write(self as *mut _);
+            ptr::addr_of_mut!((*write).prepare_callback).write(Some(callback));
+            ptr::addr_of_mut!((*write).message).write(message);
+            ptr::addr_of_mut!((*write).op).write(header.op);
+            ptr::addr_of_mut!((*write).checksum).write(header.checksum);
+        }
+
+        let buffer_len = constants::sector_ceil(header_size);
+        assert!(buffer_len <= constants::MESSAGE_SIZE_MAX as usize);
+
+        let buffer_ptr = unsafe { (*message).buffer_ptr() };
+        // SAFETY: Message buffers are MESSAGE_SIZE_MAX bytes and sector-aligned.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, buffer_len) };
+        buffer[header_size..].fill(0);
+        assert!(zero::is_all_zeros(&buffer[header_size..]));
+        self.prepare_inhabited[slot.index()] = false;
+        self.prepare_checksums[slot.index()] = 0;
+
+        let offset = (constants::MESSAGE_SIZE_MAX as u64) * (slot.index() as u64);
+        unsafe {
+            self.write_sectors(
+                write,
+                Self::write_prepare_header,
+                buffer,
+                Ring::Prepares,
+                offset,
+            )
+        };
+    }
+
+    /// Completion callback after the prepare payload write.
+    ///
+    /// Restores per-slot prepare bookkeeping, updates the redundant header, and
+    /// submits a header sector write. If the in-memory header changed while the
+    /// payload write was in flight, the slot is left dirty and the write is
+    /// released without completing the prepare.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_prepare_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
+        let journal = unsafe { &mut *(*write).journal };
+        assert!(matches!(journal.status, Status::Recovered));
+
+        let message = unsafe { (*write).message };
+        assert!(!message.is_null());
+        let header = unsafe { (*message).header() };
+
+        assert!(journal.writing(header) == Writing::Exact);
+
+        let slot = journal.slot_for_header(header);
+
+        journal.prepare_inhabited[slot.index()] = true;
+        journal.prepare_checksums[slot.index()] = header.checksum;
+
+        if !journal.has_header(header) {
+            // The in-memory entry changed while the prepare was being written.
+            Self::write_prepare_release(journal as *mut _, write, None);
+            journal.dirty.set(slot.index());
+            return;
+        }
+
+        if journal.headers_redundant[slot.index()].operation == Operation::RESERVED
+            && journal.headers_redundant[slot.index()].checksum == 0
+        {
+            assert!(journal.faulty.is_set(slot.index()));
+        }
+
+        journal.headers_redundant[slot.index()] = *header;
+
+        let sector_index = slot.index() / HEADERS_PER_SECTOR;
+        let buffer = journal.header_sector(sector_index, write);
+        // Extract pointer and length to end the mutable borrow of journal,
+        // allowing write_sectors to borrow journal again.
+        let buffer_ptr = buffer.as_ptr();
+        let buffer_len = buffer.len();
+
+        let offset = Ring::Headers.offset(slot);
+        assert!(offset.is_multiple_of(constants::SECTOR_SIZE as u64));
+
+        // SAFETY: buffer_ptr/buffer_len come from header_sector which returns a slice
+        // into write_headers_sectors. The buffer remains valid for the duration of the
+        // write operation due to the range locking protocol.
+        unsafe {
+            let buffer = core::slice::from_raw_parts(buffer_ptr, buffer_len);
+            journal.write_sectors(
+                write,
+                Self::write_prepare_on_write_header,
+                buffer,
+                Ring::Headers,
+                offset,
+            );
+        }
+    }
+
+    /// Builds the header sector buffer for a write.
+    ///
+    /// Uses a per-write staging buffer keyed by the write's pool index to avoid
+    /// concurrent mutation. The buffer is populated from `headers_redundant`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the sector index is out of range or `write` does not come from
+    /// the journal's write pool.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn header_sector(
+        &mut self,
+        sector_index: usize,
+        write: *const Write<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    ) -> &mut [u8] {
+        assert!(matches!(self.status, Status::Recovered));
+        assert!(sector_index < SLOT_COUNT / HEADERS_PER_SECTOR);
+
+        let base = self.writes.items.as_ptr() as *const Write<S, WRITE_OPS, WRITE_OPS_WORDS>;
+        let diff = (write as usize).wrapping_sub(base as usize);
+        assert!(diff.is_multiple_of(size_of::<Write<S, WRITE_OPS, WRITE_OPS_WORDS>>()));
+        let write_index = diff / size_of::<Write<S, WRITE_OPS, WRITE_OPS_WORDS>>();
+        assert!(write_index < self.write_headers_sectors.len());
+        assert!(self.writes.items.len() == self.write_headers_sectors.len());
+
+        let sector_slot = Slot::new(sector_index * HEADERS_PER_SECTOR);
+
+        let sector_bytes = &mut self.write_headers_sectors[write_index];
+        let sector_headers: &mut [HeaderPrepare] = unsafe {
+            core::slice::from_raw_parts_mut(
+                sector_bytes.as_mut_ptr() as *mut HeaderPrepare,
+                HEADERS_PER_SECTOR,
+            )
+        };
+
+        sector_headers.copy_from_slice(
+            &self.headers_redundant[sector_slot.index()..sector_slot.index() + HEADERS_PER_SECTOR],
+        );
+
+        for (i, sh) in sector_headers.iter().enumerate() {
+            let slot = Slot::new(sector_slot.index() + i);
+
+            if sh.operation == Operation::RESERVED && sh.checksum == 0 {
+                assert!(self.faulty.is_set(slot.index()));
+            } else if self.faulty.is_set(slot.index()) {
+                // An entry may be faulty even with a non-zero checksum (eg. torn write).
+            }
+        }
+
+        &mut sector_bytes[..]
+    }
+
+    /// Completion callback after the header sector write.
+    ///
+    /// Verifies the header still matches the in-memory slot and redundant copy,
+    /// clears dirty/faulty flags, and releases the write. If any check fails, the
+    /// write is released without marking the slot durable.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_prepare_on_write_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
+        let journal = unsafe { &mut *(*write).journal };
+        assert!(matches!(journal.status, Status::Recovered));
+        let message = unsafe { (*write).message };
+        assert!(!message.is_null());
+
+        let header = unsafe { (*message).header() };
+        assert!(journal.writing(header) == Writing::Exact);
+
+        if !journal.has_header(header) {
+            Self::write_prepare_release(journal as *mut _, write, None);
+            return;
+        }
+
+        let slot = journal
+            .slot_with_header(header)
+            .expect("header must exist after has_header()");
+        if journal.headers_redundant[slot.index()].checksum != header.checksum {
+            assert!(journal.dirty.is_set(slot.index()));
+            Self::write_prepare_release(journal as *mut _, write, None);
+            return;
+        }
+
+        if !journal.prepare_inhabited[slot.index()]
+            || journal.prepare_checksums[slot.index()] != header.checksum
+        {
+            Self::write_prepare_release(journal as *mut _, write, None);
+            return;
+        }
+
+        journal.dirty.unset(slot.index());
+        journal.faulty.unset(slot.index());
+
+        Self::write_prepare_release(journal as *mut _, write, Some(message));
+    }
+
+    /// Releases a write and invokes the user callback.
+    ///
+    /// The IOP is returned to the pool before calling into user code to avoid
+    /// reentrancy issues and to allow immediate reuse.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_prepare_release(
+        journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
+        write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>,
+        wrote: Option<*mut MessagePrepare>,
+    ) {
+        assert!(!journal.is_null());
+        assert!(!write.is_null());
+
+        let callback =
+            unsafe { (*write).prepare_callback }.expect("write_prepare callback missing");
+        let write_message = unsafe { (*write).message };
+
+        // Release the IOP back to the pool before calling into user code.
+        {
+            let journal_mut = unsafe { &mut *journal };
+            journal_mut.writes.release(write);
+
+            if !write_message.is_null() {
+                let header = unsafe { (*write_message).header() };
+                assert!(journal_mut.writing(header) == Writing::None);
+            }
+        }
+
+        callback(journal, wrote);
     }
 
     /// Initiates a sector write operation with range locking.

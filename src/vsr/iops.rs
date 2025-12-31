@@ -14,7 +14,7 @@ use crate::stdx::{BitSetIterator, bitset::BitSet};
 /// Acquired slots return pointers to uninitialized memory. The caller must
 /// initialize before use and release exactly once.
 pub struct IOPSType<T, const SIZE: usize, const WORDS: usize> {
-    items: [MaybeUninit<T>; SIZE],
+    pub items: [MaybeUninit<T>; SIZE],
     busy: BitSet<SIZE, WORDS>,
 }
 
