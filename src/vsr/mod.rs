@@ -23,7 +23,7 @@ pub use crate::constants::{
     ClusterId, HEADER_SIZE, HEADER_SIZE_USIZE, MESSAGE_BODY_SIZE_MAX, MESSAGE_BODY_SIZE_MAX_USIZE,
     MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE, VSR_VERSION,
 };
-use crate::message_pool::Message;
+
 #[cfg(target_os = "linux")]
 pub use checksum::checksum_aegis_mac;
 pub use checksum::{Checksum128, checksum};
