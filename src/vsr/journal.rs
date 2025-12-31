@@ -756,6 +756,90 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         unsafe { std::slice::from_raw_parts(headers, count) }
     }
 
+    /// Installs `header` into its slot and marks that slot dirty.
+    ///
+    /// If the exact header already exists, this is a no-op (the dirty bit must
+    /// already be set). When overwriting a non-reserved slot, this clears the
+    /// `faulty` flag and resets the redundant header to a reserved placeholder
+    /// so recovery can detect out-of-order or partial writes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The journal is not in `Status::Recovered`
+    /// - `header` is not a valid `Prepare` header (reserved operation or too small)
+    /// - The slot would move backwards (`existing.op > header.op`)
+    /// - The slot is reserved but the redundant header is not a reserved placeholder
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn set_header_as_dirty(&mut self, header: &HeaderPrepare) {
+        assert!(matches!(self.status, Status::Recovered));
+        assert!(header.command == Command::Prepare);
+        assert!(header.operation != Operation::RESERVED);
+        assert!((header.size as usize) >= size_of::<HeaderPrepare>());
+
+        let slot = self.slot_for_op(header.op);
+
+        if self.has_header(header) {
+            assert!(self.dirty.is_set(slot.index()));
+            return;
+        }
+
+        assert!(self.headers[slot.index()].op <= header.op);
+
+        if self.headers[slot.index()].operation == Operation::RESERVED {
+            assert!(self.headers_redundant[slot.index()].operation == Operation::RESERVED);
+            assert!(self.headers_redundant[slot.index()].checksum == 0);
+        } else {
+            self.faulty.unset(slot.index());
+            self.headers_redundant[slot.index()] =
+                HeaderPrepare::reserve(header.cluster, slot.index() as u64);
+        }
+
+        self.headers[slot.index()] = *header;
+        self.dirty.set(slot.index());
+    }
+
+    /// Returns whether a write is currently in-flight for `header`'s slot.
+    ///
+    /// Scans the write pool for a busy entry with the same slot (`op % SLOT_COUNT`).
+    /// If a write is found:
+    /// - `Writing::Exact` when the checksum matches `header`
+    /// - `Writing::Slot` when the slot/op matches but the checksum differs
+    ///
+    /// Otherwise returns `Writing::None`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - The journal is not in `Status::Recovered`
+    /// - More than one write targets the same slot
+    /// - A write targets the same slot but a different `op`
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn writing(&self, header: &HeaderPrepare) -> Writing {
+        assert!(matches!(self.status, Status::Recovered));
+
+        let slot = self.slot_for_op(header.op);
+        let mut found = Writing::None;
+
+        for write in self.writes.iterate_const() {
+            let write_slot = self.slot_for_op(unsafe { (*write).op });
+            if write_slot.index() != slot.index() {
+                continue;
+            }
+
+            assert!(unsafe { (*write).op } == header.op);
+            assert!(found == Writing::None);
+
+            if unsafe { (*write).checksum } == header.checksum {
+                found = Writing::Exact
+            } else {
+                found = Writing::Slot
+            }
+        }
+
+        found
+    }
+
     /// Initiates a sector write operation with range locking.
     ///
     /// This method:
