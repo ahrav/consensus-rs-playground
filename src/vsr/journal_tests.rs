@@ -1847,6 +1847,69 @@ fn write_prepare_happy_path_updates_state_and_writes() {
 }
 
 #[test]
+fn write_prepare_non_sector_aligned_size_zero_pads() {
+    reset_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = TestJournal::new(&mut storage, 0);
+    journal.status = Status::Recovered;
+
+    let pool = MessagePool::new(1);
+    let op = 11u64;
+    let slot = (op % SLOT_COUNT as u64) as usize;
+
+    let header_size = HeaderPrepare::SIZE + 1;
+    let buffer_len = constants::sector_ceil(header_size);
+    assert!(buffer_len > header_size);
+
+    let mut message = Box::new(pool.get::<PrepareCmd>());
+    message.set_used_len(header_size);
+    message.body_used_mut().fill(0x5a);
+
+    let buffer_ptr = message.buffer_ptr();
+    let body_len = header_size - HeaderPrepare::SIZE;
+
+    {
+        let header = message.header_mut();
+        header.operation = Operation::REGISTER;
+        header.op = op;
+        let body = unsafe {
+            core::slice::from_raw_parts(buffer_ptr.add(constants::HEADER_SIZE_USIZE), body_len)
+        };
+        header.set_checksum_body(body);
+        header.set_checksum();
+    }
+
+    unsafe {
+        let padding =
+            core::slice::from_raw_parts_mut(buffer_ptr.add(header_size), buffer_len - header_size);
+        padding.fill(0xaa);
+    }
+
+    let header = *message.header();
+    journal.headers[slot] = header;
+
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    journal.write_prepare(record_prepare_callback, message_ptr);
+
+    let log = storage.write_log.borrow();
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].zone, Zone::WalPrepares);
+    assert_eq!(
+        log[0].offset,
+        (constants::MESSAGE_SIZE_MAX as u64) * slot as u64
+    );
+    assert_eq!(log[0].len, buffer_len);
+    drop(log);
+
+    let padding = unsafe {
+        core::slice::from_raw_parts(buffer_ptr.add(header_size), buffer_len - header_size)
+    };
+    assert!(padding.iter().all(|&b| b == 0));
+    assert_eq!(take_prepare_callbacks(), vec![Some(message_ptr)]);
+}
+
+#[test]
 fn write_prepare_aborts_when_header_changes_during_payload_write() {
     reset_prepare_callbacks();
 

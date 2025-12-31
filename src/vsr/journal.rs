@@ -870,9 +870,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(header.command == Command::Prepare);
         assert!(header.operation != Operation::RESERVED);
 
-        let message_buffer = unsafe { (*message).as_bytes() };
         let header_size = header.size as usize;
-        assert!(header_size <= message_buffer.len());
+        assert!(header_size <= constants::MESSAGE_SIZE_MAX as usize);
 
         assert!(self.has_header(header));
         assert!(self.writing(header) == Writing::None);
@@ -912,7 +911,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
 
         let buffer_len = constants::sector_ceil(header_size);
-        let buffer = &message_buffer[0..buffer_len];
+        assert!(buffer_len <= constants::MESSAGE_SIZE_MAX as usize);
+
+        let buffer_ptr = unsafe { (*message).buffer_ptr() };
+        // SAFETY: Message buffers are MESSAGE_SIZE_MAX bytes and sector-aligned.
+        let buffer = unsafe { core::slice::from_raw_parts_mut(buffer_ptr, buffer_len) };
+        buffer[header_size..].fill(0);
         assert!(zero::is_all_zeros(&buffer[header_size..]));
         self.prepare_inhabited[slot.index()] = false;
         self.prepare_checksums[slot.index()] = 0;
