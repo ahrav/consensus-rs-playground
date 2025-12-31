@@ -154,10 +154,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-fn record_prepare_callback(
-    _journal: *mut TestJournal,
-    message: Option<*mut MessagePrepare>,
-) {
+fn record_prepare_callback(_journal: *mut TestJournal, message: Option<*mut MessagePrepare>) {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
 }
 
@@ -1751,8 +1748,7 @@ fn write_prepare_skips_clean_slot() {
     let pool = MessagePool::new(1);
     let op = 5u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
-    let header =
-        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
 
     journal.headers[slot] = header;
     journal.headers_redundant[slot] = header;
@@ -1786,8 +1782,7 @@ fn write_prepare_returns_none_when_pool_exhausted() {
     let pool = MessagePool::new(1);
     let op = 1u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
-    let header =
-        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
     journal.headers[slot] = header;
 
     let mut busy = Vec::new();
@@ -1820,8 +1815,7 @@ fn write_prepare_happy_path_updates_state_and_writes() {
     let pool = MessagePool::new(1);
     let op = 7u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
-    let header =
-        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
     journal.headers[slot] = header;
 
     let mut message = make_prepare_message(&pool, header);
@@ -1832,11 +1826,13 @@ fn write_prepare_happy_path_updates_state_and_writes() {
     let log = storage.write_log.borrow();
     assert_eq!(log.len(), 2);
     assert_eq!(log[0].zone, Zone::WalPrepares);
-    assert_eq!(log[0].offset, (constants::MESSAGE_SIZE_MAX as u64) * slot as u64);
+    assert_eq!(
+        log[0].offset,
+        (constants::MESSAGE_SIZE_MAX as u64) * slot as u64
+    );
     assert_eq!(log[0].len, constants::SECTOR_SIZE);
 
-    let expected_header_offset =
-        (slot / HEADERS_PER_SECTOR * constants::SECTOR_SIZE) as u64;
+    let expected_header_offset = (slot / HEADERS_PER_SECTOR * constants::SECTOR_SIZE) as u64;
     assert_eq!(log[1].zone, Zone::WalHeaders);
     assert_eq!(log[1].offset, expected_header_offset);
     assert_eq!(log[1].len, constants::SECTOR_SIZE);
@@ -1861,8 +1857,7 @@ fn write_prepare_aborts_when_header_changes_during_payload_write() {
     let pool = MessagePool::new(1);
     let op = 9u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
-    let header =
-        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
     journal.headers[slot] = header;
 
     let mut message = make_prepare_message(&pool, header);
@@ -1872,8 +1867,7 @@ fn write_prepare_aborts_when_header_changes_during_payload_write() {
     assert_eq!(storage.write_count(), 1);
     assert_eq!(storage.pending_callbacks.borrow().len(), 1);
 
-    let new_header =
-        make_prepare_header_with_size(op, Operation::ROOT, constants::SECTOR_SIZE);
+    let new_header = make_prepare_header_with_size(op, Operation::ROOT, constants::SECTOR_SIZE);
     journal.headers[slot] = new_header;
 
     storage.drain_callbacks();
@@ -1895,8 +1889,7 @@ fn write_prepare_aborts_on_header_write_mismatch() {
     let pool = MessagePool::new(1);
     let op = 11u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
-    let header =
-        make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
+    let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
     journal.headers[slot] = header;
 
     let mut message = make_prepare_message(&pool, header);
