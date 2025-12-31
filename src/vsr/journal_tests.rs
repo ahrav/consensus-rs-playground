@@ -3,6 +3,7 @@ use crate::message_pool::MessagePool;
 use crate::storage::AlignedBuf;
 use crate::vsr::superblock;
 use core::cell::RefCell;
+use std::collections::HashMap;
 
 /// Alignment required for `HeaderPrepare` (16 bytes).
 const HEADER_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
@@ -12,7 +13,7 @@ const HEADER_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
 // =========================================================================
 
 /// Zone identifier for mock storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Zone {
     SuperBlock,
     WalHeaders,
@@ -27,6 +28,14 @@ struct MockWriteCompletion {
     callback: fn(&mut MockWriteCompletion),
 }
 
+/// Completion token for mock read operations.
+/// The actual contents don't matter - we just need it to exist for container_of!
+#[repr(C)]
+struct MockReadCompletion {
+    /// Callback to invoke on completion.
+    callback: fn(&mut MockReadCompletion),
+}
+
 /// Record of a single write operation for verification.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields used for future verification extensions.
@@ -34,6 +43,21 @@ struct WriteRecord {
     zone: Zone,
     offset: u64,
     len: usize,
+}
+
+/// Record of a single read operation for verification.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields used for future verification extensions.
+struct ReadRecord {
+    zone: Zone,
+    offset: u64,
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReadKey {
+    zone: Zone,
+    offset: u64,
 }
 
 /// Mock storage implementation for deterministic testing.
@@ -44,8 +68,14 @@ struct WriteRecord {
 struct MockStorage<const ASYNC: bool> {
     /// Log of all writes submitted to storage.
     write_log: RefCell<Vec<WriteRecord>>,
+    /// Log of all reads submitted to storage.
+    read_log: RefCell<Vec<ReadRecord>>,
+    /// Data to return for reads keyed by (zone, offset).
+    read_data: RefCell<HashMap<ReadKey, Vec<u8>>>,
     /// Pending callbacks to invoke (for deferred mode).
     pending_callbacks: RefCell<Vec<*mut MockWriteCompletion>>,
+    /// Pending read callbacks to invoke (for deferred mode).
+    pending_read_callbacks: RefCell<Vec<*mut MockReadCompletion>>,
 }
 
 impl<const ASYNC: bool> MockStorage<ASYNC> {
@@ -53,12 +83,25 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
     fn new() -> Self {
         Self {
             write_log: RefCell::new(Vec::new()),
+            read_log: RefCell::new(Vec::new()),
+            read_data: RefCell::new(HashMap::new()),
             pending_callbacks: RefCell::new(Vec::new()),
+            pending_read_callbacks: RefCell::new(Vec::new()),
         }
     }
 
     fn write_count(&self) -> usize {
         self.write_log.borrow().len()
+    }
+
+    fn read_count(&self) -> usize {
+        self.read_log.borrow().len()
+    }
+
+    fn set_read_data(&self, zone: Zone, offset: u64, data: Vec<u8>) {
+        self.read_data
+            .borrow_mut()
+            .insert(ReadKey { zone, offset }, data);
     }
 
     /// Invokes all pending callbacks in order.
@@ -74,10 +117,24 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
             }
         }
     }
+
+    /// Invokes all pending read callbacks in order.
+    #[allow(dead_code)] // Useful for future tests needing explicit completion control.
+    fn drain_read_callbacks(&self) {
+        let callbacks: Vec<_> = self.pending_read_callbacks.borrow_mut().drain(..).collect();
+        for read_ptr in callbacks {
+            // SAFETY: The pointer was stored from a valid &mut reference in read_sectors.
+            // The read completion structure is still alive (caller ensures lifetime).
+            unsafe {
+                let read = &mut *read_ptr;
+                (read.callback)(read);
+            }
+        }
+    }
 }
 
 impl<const ASYNC: bool> Storage for MockStorage<ASYNC> {
-    type Read = ();
+    type Read = MockReadCompletion;
     type Write = MockWriteCompletion;
     type Zone = Zone;
 
@@ -94,13 +151,36 @@ impl<const ASYNC: bool> Storage for MockStorage<ASYNC> {
 
     fn read_sectors(
         &mut self,
-        _callback: fn(&mut Self::Read),
-        _read: &mut Self::Read,
-        _buffer: &mut [u8],
-        _zone: Self::Zone,
-        _offset: u64,
+        callback: fn(&mut Self::Read),
+        read: &mut Self::Read,
+        buffer: &mut [u8],
+        zone: Self::Zone,
+        offset: u64,
     ) {
-        unimplemented!("read not used in journal tests")
+        self.read_log.borrow_mut().push(ReadRecord {
+            zone,
+            offset,
+            len: buffer.len(),
+        });
+
+        let data = self
+            .read_data
+            .borrow()
+            .get(&ReadKey { zone, offset })
+            .cloned()
+            .expect("missing read data for zone/offset");
+        assert!(buffer.len() <= data.len());
+        buffer.copy_from_slice(&data[..buffer.len()]);
+
+        read.callback = callback;
+
+        if ASYNC {
+            self.pending_read_callbacks
+                .borrow_mut()
+                .push(read as *mut _);
+        } else {
+            (read.callback)(read);
+        }
     }
 
     fn write_sectors(
@@ -154,6 +234,11 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    static READ_PREPARE_CALLBACKS: RefCell<Vec<(Option<*mut MessagePrepare>, ReadOptions)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
 fn record_prepare_callback(_journal: *mut TestJournal, message: Option<*mut MessagePrepare>) {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
 }
@@ -165,12 +250,36 @@ fn record_prepare_callback_async(
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
 }
 
+fn record_read_prepare_callback(
+    _journal: *mut TestJournal,
+    message: Option<*mut MessagePrepare>,
+    options: ReadOptions,
+) {
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((message, options)));
+}
+
+fn record_read_prepare_callback_async(
+    _journal: *mut Journal<MockStorage<true>, 32, 1>,
+    message: Option<*mut MessagePrepare>,
+    options: ReadOptions,
+) {
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((message, options)));
+}
+
 fn reset_prepare_callbacks() {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
 }
 
 fn take_prepare_callbacks() -> Vec<Option<*mut MessagePrepare>> {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().drain(..).collect())
+}
+
+fn reset_read_prepare_callbacks() {
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
+}
+
+fn take_read_prepare_callbacks() -> Vec<(Option<*mut MessagePrepare>, ReadOptions)> {
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().drain(..).collect())
 }
 
 // =========================================================================
@@ -1734,6 +1843,423 @@ fn async_overlap_queuing_handles_multiple_waiters() {
 }
 
 // =========================================================================
+// Read Prepare Path (Unit Tests)
+// =========================================================================
+
+#[test]
+fn read_prepare_returns_none_when_header_missing() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    let header = make_prepare_header_with_size(1, Operation::REGISTER, constants::SECTOR_SIZE);
+    let slot = Slot::from_op(header.op);
+    journal.headers[slot.index()] = make_reserved_header(slot.index());
+    let options = ReadOptions::commit(header.op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(storage.read_count(), 0);
+    assert_eq!(journal.reads_commit_count, 0);
+    assert_eq!(journal.reads_repair_count, 0);
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+}
+
+#[test]
+fn read_prepare_returns_none_when_prepare_not_inhabited() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+
+    let header = make_prepare_header_with_size(2, Operation::REGISTER, constants::SECTOR_SIZE);
+    let slot = Slot::from_op(header.op);
+    journal.headers[slot.index()] = header;
+    journal.prepare_inhabited[slot.index()] = false;
+    journal.prepare_checksums[slot.index()] = header.checksum;
+
+    let options = ReadOptions::commit(header.op, header.checksum);
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(storage.read_count(), 0);
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+}
+
+#[test]
+fn read_prepare_works_with_fresh_message_buffer() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 3u64;
+    let cluster = 42u128;
+    let body = vec![0x11, 0x22, 0x33];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let mut message = Box::new(pool.get::<PrepareCmd>());
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(storage.read_count(), 1);
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
+    assert_eq!(message.header().size, header.size);
+    assert_eq!(message.body_used(), body.as_slice());
+}
+
+#[test]
+fn read_prepare_header_only_fast_path_skips_io() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 3u64;
+    let cluster = 7u128;
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &[],
+    );
+
+    let mut message = make_read_message(&pool, constants::SECTOR_SIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(storage.read_count(), 0);
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
+
+    let bytes =
+        unsafe { core::slice::from_raw_parts(message.buffer_ptr(), constants::SECTOR_SIZE) };
+    assert_eq!(&bytes[..HeaderPrepare::SIZE], header.as_bytes());
+    assert!(bytes[HeaderPrepare::SIZE..].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn read_prepare_reads_exact_size_and_validates_padding() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 4u64;
+    let cluster = 9u128;
+    let body = vec![0x5a];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    let log = storage.read_log.borrow();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].len, constants::sector_ceil(header.size as usize));
+    drop(log);
+
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
+    assert_eq!(message.header().checksum, header.checksum);
+    assert_eq!(message.header().size, header.size);
+    assert_eq!(message.body_used(), body.as_slice());
+
+    let slot = Slot::from_op(op);
+    assert!(!journal.faulty.is_set(slot.index()));
+}
+
+#[test]
+fn read_prepare_reads_full_slot_when_header_not_exact() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 5u64;
+    let cluster = 3u128;
+    let body = vec![0x11, 0x22];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()].checksum = header.checksum.wrapping_add(1);
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare_with_op_and_checksum(record_read_prepare_callback, message_ptr, options);
+
+    let log = storage.read_log.borrow();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].len, constants::MESSAGE_SIZE_MAX_USIZE);
+    drop(log);
+
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
+}
+
+#[test]
+fn read_prepare_marks_faulty_on_body_corruption() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 6u64;
+    let cluster = 1u128;
+    let body = vec![0x10, 0x20, 0x30];
+
+    let (header, mut data) = make_prepare_disk_image(op, Operation::REGISTER, cluster, &body);
+    data[HeaderPrepare::SIZE] ^= 0xFF;
+
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()] = header;
+    journal.prepare_inhabited[slot.index()] = true;
+    journal.prepare_checksums[slot.index()] = header.checksum;
+
+    let offset = (constants::MESSAGE_SIZE_MAX as u64) * slot.index() as u64;
+    storage.set_read_data(Zone::WalPrepares, offset, data);
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    assert!(journal.faulty.is_set(slot.index()));
+    assert!(journal.dirty.is_set(slot.index()));
+}
+
+#[test]
+fn read_prepare_rejects_nonzero_padding() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 7u64;
+    let cluster = 1u128;
+    let body = vec![0x42];
+
+    let (header, mut data) = make_prepare_disk_image(op, Operation::REGISTER, cluster, &body);
+    let size = header.size as usize;
+    let padded = constants::sector_ceil(size);
+    assert!(size < padded);
+    data[size] = 0x99;
+
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()] = header;
+    journal.prepare_inhabited[slot.index()] = true;
+    journal.prepare_checksums[slot.index()] = header.checksum;
+
+    let offset = (constants::MESSAGE_SIZE_MAX as u64) * slot.index() as u64;
+    storage.set_read_data(Zone::WalPrepares, offset, data);
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    assert!(journal.faulty.is_set(slot.index()));
+    assert!(journal.dirty.is_set(slot.index()));
+}
+
+#[test]
+fn read_prepare_detects_prepare_changed_during_read() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 8u64;
+    let cluster = 1u128;
+    let body = vec![0x1];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
+
+    assert_eq!(journal.reads_commit_count, 1);
+    assert_eq!(storage.pending_read_callbacks.borrow().len(), 1);
+
+    let slot = Slot::from_op(op);
+    journal.prepare_inhabited[slot.index()] = false;
+
+    storage.drain_read_callbacks();
+
+    assert_eq!(journal.reads_commit_count, 0);
+    assert!(!journal.faulty.is_set(slot.index()));
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+}
+
+#[test]
+fn read_prepare_reserves_commit_reads_over_repairs() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::<true>::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(READ_OPS + 4);
+    let mut messages: Vec<Box<MessagePrepare>> = Vec::new();
+
+    for i in 0..READS_REPAIR_COUNT_MAX {
+        let op = 100 + i as u64;
+        let header =
+            install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x7f]);
+
+        let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+        let message_ptr = message.as_mut() as *mut MessagePrepare;
+        let options = ReadOptions::repair(op, header.checksum, 1);
+
+        journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
+        messages.push(message);
+    }
+
+    assert_eq!(journal.reads_repair_count, READS_REPAIR_COUNT_MAX);
+    assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX);
+
+    let op = 200u64;
+    let header =
+        install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x1]);
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::repair(op, header.checksum, 1);
+    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
+    messages.push(message);
+
+    assert_eq!(journal.reads_repair_count, READS_REPAIR_COUNT_MAX);
+    assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX);
+    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+
+    let op = 300u64;
+    let header =
+        install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x2]);
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
+    messages.push(message);
+
+    assert_eq!(journal.reads_commit_count, 1);
+    assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX + 1);
+
+    storage.drain_read_callbacks();
+
+    assert_eq!(journal.reads_commit_count, 0);
+    assert_eq!(journal.reads_repair_count, 0);
+    assert_eq!(
+        take_read_prepare_callbacks().len(),
+        READS_REPAIR_COUNT_MAX + 1
+    );
+}
+
+#[test]
+fn read_prepare_accepts_max_size_prepare() {
+    reset_read_prepare_callbacks();
+
+    let mut storage = MockStorage::new();
+    let mut journal = make_recovered_journal(&mut storage, 0);
+
+    let pool = MessagePool::new(1);
+    let op = 400u64;
+    let cluster = 1u128;
+    let body = vec![0x5a; constants::MESSAGE_BODY_SIZE_MAX_USIZE];
+    let header = install_prepare_for_read(
+        &mut journal,
+        &storage,
+        op,
+        Operation::REGISTER,
+        cluster,
+        &body,
+    );
+
+    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
+    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let options = ReadOptions::commit(op, header.checksum);
+
+    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+
+    let log = storage.read_log.borrow();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].len, constants::MESSAGE_SIZE_MAX_USIZE);
+    drop(log);
+
+    assert_eq!(message.body_used().len(), body.len());
+    assert_eq!(message.body_used(), body.as_slice());
+    assert_eq!(
+        take_read_prepare_callbacks(),
+        vec![(Some(message_ptr), options)]
+    );
+}
+
+// =========================================================================
 // Write Prepare Path (Unit Tests)
 // =========================================================================
 
@@ -2423,6 +2949,66 @@ fn make_prepare_message(pool: &MessagePool, header: HeaderPrepare) -> Box<Messag
     let mut message = Box::new(pool.get::<PrepareCmd>());
     *message.header_mut() = header;
     message
+}
+
+fn make_recovered_journal<const ASYNC: bool>(
+    storage: &mut MockStorage<ASYNC>,
+    replica: u8,
+) -> Journal<MockStorage<ASYNC>, 32, 1> {
+    let mut journal = Journal::<MockStorage<ASYNC>, 32, 1>::new(storage, replica);
+    journal.status = Status::Recovered;
+    journal.dirty = BitSet::empty();
+    journal.faulty = BitSet::empty();
+    journal
+}
+
+fn make_read_message(pool: &MessagePool, used_len: usize) -> Box<MessagePrepare> {
+    let mut message = Box::new(pool.get::<PrepareCmd>());
+    message.set_used_len(used_len);
+    message
+}
+
+fn make_prepare_disk_image(
+    op: u64,
+    operation: Operation,
+    cluster: u128,
+    body: &[u8],
+) -> (HeaderPrepare, Vec<u8>) {
+    assert!(body.len() <= constants::MESSAGE_BODY_SIZE_MAX_USIZE);
+
+    let mut header = HeaderPrepare::new();
+    header.command = Command::Prepare;
+    header.operation = operation;
+    header.op = op;
+    header.cluster = cluster;
+    header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    header.set_checksum_body(body);
+    header.set_checksum();
+
+    let mut data = vec![0u8; constants::MESSAGE_SIZE_MAX_USIZE];
+    data[..HeaderPrepare::SIZE].copy_from_slice(header.as_bytes());
+    data[HeaderPrepare::SIZE..HeaderPrepare::SIZE + body.len()].copy_from_slice(body);
+
+    (header, data)
+}
+
+fn install_prepare_for_read<const ASYNC: bool>(
+    journal: &mut Journal<MockStorage<ASYNC>, 32, 1>,
+    storage: &MockStorage<ASYNC>,
+    op: u64,
+    operation: Operation,
+    cluster: u128,
+    body: &[u8],
+) -> HeaderPrepare {
+    let (header, data) = make_prepare_disk_image(op, operation, cluster, body);
+    let slot = Slot::from_op(op);
+    journal.headers[slot.index()] = header;
+    journal.prepare_inhabited[slot.index()] = true;
+    journal.prepare_checksums[slot.index()] = header.checksum;
+
+    let offset = (constants::MESSAGE_SIZE_MAX as u64) * slot.index() as u64;
+    storage.set_read_data(Zone::WalPrepares, offset, data);
+    header
 }
 
 // -------------------------------------------------------------------------

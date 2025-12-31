@@ -41,31 +41,49 @@
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
 #[allow(dead_code)]
-use core::cmp::min;
-use core::mem::MaybeUninit;
-use core::ptr;
+use core::{cmp::min, mem::MaybeUninit, ptr};
 
 #[allow(unused_imports)]
-use crate::constants;
-use crate::container_of;
-use crate::message_pool::Message;
-use crate::stdx::BitSet;
-use crate::util::utils::AlignedSlice;
-use crate::util::zero;
-use crate::vsr::command::PrepareCmd;
-use crate::vsr::journal_primitives::{HEADERS_PER_SECTOR, Slot};
-use crate::vsr::{Checksum128, Command, Operation};
-use crate::vsr::{
-    Header,
-    HeaderPrepare,
-    iops::IOPSType,
-    journal_primitives::{
-        HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_SIZE, Ring, SLOT_COUNT, SLOT_COUNT_WORDS,
-        WAL_HEADER_SIZE,
+use crate::{
+    constants, container_of,
+    message_pool::Message,
+    stdx::BitSet,
+    util::{utils::AlignedSlice, zero},
+    vsr::{
+        Checksum128, Command, Header, HeaderPrepare, Operation,
+        command::PrepareCmd,
+        iops::IOPSType,
+        journal_primitives::{
+            HEADER_CHUNK_COUNT, HEADER_CHUNK_WORDS, HEADERS_PER_SECTOR, HEADERS_SIZE, Ring,
+            SLOT_COUNT, SLOT_COUNT_WORDS, Slot, WAL_HEADER_SIZE,
+        },
+        storage::{Storage, Synchronicity},
     },
-    storage::{Storage, Synchronicity},
-    // Command, Operation,
 };
+
+// ============================================================================
+// Read IOP accounting
+// ============================================================================
+
+// The read path shares a single IOP pool across commit and repair reads. We reserve
+// a small number of slots for commit-path reads so repair traffic cannot starve
+// client commits. Accounting is enforced in `read_prepare_with_op_and_checksum`.
+
+/// Total read IOPs available to the journal.
+///
+/// We intentionally reserve a small number of reads for the commit path so that an
+/// asymmetrically partitioned replica cannot starve the cluster with repair reads.
+const READ_OPS: usize = constants::JOURNAL_IOPS_READ_MAX as usize;
+
+/// `IOPSType` uses a bitset internally; `READ_OPS_WORDS` is the number of `u64` words
+/// required to represent `READ_OPS` bits.
+const READ_OPS_WORDS: usize = READ_OPS.div_ceil(64);
+
+/// Reads reserved for commit path (`destination_replica == None`).
+const READS_COMMIT_COUNT_MAX: usize = 2;
+
+/// Reads available for repair path (`destination_replica != None`).
+const READS_REPAIR_COUNT_MAX: usize = READ_OPS - READS_COMMIT_COUNT_MAX;
 
 // Compile-time assertions to verify header chunk constant relationships.
 const _: () = {
@@ -77,6 +95,10 @@ const _: () = {
     assert!(constants::MESSAGE_SIZE_MAX.is_multiple_of(WAL_HEADER_SIZE as u32));
     // MESSAGE_SIZE_MAX must be sector-aligned.
     assert!((constants::MESSAGE_SIZE_MAX as usize).is_multiple_of(constants::SECTOR_SIZE));
+
+    assert!(READ_OPS > 0);
+    assert!(READS_REPAIR_COUNT_MAX > 0);
+    assert!(READS_REPAIR_COUNT_MAX + READS_COMMIT_COUNT_MAX == READ_OPS);
 };
 
 /// Bitset tracking header chunk state. `HEADER_CHUNK_WORDS` is the number of `u64`s
@@ -252,6 +274,69 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
 pub type MessagePrepare = Message<PrepareCmd>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Parameters describing a prepare read request.
+///
+/// These options are copied into the read descriptor and passed back to the
+/// completion callback so callers can associate results with their request.
+pub struct ReadOptions {
+    /// Operation number of the prepare to read.
+    pub op: u64,
+    /// Expected checksum for identity verification.
+    pub checksum: Checksum128,
+    /// `None` for commit-path reads, `Some(replica)` for repair/request_prepare reads.
+    pub destination_replica: Option<u8>,
+}
+
+impl ReadOptions {
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn commit(op: u64, checksum: Checksum128) -> Self {
+        Self {
+            op,
+            checksum,
+            destination_replica: None,
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn repair(op: u64, checksum: Checksum128, destination_replica: u8) -> Self {
+        Self {
+            op,
+            checksum,
+            destination_replica: Some(destination_replica),
+        }
+    }
+}
+
+#[repr(C)]
+/// Descriptor for an in-flight prepare read.
+///
+/// Allocated from `Journal.reads` and populated before issuing storage I/O. The
+/// completion token is first to support `container_of!` in the read callback.
+pub struct Read<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+    /// Storage completion token (must be first for `container_of!`).
+    pub completion: MaybeUninit<S::Read>,
+    /// Back-pointer to the owning journal.
+    pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    /// Target message buffer to fill; must remain valid until callback.
+    pub message: *mut MessagePrepare,
+    /// Read options passed through to the callback.
+    pub options: ReadOptions,
+    /// User callback invoked when the read completes (or is bypassed).
+    pub callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+}
+
+/// Callback invoked when `read_prepare` completes.
+///
+/// `prepare` is `Some(message)` only when the prepare was read successfully and passed all
+/// validation. `None` indicates the prepare is unavailable, was rewritten while reading,
+/// or was detected as corrupt/misdirected (and the slot may have been marked faulty).
+/// The callback may run without issuing I/O (e.g. header-only fast path or no-entry cases).
+pub type ReadPrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
+    fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>, ReadOptions);
+
 /// Callback invoked when `write_prepare` completes.
 pub type WritePrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
     fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>);
@@ -306,21 +391,29 @@ const _: () = {
 };
 
 /// Journal lifecycle state.
-#[derive(Clone, Copy)]
-pub enum Status<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Status {
     /// Initial state before recovery begins.
     Init,
-    /// Recovery in progress; callback invoked when complete.
-    Recovering(fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>)),
+    /// Journal is recovering; header chunks being read and validated.
+    Recovering {
+        /// Number of header sectors successfully read and validated.
+        headers_recovered: u64,
+        /// Total number of header sectors to recover.
+        headers_total: u64,
+    },
     /// Recovery complete; journal is ready for normal operation.
     Recovered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Writing {
+enum Writing {
+    /// No write in progress for this slot.
     None,
-    Slot,
+    /// A write is in progress for this exact op+checksum.
     Exact,
+    /// A write is in progress for this slot but different op+checksum.
+    Slot,
 }
 
 /// WAL journal implementing range-locked sector writes.
@@ -357,11 +450,20 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
 
-    /// Chunks with outstanding or completed read requests.
+    /// Recovery-time: header chunks with outstanding or completed read requests.
     pub header_chunks_requested: HeaderChunks,
 
-    /// Chunks whose reads have completed and data copied.
+    /// Recovery-time: header chunks whose reads have completed and data copied.
     pub header_chunks_recovered: HeaderChunks,
+
+    /// Pool of read operation descriptors for prepare reads (commit + repair).
+    pub reads: IOPSType<Read<S, WRITE_OPS, WRITE_OPS_WORDS>, READ_OPS, READ_OPS_WORDS>,
+
+    /// In-flight reads attributed to the commit path (`destination_replica == None`).
+    pub reads_commit_count: usize,
+
+    /// In-flight reads attributed to the repair path (`destination_replica != None`).
+    pub reads_repair_count: usize,
 
     /// Pool of write operation descriptors for the range-locking machinery.
     pub writes: IOPSType<Write<S, WRITE_OPS, WRITE_OPS_WORDS>, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -388,7 +490,7 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     pub prepare_inhabited: Vec<bool>,
 
     /// Current journal state (initializing, recovering, or recovered).
-    pub status: Status<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    pub status: Status,
 }
 
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
@@ -428,6 +530,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             write_headers_sectors,
             header_chunks_requested: HeaderChunks::empty(),
             header_chunks_recovered: HeaderChunks::empty(),
+            reads: IOPSType::default(),
+            reads_commit_count: 0,
+            reads_repair_count: 0,
             writes: IOPSType::default(),
             dirty,
             faulty,
@@ -839,6 +944,278 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
 
         found
+    }
+
+    /// Read a prepare from disk. There must be a matching in-memory header.
+    ///
+    /// This is the safe entry point used by the normal commit path and by request/repair
+    /// handlers that already have an exact (op, checksum) identity to read.
+    ///
+    /// On failure, the callback is invoked with `None` and **no read I/O is issued**.
+    /// This includes cases where the in-memory slot is not inhabited or no exact match exists.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_prepare(
+        &mut self,
+        callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+        message: *mut MessagePrepare,
+        options: ReadOptions,
+    ) {
+        assert!(matches!(self.status, Status::Recovered));
+        assert!(!message.is_null());
+        assert!(options.checksum != 0);
+
+        let Some(slot) = self.slot_with_op_and_checksum(options.op, options.checksum) else {
+            self.read_prepare_log(options.op, Some(options.checksum), "no entry exactly");
+            callback(self as *mut _, None, options);
+            return;
+        };
+
+        if self.prepare_inhabited[slot.index()]
+            && self.prepare_checksums[slot.index()] == options.checksum
+        {
+            self.read_prepare_with_op_and_checksum(callback, message, options);
+        } else {
+            self.read_prepare_log(options.op, Some(options.checksum), "no matching prepare");
+            callback(self as *mut _, None, options);
+        }
+    }
+
+    /// Read a prepare from disk. There may or may not be a matching in-memory header.
+    ///
+    /// This is the shared primitive used by:
+    /// - `read_prepare` (normal path)
+    /// - request/repair paths once the checksum is known
+    /// - recovery checks (step 4) that need to validate/repair prepares
+    ///
+    /// The caller must ensure:
+    /// - `prepare_inhabited[slot] == true`
+    /// - `prepare_checksums[slot] == options.checksum`
+    ///
+    /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
+    /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
+    /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_prepare_with_op_and_checksum(
+        &mut self,
+        callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+        message: *mut MessagePrepare,
+        options: ReadOptions,
+    ) {
+        assert!(matches!(self.status, Status::Recovered));
+        assert!(!message.is_null());
+        assert!(options.checksum != 0);
+
+        let slot = self.slot_for_op(options.op);
+        assert!(self.prepare_inhabited[slot.index()]);
+        assert!(self.prepare_checksums[slot.index()] == options.checksum);
+
+        // Default to full slot reads; exact headers can tighten this.
+        let mut message_size: usize = constants::MESSAGE_SIZE_MAX_USIZE;
+
+        // Optimization: if the exact header is in-memory, we can read fewer bytes (or skip entirely).
+        if let Some(exact) = self.header_with_op_and_checksum(options.op, options.checksum) {
+            if exact.size as usize == size_of::<HeaderPrepare>() {
+                // Header-only prepare; no disk required. Populate the message buffer
+                // with the header and zero the remainder of the first sector.
+                unsafe {
+                    let buf_ptr = (*message).buffer_ptr();
+                    let buf_len = constants::MESSAGE_SIZE_MAX_USIZE;
+                    assert!(buf_len >= constants::SECTOR_SIZE);
+
+                    ptr::copy_nonoverlapping(
+                        exact as *const HeaderPrepare as *const u8,
+                        buf_ptr,
+                        size_of::<HeaderPrepare>(),
+                    );
+
+                    let sector = core::slice::from_raw_parts_mut(buf_ptr, constants::SECTOR_SIZE);
+                    sector[size_of::<HeaderPrepare>()..].fill(0);
+                }
+
+                callback(self as *mut _, Some(message), options);
+                return;
+            } else {
+                // As an optimization, read only the exact message size (sector-aligned).
+                message_size = constants::sector_ceil(exact.size as usize);
+                assert!(message_size <= constants::MESSAGE_SIZE_MAX_USIZE);
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // IOP accounting (commit vs repair)
+        // ---------------------------------------------------------------------
+
+        if options.destination_replica.is_none() {
+            // Commit-path reads are allowed as long as an IOP is available.
+            if self.reads.available() == 0 || self.reads_commit_count == READS_COMMIT_COUNT_MAX {
+                self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+                callback(self as *mut _, None, options);
+                return;
+            }
+            self.reads_commit_count += 1;
+        } else {
+            // Repair reads are capped so they cannot starve commit reads.
+            if self.reads_repair_count == READS_REPAIR_COUNT_MAX {
+                self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+                callback(self as *mut _, None, options);
+                return;
+            }
+            self.reads_repair_count += 1;
+        }
+
+        assert!(self.reads_commit_count <= READS_COMMIT_COUNT_MAX);
+        assert!(self.reads_repair_count <= READS_REPAIR_COUNT_MAX);
+
+        let Some(read) = self.reads.acquire() else {
+            if options.destination_replica.is_none() {
+                self.reads_commit_count -= 1;
+            } else {
+                self.reads_repair_count -= 1;
+            }
+            callback(self as *mut _, None, options);
+            return;
+        };
+
+        unsafe {
+            ptr::addr_of_mut!((*read).journal).write(self as *mut _);
+            ptr::addr_of_mut!((*read).message).write(message);
+            ptr::addr_of_mut!((*read).options).write(options);
+            ptr::addr_of_mut!((*read).callback).write(callback);
+        }
+
+        let buf_ptr = unsafe { (*message).buffer_ptr() };
+        let buf_len_total = constants::MESSAGE_SIZE_MAX_USIZE;
+        assert!(message_size <= buf_len_total);
+
+        let buffer: &mut [u8] = unsafe { core::slice::from_raw_parts_mut(buf_ptr, message_size) };
+        let offset = (constants::MESSAGE_SIZE_MAX as u64) * (slot.index() as u64);
+        assert!(offset.is_multiple_of(constants::SECTOR_SIZE as u64));
+
+        let storage = unsafe { &mut *self.storage };
+
+        storage.read_sectors(
+            Self::read_prepare_with_op_and_checksum_on_read,
+            unsafe { &mut *(*read).completion.as_mut_ptr() },
+            buffer,
+            S::WAL_PREPARES_ZONE,
+            offset,
+        );
+    }
+
+    /// Completion callback for prepare reads.
+    ///
+    /// Recovers the read descriptor, updates IOP accounting, and validates the
+    /// on-disk prepare (header, body, padding) against the expected identity.
+    /// On validation failure, marks the slot faulty/dirty if it still refers to
+    /// the same prepare, then invokes the callback with `None`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_prepare_with_op_and_checksum_on_read(completion: &mut S::Read) {
+        let read: *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> =
+            container_of!(completion, Read<S, WRITE_OPS, WRITE_OPS_WORDS>, completion);
+
+        let journal = unsafe { &mut *(*read).journal };
+        assert!(matches!(journal.status, Status::Recovered));
+
+        let callback = unsafe { (*read).callback };
+        let message = unsafe { (*read).message };
+        let options = unsafe { (*read).options };
+
+        // Release IOP accounting before invoking user callbacks.
+        if options.destination_replica.is_none() {
+            assert!(journal.reads_commit_count > 0);
+            journal.reads_commit_count -= 1;
+        } else {
+            assert!(journal.reads_repair_count > 0);
+            journal.reads_repair_count -= 1;
+        }
+        journal.reads.release(read);
+
+        // The prepare may have been re-written since the read began.
+        let slot = journal.slot_for_op(options.op);
+        let checksum_inhabited = journal.prepare_inhabited[slot.index()];
+        let checksum_match = journal.prepare_checksums[slot.index()] == options.checksum;
+        if !checksum_inhabited || !checksum_match {
+            journal.read_prepare_log(
+                options.op,
+                Some(options.checksum),
+                "prepare changed during read",
+            );
+            callback(journal as *mut _, None, options);
+            return;
+        }
+
+        // Validate header identity and message integrity.
+        let header = unsafe { (*message).header() };
+        let expected_cluster = journal.headers[slot.index()].cluster;
+
+        let error_reason: Option<&'static str> = (|| {
+            if !header.valid_checksum() {
+                return Some("corrupt header after read");
+            }
+
+            if header.command != Command::Prepare {
+                return Some("wrong command");
+            }
+
+            if header.cluster != expected_cluster {
+                return Some("wrong cluster");
+            }
+
+            if header.op != options.op {
+                return Some("op changed during read");
+            }
+
+            if header.checksum != options.checksum {
+                return Some("checksum changed during read");
+            }
+
+            let size = header.size as usize;
+            if size < size_of::<HeaderPrepare>() || size > constants::MESSAGE_SIZE_MAX_USIZE {
+                return Some("invalid message size");
+            }
+
+            let bytes = unsafe { core::slice::from_raw_parts((*message).buffer_ptr(), size) };
+            let body_used = &bytes[size_of::<HeaderPrepare>()..size];
+            if !header.valid_checksum_body(body_used) {
+                return Some("corrupt body after read");
+            }
+
+            let padded = constants::sector_ceil(size);
+            assert!(padded.is_multiple_of(constants::SECTOR_SIZE));
+            if padded > constants::MESSAGE_SIZE_MAX_USIZE {
+                return Some("invalid message size");
+            }
+
+            // Padding must be zero to detect torn or partial writes.
+            let padding = unsafe {
+                core::slice::from_raw_parts((*message).buffer_ptr().add(size), padded - size)
+            };
+            if !zero::is_all_zeros(padding) {
+                return Some("corrupt sector padding");
+            }
+
+            None
+        })();
+
+        if let Some(reason) = error_reason {
+            // Mark the slot faulty if the exact header still matches what we were trying to read.
+            if let Some(slot) = journal.slot_with_op_and_checksum(options.op, options.checksum) {
+                journal.faulty.set(slot.index());
+                journal.dirty.set(slot.index());
+            }
+
+            journal.read_prepare_log(options.op, Some(options.checksum), reason);
+            callback(journal as *mut _, None, options);
+        } else {
+            callback(journal as *mut _, Some(message), options);
+        }
+    }
+
+    #[inline]
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Debug hook for read-path notices; intentionally a no-op in production builds.
+    fn read_prepare_log(&self, op: u64, checksum: Option<Checksum128>, notice: &str) {
+        let _ = (op, checksum, notice);
     }
 
     /// Writes a prepare message and its header to the WAL.
