@@ -38,7 +38,6 @@ struct MockReadCompletion {
 
 /// Record of a single write operation for verification.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future verification extensions.
 struct WriteRecord {
     zone: Zone,
     offset: u64,
@@ -47,7 +46,7 @@ struct WriteRecord {
 
 /// Record of a single read operation for verification.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used for future verification extensions.
+#[allow(dead_code)] // zone/offset fields reserved for future verification extensions.
 struct ReadRecord {
     zone: Zone,
     offset: u64,
@@ -114,7 +113,6 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
     }
 
     /// Invokes all pending callbacks in order.
-    #[allow(dead_code)] // Useful for future tests needing explicit completion control.
     fn drain_callbacks(&self) {
         let callbacks: Vec<_> = self.pending_callbacks.borrow_mut().drain(..).collect();
         for write_ptr in callbacks {
@@ -128,7 +126,6 @@ impl<const ASYNC: bool> MockStorage<ASYNC> {
     }
 
     /// Invokes all pending read callbacks in order.
-    #[allow(dead_code)] // Useful for future tests needing explicit completion control.
     fn drain_read_callbacks(&self) {
         let callbacks: Vec<_> = self.pending_read_callbacks.borrow_mut().drain(..).collect();
         for read_ptr in callbacks {

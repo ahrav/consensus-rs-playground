@@ -40,7 +40,6 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
-#[allow(dead_code)]
 use core::{cmp::min, mem::MaybeUninit, ptr};
 
 #[allow(unused_imports)]
@@ -602,7 +601,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot for `op` only if a header with that exact op exists.
     #[inline]
-    #[allow(dead_code)]
     fn slot_with_op(&self, op: u64) -> Option<Slot> {
         self.header_with_op(op).map(|_| self.slot_for_op(op))
     }
@@ -625,7 +623,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot only if this EXACT header (op + checksum) exists.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_with_op_and_checksum(&self, op: u64, checksum: Checksum128) -> Option<Slot> {
         self.header_with_op_and_checksum(op, checksum)
             .map(|_| self.slot_for_op(op))
@@ -653,7 +650,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot for a header known to exist. Asserts presence.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_for_header(&self, header: &HeaderPrepare) -> Slot {
         assert!(self.slot_with_op(header.op).is_some());
         self.slot_for_op(header.op)
@@ -661,7 +657,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     /// Returns the slot only if this exact header exists in the journal.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn slot_with_header(&self, header: &HeaderPrepare) -> Option<Slot> {
         self.slot_with_op_and_checksum(header.op, header.checksum)
     }
@@ -671,14 +666,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     // =========================================================================
 
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn has_header(&self, header: &HeaderPrepare) -> bool {
         self.header_with_op_and_checksum(header.op, header.checksum)
             .is_some()
     }
 
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     fn has_dirty(&self, header: &HeaderPrepare) -> bool {
         assert!(self.has_header(header));
         let slot = self.slot_for_header(header);
@@ -920,7 +913,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - More than one write targets the same slot
     /// - A write targets the same slot but a different `op`
-    #[cfg_attr(not(test), allow(dead_code))]
     fn writing(&self, header: &HeaderPrepare) -> Writing {
         assert!(matches!(self.status, Status::Recovered));
 
@@ -1108,7 +1100,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// on-disk prepare (header, body, padding) against the expected identity.
     /// On validation failure, marks the slot faulty/dirty if it still refers to
     /// the same prepare, then invokes the callback with `None`.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare_with_op_and_checksum_on_read(completion: &mut S::Read) {
         let read: *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> =
             container_of!(completion, Read<S, WRITE_OPS, WRITE_OPS_WORDS>, completion);
@@ -1211,9 +1202,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
     }
 
-    #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
     /// Debug hook for read-path notices; intentionally a no-op in production builds.
+    #[inline]
     fn read_prepare_log(&self, op: u64, checksum: Option<Checksum128>, notice: &str) {
         let _ = (op, checksum, notice);
     }
@@ -1316,7 +1306,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// submits a header sector write. If the in-memory header changed while the
     /// payload write was in flight, the slot is left dirty and the write is
     /// released without completing the prepare.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
         let journal = unsafe { &mut *(*write).journal };
         assert!(matches!(journal.status, Status::Recovered));
@@ -1381,7 +1370,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Panics if the sector index is out of range or `write` does not come from
     /// the journal's write pool.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn header_sector(
         &mut self,
         sector_index: usize,
@@ -1429,7 +1417,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// Verifies the header still matches the in-memory slot and redundant copy,
     /// clears dirty/faulty flags, and releases the write. If any check fails, the
     /// write is released without marking the slot durable.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_on_write_header(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
         let journal = unsafe { &mut *(*write).journal };
         assert!(matches!(journal.status, Status::Recovered));
@@ -1470,7 +1457,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// The IOP is returned to the pool before calling into user code to avoid
     /// reentrancy issues and to allow immediate reuse.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare_release(
         journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
         write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>,
