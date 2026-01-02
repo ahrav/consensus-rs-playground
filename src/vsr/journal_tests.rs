@@ -1064,7 +1064,13 @@ fn recovery_cases_match_expected_decisions() {
         decision_multiple: RecoveryDecision,
         decision_single: RecoveryDecision,
     ) {
-        let case = recovery_case(header.as_ref(), prepare.as_ref(), op_max, op_prepare_max, false);
+        let case = recovery_case(
+            header.as_ref(),
+            prepare.as_ref(),
+            op_max,
+            op_prepare_max,
+            false,
+        );
         assert_eq!(case.label, label);
         assert_eq!(case.decision(false), decision_multiple);
         assert_eq!(case.decision(true), decision_single);
@@ -3245,12 +3251,7 @@ fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
     header
 }
 
-fn make_recovery_header(
-    op: u64,
-    view: u32,
-    checksum: u128,
-    operation: Operation,
-) -> HeaderPrepare {
+fn make_recovery_header(op: u64, view: u32, checksum: u128, operation: Operation) -> HeaderPrepare {
     let mut header = HeaderPrepare::new();
     header.command = Command::Prepare;
     header.operation = operation;
