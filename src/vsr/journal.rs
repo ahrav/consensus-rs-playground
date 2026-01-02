@@ -602,7 +602,7 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
         decision_single: RecoveryDecision::Vsr,
         pattern: [_1, _0, _0, __, __, A0, __, __, __, __, __],
     },
-    // @D - prepare ok reerved, header invalid.
+    // @D - prepare ok reserved, header invalid.
     RecoveryCase {
         label: "@D",
         decision_multiple: RecoveryDecision::Vsr,
@@ -637,7 +637,7 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
         decision_single: RecoveryDecision::Unreachable,
         pattern: [__, __, _1, _0, __, _1, __, __, __, __, __],
     },
-    // @I - header beyond op_prepare_max.
+    // @I - header.op > op_prepare_max, prepare not reserved.
     RecoveryCase {
         label: "@I",
         decision_multiple: RecoveryDecision::Cut,
@@ -658,35 +658,35 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
         decision_single: RecoveryDecision::Vsr,
         pattern: [_1, _0, _1, _1, __, __, _0, __, __, __, __],
     },
-    // @L both reserved and identical.
+    // @L normal path: reserved.
     RecoveryCase {
         label: "@L",
         decision_multiple: RecoveryDecision::Nil,
         decision_single: RecoveryDecision::Nil,
         pattern: [_1, _1, _1, _1, __, __, __, A1, A1, A0, A1],
     },
-    // @M - header older than prepare (wrap), repair.
+    // @M - header.op < prepare.op.
     RecoveryCase {
         label: "@M",
         decision_multiple: RecoveryDecision::Fix,
         decision_single: RecoveryDecision::Fix,
         pattern: [_1, _0, _1, _0, __, _0, _0, _0, _0, _1, __],
     },
-    // @N - header newer than prepare, fault.
+    // @N - header.op > prepare.op.
     RecoveryCase {
         label: "@N",
         decision_multiple: RecoveryDecision::Vsr,
         decision_single: RecoveryDecision::Vsr,
         pattern: [_1, _0, _1, _0, __, _0, _0, _0, _0, _0, __],
     },
-    // @O - op matches but checksum/view mistmatch.
+    // @O - header.view != prepare.view (op matches, checksum differs).
     RecoveryCase {
         label: "@O",
         decision_multiple: RecoveryDecision::Vsr,
         decision_single: RecoveryDecision::Vsr,
         pattern: [_1, _0, _1, _0, __, _0, _0, _0, _1, A0, A0],
     },
-    // @P - clean match.
+    // @P - normal path: prepare.
     RecoveryCase {
         label: "@P",
         decision_multiple: RecoveryDecision::Fix,
