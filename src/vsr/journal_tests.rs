@@ -1050,6 +1050,196 @@ mod proptests {
 }
 
 // =========================================================================
+// Recovery Case Table (Unit Tests)
+// =========================================================================
+
+#[test]
+fn recovery_cases_match_expected_decisions() {
+    fn assert_case(
+        label: &str,
+        header: Option<HeaderPrepare>,
+        prepare: Option<HeaderPrepare>,
+        op_max: u64,
+        op_prepare_max: u64,
+        decision_multiple: RecoveryDecision,
+        decision_single: RecoveryDecision,
+    ) {
+        let case = recovery_case(
+            header.as_ref(),
+            prepare.as_ref(),
+            op_max,
+            op_prepare_max,
+            false,
+        );
+        assert_eq!(case.label, label);
+        assert_eq!(case.decision(false), decision_multiple);
+        assert_eq!(case.decision(true), decision_single);
+    }
+
+    assert_case(
+        "@A",
+        None,
+        None,
+        0,
+        0,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    assert_case(
+        "@B",
+        Some(make_reserved_header(1)),
+        None,
+        0,
+        0,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    assert_case(
+        "@C",
+        Some(make_recovery_header(5, 1, 0x11, Operation::REGISTER)),
+        None,
+        10,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    assert_case(
+        "@D",
+        None,
+        Some(make_reserved_header(2)),
+        10,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Fix,
+    );
+
+    assert_case(
+        "@E",
+        None,
+        Some(make_recovery_header(9, 1, 0x22, Operation::REGISTER)),
+        10,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Fix,
+    );
+
+    assert_case(
+        "@F",
+        None,
+        Some(make_recovery_header(10, 1, 0x33, Operation::REGISTER)),
+        10,
+        10,
+        RecoveryDecision::Fix,
+        RecoveryDecision::Fix,
+    );
+
+    assert_case(
+        "@G",
+        Some(make_reserved_header(3)),
+        Some(make_recovery_header(7, 1, 0x44, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Fix,
+        RecoveryDecision::Fix,
+    );
+
+    assert_case(
+        "@H",
+        None,
+        Some(make_recovery_header(12, 1, 0x55, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Cut,
+        RecoveryDecision::Unreachable,
+    );
+
+    assert_case(
+        "@I",
+        Some(make_recovery_header(12, 1, 0x66, Operation::REGISTER)),
+        Some(make_recovery_header(9, 1, 0x77, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Cut,
+        RecoveryDecision::Unreachable,
+    );
+
+    assert_case(
+        "@J",
+        Some(make_recovery_header(12, 1, 0x88, Operation::REGISTER)),
+        Some(make_reserved_header(2)),
+        20,
+        10,
+        RecoveryDecision::Cut,
+        RecoveryDecision::Unreachable,
+    );
+
+    assert_case(
+        "@K",
+        Some(make_recovery_header(8, 1, 0x99, Operation::REGISTER)),
+        Some(make_reserved_header(2)),
+        20,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    let reserved = make_reserved_header(4);
+    assert_case(
+        "@L",
+        Some(reserved),
+        Some(reserved),
+        10,
+        10,
+        RecoveryDecision::Nil,
+        RecoveryDecision::Nil,
+    );
+
+    assert_case(
+        "@M",
+        Some(make_recovery_header(5, 1, 0x100, Operation::REGISTER)),
+        Some(make_recovery_header(7, 1, 0x200, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Fix,
+        RecoveryDecision::Fix,
+    );
+
+    assert_case(
+        "@N",
+        Some(make_recovery_header(7, 1, 0x300, Operation::REGISTER)),
+        Some(make_recovery_header(5, 1, 0x400, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    assert_case(
+        "@O",
+        Some(make_recovery_header(6, 1, 0x500, Operation::REGISTER)),
+        Some(make_recovery_header(6, 2, 0x600, Operation::REGISTER)),
+        20,
+        10,
+        RecoveryDecision::Vsr,
+        RecoveryDecision::Vsr,
+    );
+
+    let header = make_recovery_header(6, 1, 0x700, Operation::REGISTER);
+    assert_case(
+        "@P",
+        Some(header),
+        Some(header),
+        20,
+        10,
+        RecoveryDecision::Fix,
+        RecoveryDecision::Fix,
+    );
+}
+
+// =========================================================================
 // Range Overlap Detection (Property Tests)
 // =========================================================================
 
@@ -3058,6 +3248,16 @@ fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
     header.op = slot_index as u64;
     header.size = HeaderPrepare::SIZE as u32;
     header.set_checksum();
+    header
+}
+
+fn make_recovery_header(op: u64, view: u32, checksum: u128, operation: Operation) -> HeaderPrepare {
+    let mut header = HeaderPrepare::new();
+    header.command = Command::Prepare;
+    header.operation = operation;
+    header.op = op;
+    header.view = view;
+    header.checksum = checksum;
     header
 }
 
