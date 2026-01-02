@@ -337,8 +337,68 @@ pub type ReadPrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: u
     fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>, ReadOptions);
 
 /// Callback invoked when `write_prepare` completes.
+///
+/// The second parameter is `Some(message)` when the prepare was successfully written to disk
+/// and the in-memory header still matches. `None` indicates:
+/// - The slot was already durable (no I/O needed)
+/// - No write IOP was available
+/// - The in-memory header changed during the write
+///
+/// The callback is always invoked exactly once per `write_prepare` call.
 pub type WritePrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
     fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>);
+
+/// Callback invoked when journal recovery completes.
+///
+/// Called once after all header chunks have been read and validated, and the
+/// journal transitions from `Status::Recovering` to `Status::Recovered`.
+/// At this point the journal is ready for normal read/write operations.
+pub type RecoverCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
+    fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>);
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Phases of the recovery pipeline.
+enum RecoveryStage {
+    Headers,
+    Prepares,
+    Slots,
+    Fix,
+    Done,
+}
+
+#[allow(dead_code)]
+/// In-progress recovery bookkeeping.
+struct Recovery<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+    callback: RecoverCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    cluster: u128,
+    op_prepare_max: u64,
+    op_checkpoint: u64,
+    solo: bool,
+
+    stage: RecoveryStage,
+    prepare_next_slot: usize,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Identifies what kind of recovery data a read buffer contains.
+enum RecoveryReadKind {
+    Headers,
+    Prepares,
+}
+
+/// Dedicated read IOP used during recovery.
+///
+/// Kept separate from the `reads` pool to avoid mixing recovery IO and normal `read_prepare` IO.
+#[allow(dead_code)]
+#[repr(C)]
+struct RecoveryRead<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
+    completion: MaybeUninit<S::Read>,
+    journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    kind: RecoveryReadKind,
+    index: usize,
+}
 
 /// A write operation descriptor for the range-locking machinery.
 ///
@@ -413,6 +473,276 @@ enum Writing {
     Exact,
     /// A write is in progress for this slot but different op+checksum.
     Slot,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Recovery action to take for a header/prepare pair.
+enum RecoveryDecision {
+    /// Redundant headers and prepares match.
+    Eql,
+    /// Entry is empty (reserved).
+    Nil,
+    /// Redundant headers must be repaired locally from the prepare.
+    Fix,
+    /// Entry is faulty and must be repaired over VSR.
+    Vsr,
+    /// Truncate prepares beyond `op_prepare_max`.
+    Cut,
+    /// Truncate torn prepares beyond the recovery head.
+    CutTorn,
+    /// Should never happen (solo-only).
+    Unreachable,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Matcher for a single boolean parameter in a recovery-case pattern.
+enum Matcher {
+    Any,
+    IsFalse,
+    IsTrue,
+    AssertFalse,
+    AssertTrue,
+}
+
+/// One row in the recovery decision table.
+///
+/// `pattern` matches 11 boolean parameters derived from a header/prepare pair.
+/// The `decision_*` fields capture the action to take depending on solo/multi mode.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct RecoveryCase {
+    label: &'static str,
+    decision_multiple: RecoveryDecision,
+    decision_single: RecoveryDecision,
+    pattern: [Matcher; 11],
+}
+
+#[allow(dead_code)]
+impl RecoveryCase {
+    #[inline]
+    const fn decision(&self, solo: bool) -> RecoveryDecision {
+        if solo {
+            self.decision_single
+        } else {
+            self.decision_multiple
+        }
+    }
+
+    #[inline]
+    fn check(&self, parameters: [bool; 11]) -> Result<bool, ()> {
+        for (m, p) in self.pattern.iter().copied().zip(parameters.iter().copied()) {
+            match m {
+                Matcher::Any => {}
+                Matcher::IsFalse => {
+                    if p {
+                        return Ok(false);
+                    }
+                }
+                Matcher::IsTrue => {
+                    if !p {
+                        return Ok(false);
+                    }
+                }
+                Matcher::AssertFalse => {
+                    if p {
+                        return Err(());
+                    }
+                }
+                Matcher::AssertTrue => {
+                    if !p {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+const __: Matcher = Matcher::Any;
+const _0: Matcher = Matcher::IsFalse;
+const _1: Matcher = Matcher::IsTrue;
+#[allow(dead_code)]
+const A0: Matcher = Matcher::AssertFalse;
+#[allow(dead_code)]
+const A1: Matcher = Matcher::AssertTrue;
+
+/// Pseudo-case used when torn prepares are detected during recovery.
+#[allow(dead_code)]
+const CASE_CUT_TORN: RecoveryCase = RecoveryCase {
+    label: "@CUT_TORN",
+    decision_multiple: RecoveryDecision::CutTorn,
+    decision_single: RecoveryDecision::CutTorn,
+    pattern: [__; 11],
+};
+
+/// Ordered recovery decision table (first and only match wins).
+#[allow(dead_code)]
+const RECOVERY_CASES: [RecoveryCase; 16] = [
+    // @A - both invalid.
+    RecoveryCase {
+        label: "@A",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_0, __, _0, __, __, A0, A0, __, __, __, __],
+    },
+    // @B - header ok reserved, prepare invalid.
+    RecoveryCase {
+        label: "@B",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_1, _1, _0, __, __, A0, __, __, __, __, __],
+    },
+    // @C - header ok not reserved, prepare invalid.
+    RecoveryCase {
+        label: "@C",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_1, _0, _0, __, __, A0, __, __, __, __, __],
+    },
+    // @D - prepare ok reerved, header invalid.
+    RecoveryCase {
+        label: "@D",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_0, __, _1, _1, __, __, A0, __, __, __, __],
+    },
+    // @E - prepare ok, not reserved, not maximum.
+    RecoveryCase {
+        label: "@E",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_0, __, _1, _0, _0, _0, A0, __, __, __, __],
+    },
+    // @F - prepare ok, not reserved, maximum.
+    RecoveryCase {
+        label: "@F",
+        decision_multiple: RecoveryDecision::Fix,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_0, __, _1, _0, _1, _0, A0, __, __, __, __],
+    },
+    // @G - header ok reserved, prepare ok not reserved.
+    RecoveryCase {
+        label: "@G",
+        decision_multiple: RecoveryDecision::Fix,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_1, _1, _1, _0, __, _0, __, __, __, __, __],
+    },
+    // @H - prepare beyond op_prepare_max.
+    RecoveryCase {
+        label: "@H",
+        decision_multiple: RecoveryDecision::Cut,
+        decision_single: RecoveryDecision::Unreachable,
+        pattern: [__, __, _1, _0, __, _1, __, __, __, __, __],
+    },
+    // @I - header beyond op_prepare_max.
+    RecoveryCase {
+        label: "@I",
+        decision_multiple: RecoveryDecision::Cut,
+        decision_single: RecoveryDecision::Unreachable,
+        pattern: [_1, _0, _1, _0, __, _0, _1, __, __, A0, __],
+    },
+    // @J - header beyond op_prepare_max, prepare reserved.
+    RecoveryCase {
+        label: "@J",
+        decision_multiple: RecoveryDecision::Cut,
+        decision_single: RecoveryDecision::Unreachable,
+        pattern: [_1, _0, _1, _1, __, __, _1, __, __, A0, __],
+    },
+    // @K - prepare reserved, header not reserved.
+    RecoveryCase {
+        label: "@K",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_1, _0, _1, _1, __, __, _0, __, __, __, __],
+    },
+    // @L both reserved and identical.
+    RecoveryCase {
+        label: "@L",
+        decision_multiple: RecoveryDecision::Nil,
+        decision_single: RecoveryDecision::Nil,
+        pattern: [_1, _1, _1, _1, __, __, __, A1, A1, A0, A1],
+    },
+    // @M - header older than prepare (wrap), repair.
+    RecoveryCase {
+        label: "@M",
+        decision_multiple: RecoveryDecision::Fix,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_1, _0, _1, _0, __, _0, _0, _0, _0, _1, __],
+    },
+    // @N - header newer than prepare, fault.
+    RecoveryCase {
+        label: "@N",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_1, _0, _1, _0, __, _0, _0, _0, _0, _0, __],
+    },
+    // @O - op matches but checksum/view mistmatch.
+    RecoveryCase {
+        label: "@O",
+        decision_multiple: RecoveryDecision::Vsr,
+        decision_single: RecoveryDecision::Vsr,
+        pattern: [_1, _0, _1, _0, __, _0, _0, _0, _1, A0, A0],
+    },
+    // @P - clean match.
+    RecoveryCase {
+        label: "@P",
+        decision_multiple: RecoveryDecision::Fix,
+        decision_single: RecoveryDecision::Fix,
+        pattern: [_1, _0, _1, _0, __, _0, _0, _1, A1, A0, A1],
+    },
+];
+
+/// Selects the recovery case for the given header/prepare pair.
+///
+/// `op_max` and `op_prepare_max` describe the current recovery head and are used
+/// to decide when to truncate or repair entries.
+#[allow(dead_code)]
+#[inline]
+fn recovery_case(
+    header: Option<&HeaderPrepare>,
+    prepare: Option<&HeaderPrepare>,
+    op_max: u64,
+    op_prepare_max: u64,
+    solo: bool,
+) -> &'static RecoveryCase {
+    let is_header = header.is_some();
+    let is_prepare = prepare.is_some();
+    let parameters = [
+        is_header,
+        is_header && header.unwrap().operation == Operation::RESERVED,
+        is_prepare,
+        is_prepare && prepare.unwrap().operation == Operation::RESERVED,
+        is_prepare && prepare.unwrap().op == op_max,
+        is_prepare && prepare.unwrap().op > op_prepare_max,
+        is_header && header.unwrap().op > op_prepare_max,
+        is_header && is_prepare && header.unwrap().checksum == prepare.unwrap().checksum,
+        is_header && is_prepare && header.unwrap().op == prepare.unwrap().op,
+        is_header && is_prepare && header.unwrap().op < prepare.unwrap().op,
+        is_header && is_prepare && header.unwrap().view == prepare.unwrap().view,
+    ];
+
+    let mut result = None;
+    for c in RECOVERY_CASES.iter() {
+        match c.check(parameters) {
+            Ok(true) => {
+                assert!(result.is_none());
+                result = Some(c);
+            }
+            Ok(false) => {}
+            Err(()) => {
+                panic!(
+                    "recovery_case: impossible state: case={} decision={:?} parameters={:?}",
+                    c.label,
+                    c.decision(solo),
+                    parameters
+                );
+            }
+        }
+    }
+    result.unwrap_or_else(|| panic!("recovery_case: no match for parameters={:?}", parameters))
 }
 
 /// WAL journal implementing range-locked sector writes.
