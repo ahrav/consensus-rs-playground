@@ -13,6 +13,7 @@ pub mod members;
 pub mod message;
 pub mod operation;
 pub mod pool;
+pub mod replica;
 pub mod state;
 pub mod storage;
 pub mod superblock;
@@ -34,6 +35,7 @@ pub use header_prepare::HeaderPrepare;
 pub use members::{Members, member_index, valid_members};
 pub use operation::{Operation, StateMachineOperation};
 pub use pool::{MessageHandle, MessagePool};
+pub use replica::Replica;
 pub use state::VsrState;
 pub use view_change::{ViewChangeArray, ViewChangeCommand, ViewChangeSlice};
 

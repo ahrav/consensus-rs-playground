@@ -1,6 +1,7 @@
 use super::*;
 use crate::message_pool::MessagePool;
 use crate::storage::AlignedBuf;
+use crate::vsr::Release;
 use crate::vsr::superblock;
 use core::cell::RefCell;
 use std::collections::HashMap;
@@ -231,6 +232,7 @@ type TestMockStorage = MockStorage<false>;
 type TestWrite = Write<TestMockStorage, 32, 1>;
 type TestRange = Range<TestMockStorage, 32, 1>;
 type TestJournal = Journal<TestMockStorage, 32, 1>;
+type TestReplica = Replica<TestMockStorage, 32, 1>;
 
 /// Dummy callback for tests that don't need callback verification.
 fn dummy_callback(_: *mut TestWrite) {}
@@ -242,35 +244,37 @@ thread_local! {
 }
 
 thread_local! {
-    static READ_PREPARE_CALLBACKS: RefCell<Vec<(Option<*mut MessagePrepare>, ReadOptions)>> =
+    static READ_PREPARE_CALLBACKS: RefCell<Vec<(Option<MessagePrepare>, ReadOptions)>> =
         const { RefCell::new(Vec::new()) };
 }
 
-fn record_prepare_callback(_journal: *mut TestJournal, message: Option<*mut MessagePrepare>) {
+fn record_prepare_callback(_replica: *mut TestReplica, message: Option<*mut MessagePrepare>) {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
 }
 
 fn record_prepare_callback_async(
-    _journal: *mut Journal<MockStorage<true>, 32, 1>,
+    _replica: *mut Replica<MockStorage<true>, 32, 1>,
     message: Option<*mut MessagePrepare>,
 ) {
     PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push(message));
 }
 
 fn record_read_prepare_callback(
-    _journal: *mut TestJournal,
+    _replica: *mut TestReplica,
     message: Option<*mut MessagePrepare>,
     options: ReadOptions,
 ) {
-    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((message, options)));
+    let cloned = message.map(|ptr| unsafe { (*ptr).clone() });
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((cloned, options)));
 }
 
 fn record_read_prepare_callback_async(
-    _journal: *mut Journal<MockStorage<true>, 32, 1>,
+    _replica: *mut Replica<MockStorage<true>, 32, 1>,
     message: Option<*mut MessagePrepare>,
     options: ReadOptions,
 ) {
-    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((message, options)));
+    let cloned = message.map(|ptr| unsafe { (*ptr).clone() });
+    READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().push((cloned, options)));
 }
 
 fn reset_prepare_callbacks() {
@@ -285,7 +289,7 @@ fn reset_read_prepare_callbacks() {
     READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().clear());
 }
 
-fn take_read_prepare_callbacks() -> Vec<(Option<*mut MessagePrepare>, ReadOptions)> {
+fn take_read_prepare_callbacks() -> Vec<(Option<MessagePrepare>, ReadOptions)> {
     READ_PREPARE_CALLBACKS.with(|callbacks| callbacks.borrow_mut().drain(..).collect())
 }
 
@@ -2048,23 +2052,24 @@ fn read_prepare_returns_none_when_header_missing() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
     let pool = MessagePool::new(1);
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
-
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
     let header = make_prepare_header_with_size(1, Operation::REGISTER, constants::SECTOR_SIZE);
+    replica.op = header.op;
+    let journal = &mut replica.journal;
     let slot = Slot::from_op(header.op);
     journal.headers[slot.index()] = make_reserved_header(slot.index());
     let options = ReadOptions::commit(header.op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     assert_eq!(storage.read_count(), 0);
     assert_eq!(journal.reads_commit_count, 0);
     assert_eq!(journal.reads_repair_count, 0);
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
 }
 
 #[test]
@@ -2072,23 +2077,24 @@ fn read_prepare_returns_none_when_prepare_not_inhabited() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
     let pool = MessagePool::new(1);
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
-
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
     let header = make_prepare_header_with_size(2, Operation::REGISTER, constants::SECTOR_SIZE);
+    replica.op = header.op;
+    let journal = &mut replica.journal;
     let slot = Slot::from_op(header.op);
     journal.headers[slot.index()] = header;
     journal.prepare_inhabited[slot.index()] = false;
     journal.prepare_checksums[slot.index()] = header.checksum;
 
     let options = ReadOptions::commit(header.op, header.checksum);
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     assert_eq!(storage.read_count(), 0);
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
 }
 
 #[test]
@@ -2096,32 +2102,26 @@ fn read_prepare_works_with_fresh_message_buffer() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 3u64;
     let cluster = 42u128;
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
     let body = vec![0x11, 0x22, 0x33];
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &body,
-    );
+    let header =
+        install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &body);
 
-    let mut message = Box::new(pool.get::<PrepareCmd>());
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     assert_eq!(storage.read_count(), 1);
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(message_ptr), options)]
-    );
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
     assert_eq!(message.header().size, header.size);
     assert_eq!(message.body_used(), body.as_slice());
 }
@@ -2131,32 +2131,24 @@ fn read_prepare_header_only_fast_path_skips_io() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 3u64;
     let cluster = 7u128;
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &[],
-    );
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
+    let header = install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &[]);
 
-    let mut message = make_read_message(&pool, constants::SECTOR_SIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     assert_eq!(storage.read_count(), 0);
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(message_ptr), options)]
-    );
-
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
     let bytes =
         unsafe { core::slice::from_raw_parts(message.buffer_ptr(), constants::SECTOR_SIZE) };
     assert_eq!(&bytes[..HeaderPrepare::SIZE], header.as_bytes());
@@ -2168,36 +2160,30 @@ fn read_prepare_reads_exact_size_and_validates_padding() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 4u64;
     let cluster = 9u128;
     let body = vec![0x5a];
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &body,
-    );
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
+    let header =
+        install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &body);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     let log = storage.read_log.borrow();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].len, constants::sector_ceil(header.size as usize));
     drop(log);
 
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(message_ptr), options)]
-    );
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
     assert_eq!(message.header().checksum, header.checksum);
     assert_eq!(message.header().size, header.size);
     assert_eq!(message.body_used(), body.as_slice());
@@ -2211,39 +2197,33 @@ fn read_prepare_reads_full_slot_when_header_not_exact() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 5u64;
     let cluster = 3u128;
     let body = vec![0x11, 0x22];
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &body,
-    );
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
+    let header =
+        install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &body);
 
     let slot = Slot::from_op(op);
     journal.headers[slot.index()].checksum = header.checksum.wrapping_add(1);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare_with_op_and_checksum(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare_with_op_and_checksum(record_read_prepare_callback, options);
 
     let log = storage.read_log.borrow();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].len, constants::MESSAGE_SIZE_MAX_USIZE);
     drop(log);
 
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(message_ptr), options)]
-    );
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    assert!(callbacks[0].0.is_some());
 }
 
 #[test]
@@ -2251,12 +2231,14 @@ fn read_prepare_marks_faulty_on_body_corruption() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 6u64;
     let cluster = 1u128;
     let body = vec![0x10, 0x20, 0x30];
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
 
     let (header, mut data) = make_prepare_disk_image(op, Operation::REGISTER, cluster, &body);
     data[HeaderPrepare::SIZE] ^= 0xFF;
@@ -2265,17 +2247,17 @@ fn read_prepare_marks_faulty_on_body_corruption() {
     journal.headers[slot.index()] = header;
     journal.prepare_inhabited[slot.index()] = true;
     journal.prepare_checksums[slot.index()] = header.checksum;
-
     let offset = (constants::MESSAGE_SIZE_MAX as u64) * slot.index() as u64;
     storage.set_read_data(Zone::WalPrepares, offset, data);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
     assert!(journal.faulty.is_set(slot.index()));
     assert!(journal.dirty.is_set(slot.index()));
 }
@@ -2285,12 +2267,14 @@ fn read_prepare_rejects_nonzero_padding() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 7u64;
     let cluster = 1u128;
     let body = vec![0x42];
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
 
     let (header, mut data) = make_prepare_disk_image(op, Operation::REGISTER, cluster, &body);
     let size = header.size as usize;
@@ -2302,17 +2286,17 @@ fn read_prepare_rejects_nonzero_padding() {
     journal.headers[slot.index()] = header;
     journal.prepare_inhabited[slot.index()] = true;
     journal.prepare_checksums[slot.index()] = header.checksum;
-
     let offset = (constants::MESSAGE_SIZE_MAX as u64) * slot.index() as u64;
     storage.set_read_data(Zone::WalPrepares, offset, data);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
     assert!(journal.faulty.is_set(slot.index()));
     assert!(journal.dirty.is_set(slot.index()));
 }
@@ -2322,26 +2306,20 @@ fn read_prepare_detects_prepare_changed_during_read() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::<true>::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 8u64;
     let cluster = 1u128;
     let body = vec![0x1];
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &body,
-    );
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
+    let header =
+        install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &body);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback_async, options);
 
     assert_eq!(journal.reads_commit_count, 1);
     assert_eq!(storage.pending_read_callbacks.borrow().len(), 1);
@@ -2353,7 +2331,10 @@ fn read_prepare_detects_prepare_changed_during_read() {
 
     assert_eq!(journal.reads_commit_count, 0);
     assert!(!journal.faulty.is_set(slot.index()));
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
 }
 
 #[test]
@@ -2361,48 +2342,40 @@ fn read_prepare_reserves_commit_reads_over_repairs() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::<true>::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
     let pool = MessagePool::new(READ_OPS + 4);
-    let mut messages: Vec<Box<MessagePrepare>> = Vec::new();
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = 1000;
+    replica.cluster = 1;
+    let journal = &mut replica.journal;
 
     for i in 0..READS_REPAIR_COUNT_MAX {
         let op = 100 + i as u64;
         let header =
-            install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x7f]);
-
-        let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-        let message_ptr = message.as_mut() as *mut MessagePrepare;
+            install_prepare_for_read(journal, &storage, op, Operation::REGISTER, 1, &[0x7f]);
         let options = ReadOptions::repair(op, header.checksum, 1);
 
-        journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
-        messages.push(message);
+        journal.read_prepare(record_read_prepare_callback_async, options);
     }
 
     assert_eq!(journal.reads_repair_count, READS_REPAIR_COUNT_MAX);
     assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX);
 
     let op = 200u64;
-    let header =
-        install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x1]);
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let header = install_prepare_for_read(journal, &storage, op, Operation::REGISTER, 1, &[0x1]);
     let options = ReadOptions::repair(op, header.checksum, 1);
-    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
-    messages.push(message);
+    journal.read_prepare(record_read_prepare_callback_async, options);
 
     assert_eq!(journal.reads_repair_count, READS_REPAIR_COUNT_MAX);
     assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX);
-    assert_eq!(take_read_prepare_callbacks(), vec![(None, options)]);
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert!(callbacks[0].0.is_none());
+    assert_eq!(callbacks[0].1, options);
 
     let op = 300u64;
-    let header =
-        install_prepare_for_read(&mut journal, &storage, op, Operation::REGISTER, 1, &[0x2]);
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
+    let header = install_prepare_for_read(journal, &storage, op, Operation::REGISTER, 1, &[0x2]);
     let options = ReadOptions::commit(op, header.checksum);
-    journal.read_prepare(record_read_prepare_callback_async, message_ptr, options);
-    messages.push(message);
+    journal.read_prepare(record_read_prepare_callback_async, options);
 
     assert_eq!(journal.reads_commit_count, 1);
     assert_eq!(storage.read_count(), READS_REPAIR_COUNT_MAX + 1);
@@ -2422,38 +2395,32 @@ fn read_prepare_accepts_max_size_prepare() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = make_recovered_journal(&mut storage, 0);
-
-    let pool = MessagePool::new(1);
     let op = 400u64;
     let cluster = 1u128;
     let body = vec![0x5a; constants::MESSAGE_BODY_SIZE_MAX_USIZE];
-    let header = install_prepare_for_read(
-        &mut journal,
-        &storage,
-        op,
-        Operation::REGISTER,
-        cluster,
-        &body,
-    );
+    let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica(&mut storage, 0, pool);
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
+    let header =
+        install_prepare_for_read(journal, &storage, op, Operation::REGISTER, cluster, &body);
 
-    let mut message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let message_ptr = message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     let log = storage.read_log.borrow();
     assert_eq!(log.len(), 1);
     assert_eq!(log[0].len, constants::MESSAGE_SIZE_MAX_USIZE);
     drop(log);
 
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
     assert_eq!(message.body_used().len(), body.len());
     assert_eq!(message.body_used(), body.as_slice());
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(message_ptr), options)]
-    );
 }
 
 // =========================================================================
@@ -2465,10 +2432,9 @@ fn write_prepare_skips_clean_slot() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 5u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
@@ -2499,10 +2465,9 @@ fn write_prepare_returns_none_when_pool_exhausted() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 1u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
@@ -2532,10 +2497,9 @@ fn write_prepare_happy_path_updates_state_and_writes() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 7u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
@@ -2574,10 +2538,9 @@ fn write_prepare_non_sector_aligned_size_zero_pads() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 11u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
 
@@ -2637,10 +2600,9 @@ fn write_prepare_aborts_when_header_changes_during_payload_write() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::<true>::new();
-    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 9u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
@@ -2669,10 +2631,9 @@ fn write_prepare_aborts_on_header_write_mismatch() {
     reset_prepare_callbacks();
 
     let mut storage = MockStorage::<true>::new();
-    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
     let pool = MessagePool::new(1);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    let journal = &mut replica.journal;
     let op = 11u64;
     let slot = (op % SLOT_COUNT as u64) as usize;
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
@@ -2709,12 +2670,13 @@ fn write_then_read_prepare_round_trip() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::new();
-    let mut journal = TestJournal::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
-    let pool = MessagePool::new(2);
     let op = 24u64;
     let cluster = 9u128;
+    let pool = MessagePool::new(2);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
     let body = vec![0x9a, 0xbc, 0xde, 0xf0, 0x11];
 
     let mut header = HeaderPrepare::new();
@@ -2723,6 +2685,12 @@ fn write_then_read_prepare_round_trip() {
     header.op = op;
     header.cluster = cluster;
     header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    header.release = Release(1);
+    header.parent = 1;
+    header.commit = op - 1;
+    header.timestamp = 1;
+    header.client = 1;
+    header.request = 0;
     header.set_checksum_body(&body);
     header.set_checksum();
 
@@ -2742,21 +2710,19 @@ fn write_then_read_prepare_round_trip() {
     assert!(journal.prepare_inhabited[slot.index()]);
     assert_eq!(journal.prepare_checksums[slot.index()], header.checksum);
 
-    let mut read_message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let read_message_ptr = read_message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(record_read_prepare_callback, read_message_ptr, options);
+    journal.read_prepare(record_read_prepare_callback, options);
 
     assert_eq!(storage.read_count(), 1);
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(read_message_ptr), options)]
-    );
-    assert_eq!(read_message.header().op, header.op);
-    assert_eq!(read_message.header().checksum, header.checksum);
-    assert_eq!(read_message.header().size, header.size);
-    assert_eq!(read_message.body_used(), body.as_slice());
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
+    assert_eq!(message.header().op, header.op);
+    assert_eq!(message.header().checksum, header.checksum);
+    assert_eq!(message.header().size, header.size);
+    assert_eq!(message.body_used(), body.as_slice());
 }
 
 #[test]
@@ -2765,13 +2731,14 @@ fn async_write_then_read_prepare_round_trip() {
     reset_read_prepare_callbacks();
 
     let mut storage = MockStorage::<true>::new();
-    let mut journal = Journal::<MockStorage<true>, 32, 1>::new(&mut storage, 0);
-    journal.status = Status::Recovered;
-
-    let pool = MessagePool::new(2);
     let op = 41u64;
     let cluster = 5u128;
     let body = vec![0xa1, 0xb2, 0xc3, 0xd4];
+    let pool = MessagePool::new(2);
+    let mut replica = make_recovered_replica_dirty(&mut storage, 0, pool.clone());
+    replica.op = op;
+    replica.cluster = cluster;
+    let journal = &mut replica.journal;
 
     let mut header = HeaderPrepare::new();
     header.command = Command::Prepare;
@@ -2779,6 +2746,12 @@ fn async_write_then_read_prepare_round_trip() {
     header.op = op;
     header.cluster = cluster;
     header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    header.release = Release(1);
+    header.parent = 1;
+    header.commit = op - 1;
+    header.timestamp = 1;
+    header.client = 1;
+    header.request = 0;
     header.set_checksum_body(&body);
     header.set_checksum();
 
@@ -2803,28 +2776,22 @@ fn async_write_then_read_prepare_round_trip() {
     assert!(journal.prepare_inhabited[slot.index()]);
     assert_eq!(journal.prepare_checksums[slot.index()], header.checksum);
 
-    let mut read_message = make_read_message(&pool, constants::MESSAGE_SIZE_MAX_USIZE);
-    let read_message_ptr = read_message.as_mut() as *mut MessagePrepare;
     let options = ReadOptions::commit(op, header.checksum);
 
-    journal.read_prepare(
-        record_read_prepare_callback_async,
-        read_message_ptr,
-        options,
-    );
+    journal.read_prepare(record_read_prepare_callback_async, options);
 
     assert_eq!(storage.pending_read_callbacks.borrow().len(), 1);
     storage.drain_read_callbacks();
 
     assert_eq!(storage.read_count(), 1);
-    assert_eq!(
-        take_read_prepare_callbacks(),
-        vec![(Some(read_message_ptr), options)]
-    );
-    assert_eq!(read_message.header().op, header.op);
-    assert_eq!(read_message.header().checksum, header.checksum);
-    assert_eq!(read_message.header().size, header.size);
-    assert_eq!(read_message.body_used(), body.as_slice());
+    let callbacks = take_read_prepare_callbacks();
+    assert_eq!(callbacks.len(), 1);
+    assert_eq!(callbacks[0].1, options);
+    let message = callbacks[0].0.as_ref().expect("message missing");
+    assert_eq!(message.header().op, header.op);
+    assert_eq!(message.header().checksum, header.checksum);
+    assert_eq!(message.header().size, header.size);
+    assert_eq!(message.body_used(), body.as_slice());
 }
 
 // =========================================================================
@@ -3271,6 +3238,23 @@ fn make_prepare_header_with_size(op: u64, operation: Operation, size: usize) -> 
     header.operation = operation;
     header.op = op;
     header.size = size as u32;
+    if operation != Operation::ROOT && operation != Operation::RESERVED {
+        header.release = Release(1);
+        header.parent = 1;
+        header.commit = op.saturating_sub(1);
+        header.timestamp = 1;
+
+        if operation == Operation::PULSE || operation == Operation::UPGRADE {
+            header.client = 0;
+            header.request = 0;
+        } else if operation == Operation::REGISTER {
+            header.client = 1;
+            header.request = 0;
+        } else {
+            header.client = 1;
+            header.request = 1;
+        }
+    }
 
     let body_len = size - HeaderPrepare::SIZE;
     let body = vec![0u8; body_len];
@@ -3286,21 +3270,27 @@ fn make_prepare_message(pool: &MessagePool, header: HeaderPrepare) -> Box<Messag
     message
 }
 
-fn make_recovered_journal<const ASYNC: bool>(
+fn make_recovered_replica<const ASYNC: bool>(
     storage: &mut MockStorage<ASYNC>,
     replica: u8,
-) -> Journal<MockStorage<ASYNC>, 32, 1> {
-    let mut journal = Journal::<MockStorage<ASYNC>, 32, 1>::new(storage, replica);
-    journal.status = Status::Recovered;
-    journal.dirty = BitSet::empty();
-    journal.faulty = BitSet::empty();
-    journal
+    message_pool: MessagePool,
+) -> Replica<MockStorage<ASYNC>, 32, 1> {
+    let mut replica = Replica::new(storage, replica, 0, message_pool);
+    replica.journal.status = Status::Recovered;
+    replica.journal.dirty = BitSet::empty();
+    replica.journal.faulty = BitSet::empty();
+    replica
 }
 
-fn make_read_message(pool: &MessagePool, used_len: usize) -> Box<MessagePrepare> {
-    let mut message = Box::new(pool.get::<PrepareCmd>());
-    message.set_used_len(used_len);
-    message
+fn make_recovered_replica_dirty<const ASYNC: bool>(
+    storage: &mut MockStorage<ASYNC>,
+    replica: u8,
+    message_pool: MessagePool,
+) -> Replica<MockStorage<ASYNC>, 32, 1> {
+    let mut replica = make_recovered_replica(storage, replica, message_pool);
+    replica.journal.dirty = BitSet::full();
+    replica.journal.faulty = BitSet::full();
+    replica
 }
 
 fn make_prepare_disk_image(
@@ -3317,6 +3307,23 @@ fn make_prepare_disk_image(
     header.op = op;
     header.cluster = cluster;
     header.size = (HeaderPrepare::SIZE + body.len()) as u32;
+    if operation != Operation::ROOT && operation != Operation::RESERVED {
+        header.release = Release(1);
+        header.parent = 1;
+        header.commit = op.saturating_sub(1);
+        header.timestamp = 1;
+
+        if operation == Operation::PULSE || operation == Operation::UPGRADE {
+            header.client = 0;
+            header.request = 0;
+        } else if operation == Operation::REGISTER {
+            header.client = 1;
+            header.request = 0;
+        } else {
+            header.client = 1;
+            header.request = 1;
+        }
+    }
     header.set_checksum_body(body);
     header.set_checksum();
 
