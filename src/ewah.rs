@@ -386,6 +386,7 @@ impl<'a, W: EwahWord> Decoder<'a, W> {
         let mut target_index = self.target_index;
 
         if self.source_literal_words > 0 {
+            // Carry over literal words from a marker that crossed a chunk boundary.
             let literal_word_count_chunk = min(self.source_literal_words, source_words.len());
             self.target_words[target_index..target_index + literal_word_count_chunk]
                 .copy_from_slice(
@@ -412,6 +413,7 @@ impl<'a, W: EwahWord> Decoder<'a, W> {
                 W::zero()
             };
 
+            // Expand the uniform run directly into the target buffer.
             self.target_words[target_index..target_index + uniform_word_count].fill(uniform_values);
             target_index += uniform_word_count;
 
@@ -427,6 +429,7 @@ impl<'a, W: EwahWord> Decoder<'a, W> {
             source_index += literal_word_count_chunk;
             target_index += literal_word_count_chunk;
 
+            // Store any remaining literal words so the next chunk resumes correctly.
             self.source_literal_words = literal_word_count - literal_word_count_chunk;
         }
 
@@ -507,12 +510,14 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
         ));
 
         let target_words = as_aligned_words_mut::<W>(target_chunk);
+        // Zero-fill so any unused tail is deterministic when a chunk is partially written.
         target_words.fill(W::zero());
 
         let mut target_index: usize = 0;
         let mut source_index: usize = self.source_index;
 
         if self.literal_word_count > 0 {
+            // Finish emitting literal words that didn't fit in the previous chunk.
             let literal_word_count_chunk = min(self.literal_word_count, target_words.len());
 
             target_words[target_index..target_index + literal_word_count_chunk].copy_from_slice(
@@ -538,6 +543,7 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
                 let slice = &source_words[source_index..source_index + uniform_max_u64 as usize];
                 let uniform_value = word;
 
+                // Count a run of identical uniform words (all-zeros or all-ones).
                 match slice.iter().position(|&w| w != uniform_value) {
                     Some(pos) => pos,
                     None => slice.len(),
@@ -546,6 +552,7 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
 
             source_index += uniform_word_count;
 
+            // Uniform words are all-zeros or all-ones; the LSB encodes the bit value.
             let uniform_bit: u8 = if uniform_word_count == 0 {
                 0
             } else {
@@ -558,6 +565,7 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
 
                 let slice = &source_words[source_index..source_index + literal_max_u64 as usize];
 
+                // Stop literals when we hit the next uniform word or the marker limit.
                 let mut count = literal_max_u64 as usize;
                 for (i, &w) in slice.iter().enumerate() {
                     if !Ewah::<W>::is_literal(w) {
@@ -584,6 +592,7 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
             target_index += literal_word_count_chunk;
             source_index += literal_word_count_chunk;
 
+            // Carry any remaining literals to the next chunk.
             self.literal_word_count = literal_word_count - literal_word_count_chunk;
 
             if uniform_bit == 0 && literal_word_count == 0 {
