@@ -388,18 +388,6 @@ enum RecoveryReadKind {
     Prepares,
 }
 
-/// Dedicated read IOP used during recovery.
-///
-/// Kept separate from the `reads` pool to avoid mixing recovery IO and normal `read_prepare` IO.
-#[allow(dead_code)]
-#[repr(C)]
-struct RecoveryRead<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
-    completion: MaybeUninit<S::Read>,
-    journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
-    kind: RecoveryReadKind,
-    index: usize,
-}
-
 /// A write operation descriptor for the range-locking machinery.
 ///
 /// `Write` represents a single in-flight write operation. It is allocated from
