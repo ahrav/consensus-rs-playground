@@ -60,6 +60,8 @@ use crate::{
     },
 };
 
+use super::replica::Replica;
+
 // ============================================================================
 // Read IOP accounting
 // ============================================================================
@@ -319,8 +321,8 @@ pub struct Read<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize
     pub completion: MaybeUninit<S::Read>,
     /// Back-pointer to the owning journal.
     pub journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
-    /// Target message buffer to fill; must remain valid until callback.
-    pub message: *mut MessagePrepare,
+    /// Owned message buffer used for the read; moved out on completion.
+    pub message: MaybeUninit<MessagePrepare>,
     /// Read options passed through to the callback.
     pub options: ReadOptions,
     /// User callback invoked when the read completes (or is bypassed).
@@ -333,8 +335,9 @@ pub struct Read<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize
 /// validation. `None` indicates the prepare is unavailable, was rewritten while reading,
 /// or was detected as corrupt/misdirected (and the slot may have been marked faulty).
 /// The callback may run without issuing I/O (e.g. header-only fast path or no-entry cases).
+/// If the caller needs to retain the message beyond the callback, it must clone it.
 pub type ReadPrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
-    fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>, ReadOptions);
+    fn(*mut Replica<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>, ReadOptions);
 
 /// Callback invoked when `write_prepare` completes.
 ///
@@ -346,7 +349,7 @@ pub type ReadPrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: u
 ///
 /// The callback is always invoked exactly once per `write_prepare` call.
 pub type WritePrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
-    fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>);
+    fn(*mut Replica<S, WRITE_OPS, WRITE_OPS_WORDS>, Option<*mut MessagePrepare>);
 
 /// Callback invoked when journal recovery completes.
 ///
@@ -813,6 +816,18 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     Journal<S, WRITE_OPS, WRITE_OPS_WORDS>
 {
+    #[inline]
+    fn replica_from_journal(
+        journal: *mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    ) -> *mut Replica<S, WRITE_OPS, WRITE_OPS_WORDS> {
+        container_of!(journal, Replica<S, WRITE_OPS, WRITE_OPS_WORDS>, journal)
+    }
+
+    #[inline]
+    fn replica_ptr(&mut self) -> *mut Replica<S, WRITE_OPS, WRITE_OPS_WORDS> {
+        Self::replica_from_journal(self as *mut _)
+    }
+
     /// Creates a new Journal with the given storage backend.
     ///
     /// # Safety Requirements (for callers)
@@ -1267,26 +1282,33 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     fn read_prepare(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
-        message: *mut MessagePrepare,
         options: ReadOptions,
     ) {
         assert!(matches!(self.status, Status::Recovered));
-        assert!(!message.is_null());
         assert!(options.checksum != 0);
+
+        let replica_ptr = self.replica_ptr();
+        let replica = unsafe { &mut *replica_ptr };
+
+        if options.op > replica.op {
+            self.read_prepare_log(options.op, Some(options.checksum), "beyond replica.op");
+            callback(replica_ptr, None, options);
+            return;
+        }
 
         let Some(slot) = self.slot_with_op_and_checksum(options.op, options.checksum) else {
             self.read_prepare_log(options.op, Some(options.checksum), "no entry exactly");
-            callback(self as *mut _, None, options);
+            callback(replica_ptr, None, options);
             return;
         };
 
         if self.prepare_inhabited[slot.index()]
             && self.prepare_checksums[slot.index()] == options.checksum
         {
-            self.read_prepare_with_op_and_checksum(callback, message, options);
+            self.read_prepare_with_op_and_checksum(callback, options);
         } else {
             self.read_prepare_log(options.op, Some(options.checksum), "no matching prepare");
-            callback(self as *mut _, None, options);
+            callback(replica_ptr, None, options);
         }
     }
 
@@ -1308,16 +1330,19 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
-        message: *mut MessagePrepare,
         options: ReadOptions,
     ) {
         assert!(matches!(self.status, Status::Recovered));
-        assert!(!message.is_null());
         assert!(options.checksum != 0);
+
+        let replica_ptr = self.replica_ptr();
+        let replica = unsafe { &mut *replica_ptr };
 
         let slot = self.slot_for_op(options.op);
         assert!(self.prepare_inhabited[slot.index()]);
         assert!(self.prepare_checksums[slot.index()] == options.checksum);
+
+        let mut message = replica.message_pool.get::<PrepareCmd>();
 
         // Default to full slot reads; exact headers can tighten this.
         let mut message_size: usize = constants::MESSAGE_SIZE_MAX_USIZE;
@@ -1327,11 +1352,11 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             if exact.size as usize == size_of::<HeaderPrepare>() {
                 // Header-only prepare; no disk required. Populate the message buffer
                 // with the header and zero the remainder of the first sector.
-                unsafe {
-                    let buf_ptr = (*message).buffer_ptr();
-                    let buf_len = constants::MESSAGE_SIZE_MAX_USIZE;
-                    assert!(buf_len >= constants::SECTOR_SIZE);
+                let buf_ptr = message.buffer_ptr();
+                let buf_len = constants::MESSAGE_SIZE_MAX_USIZE;
+                assert!(buf_len >= constants::SECTOR_SIZE);
 
+                unsafe {
                     ptr::copy_nonoverlapping(
                         exact as *const HeaderPrepare as *const u8,
                         buf_ptr,
@@ -1342,7 +1367,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                     sector[size_of::<HeaderPrepare>()..].fill(0);
                 }
 
-                callback(self as *mut _, Some(message), options);
+                callback(replica_ptr, Some(&mut message as *mut _), options);
                 return;
             } else {
                 // As an optimization, read only the exact message size (sector-aligned).
@@ -1356,10 +1381,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         // ---------------------------------------------------------------------
 
         if options.destination_replica.is_none() {
-            // Commit-path reads are allowed as long as an IOP is available.
-            if self.reads.available() == 0 || self.reads_commit_count == READS_COMMIT_COUNT_MAX {
+            if self.reads.available() == 0 {
                 self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
-                callback(self as *mut _, None, options);
+                callback(replica_ptr, None, options);
                 return;
             }
             self.reads_commit_count += 1;
@@ -1367,7 +1391,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             // Repair reads are capped so they cannot starve commit reads.
             if self.reads_repair_count == READS_REPAIR_COUNT_MAX {
                 self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
-                callback(self as *mut _, None, options);
+                callback(replica_ptr, None, options);
+                return;
+            }
+            if self.reads.available() == 0 {
+                self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+                callback(replica_ptr, None, options);
                 return;
             }
             self.reads_repair_count += 1;
@@ -1378,22 +1407,26 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
         let Some(read) = self.reads.acquire() else {
             if options.destination_replica.is_none() {
+                assert!(self.reads_commit_count > 0);
                 self.reads_commit_count -= 1;
             } else {
+                assert!(self.reads_repair_count > 0);
                 self.reads_repair_count -= 1;
             }
-            callback(self as *mut _, None, options);
+            self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+            callback(replica_ptr, None, options);
             return;
         };
 
         unsafe {
             ptr::addr_of_mut!((*read).journal).write(self as *mut _);
-            ptr::addr_of_mut!((*read).message).write(message);
             ptr::addr_of_mut!((*read).options).write(options);
             ptr::addr_of_mut!((*read).callback).write(callback);
+            ptr::addr_of_mut!((*read).message).write(MaybeUninit::new(message));
         }
 
-        let buf_ptr = unsafe { (*message).buffer_ptr() };
+        let message_ptr = unsafe { (*read).message.as_mut_ptr() };
+        let buf_ptr = unsafe { (*message_ptr).buffer_ptr() };
         let buf_len_total = constants::MESSAGE_SIZE_MAX_USIZE;
         assert!(message_size <= buf_len_total);
 
@@ -1426,8 +1459,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(matches!(journal.status, Status::Recovered));
 
         let callback = unsafe { (*read).callback };
-        let message = unsafe { (*read).message };
         let options = unsafe { (*read).options };
+        let mut message = unsafe { ptr::read((*read).message.as_ptr()) };
+        let message_ptr: *mut MessagePrepare = &mut message;
 
         // Release IOP accounting before invoking user callbacks.
         if options.destination_replica.is_none() {
@@ -1439,6 +1473,15 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
         journal.reads.release(read);
 
+        let replica_ptr = Self::replica_from_journal(journal as *mut _);
+        let replica = unsafe { &mut *replica_ptr };
+
+        if options.op > replica.op {
+            journal.read_prepare_log(options.op, Some(options.checksum), "beyond replica.op");
+            callback(replica_ptr, None, options);
+            return;
+        }
+
         // The prepare may have been re-written since the read began.
         let slot = journal.slot_for_op(options.op);
         let checksum_inhabited = journal.prepare_inhabited[slot.index()];
@@ -1449,21 +1492,21 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 Some(options.checksum),
                 "prepare changed during read",
             );
-            callback(journal as *mut _, None, options);
+            callback(replica_ptr, None, options);
             return;
         }
 
         // Validate header identity and message integrity.
-        let header = unsafe { (*message).header() };
-        let expected_cluster = journal.headers[slot.index()].cluster;
+        let header = message.header();
+        let expected_cluster = replica.cluster;
 
         let error_reason: Option<&'static str> = (|| {
             if !header.valid_checksum() {
                 return Some("corrupt header after read");
             }
 
-            if header.command != Command::Prepare {
-                return Some("wrong command");
+            if let Some(reason) = header.invalid() {
+                return Some(reason);
             }
 
             if header.cluster != expected_cluster {
@@ -1483,7 +1526,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 return Some("invalid message size");
             }
 
-            let bytes = unsafe { core::slice::from_raw_parts((*message).buffer_ptr(), size) };
+            let bytes = unsafe { core::slice::from_raw_parts(message.buffer_ptr(), size) };
             let body_used = &bytes[size_of::<HeaderPrepare>()..size];
             if !header.valid_checksum_body(body_used) {
                 return Some("corrupt body after read");
@@ -1497,7 +1540,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             // Padding must be zero to detect torn or partial writes.
             let padding = unsafe {
-                core::slice::from_raw_parts((*message).buffer_ptr().add(size), padded - size)
+                core::slice::from_raw_parts(message.buffer_ptr().add(size), padded - size)
             };
             if !zero::is_all_zeros(padding) {
                 return Some("corrupt sector padding");
@@ -1514,9 +1557,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             }
 
             journal.read_prepare_log(options.op, Some(options.checksum), reason);
-            callback(journal as *mut _, None, options);
+            callback(replica_ptr, None, options);
         } else {
-            callback(journal as *mut _, Some(message), options);
+            callback(replica_ptr, Some(message_ptr), options);
         }
     }
 
@@ -1551,6 +1594,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(matches!(self.status, Status::Recovered));
         assert!(!message.is_null());
 
+        let replica_ptr = self.replica_ptr();
+
         let header = unsafe { (*message).header() };
         assert!(header.command == Command::Prepare);
         assert!(header.operation != Operation::RESERVED);
@@ -1572,7 +1617,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             assert!(self.headers_redundant[slot.index()].checksum == header.checksum);
 
             // Already durable; no I/O required.
-            callback(self as *mut _, None);
+            callback(replica_ptr, None);
             return;
         }
 
@@ -1580,7 +1625,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
         let Some(write) = self.writes.acquire() else {
             // No IOP available; caller must retry later.
-            callback(self as *mut _, None);
+            callback(replica_ptr, None);
             return;
         };
 
@@ -1798,7 +1843,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             }
         }
 
-        callback(journal, wrote);
+        let replica_ptr = Self::replica_from_journal(journal);
+        callback(replica_ptr, wrote);
     }
 
     /// Initiates a sector write operation with range locking.
