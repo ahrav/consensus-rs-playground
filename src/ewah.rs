@@ -2,8 +2,7 @@
 //!
 //! EWAH is a word-aligned compression scheme for sparse bitmaps that achieves
 //! good compression ratios while enabling efficient logical operations directly
-//! on compressed data. This implementation is optimized for use in the VSR
-//! protocol's journal free-set tracking.
+//! on compressed data.
 //!
 //! # Wire Format
 //!
@@ -43,12 +42,7 @@
 //!
 //! - Lemire et al., "Sorting improves word-aligned bitmap indexes"
 
-use core::{
-    cmp::min,
-    convert::TryFrom,
-    marker::PhantomData,
-    mem::size_of,
-};
+use core::{cmp::min, convert::TryFrom, marker::PhantomData, mem::size_of};
 
 // EWAH uses native word layout in memory. Little-endian is required because:
 // 1. The marker word bit layout assumes LSB-first ordering
@@ -633,9 +627,7 @@ mod tests {
     fn words_as_bytes_mut<W: EwahWord>(words: &mut [W]) -> &mut [u8] {
         let byte_len = core::mem::size_of_val(words);
         // Safety: Vec<W> (or slice from it) is aligned and sized for W.
-        unsafe {
-            slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, byte_len)
-        }
+        unsafe { slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, byte_len) }
     }
 
     fn encode_all<W: EwahWord>(source: &[W], chunk_words: usize) -> Vec<W> {
