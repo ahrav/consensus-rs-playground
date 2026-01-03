@@ -47,8 +47,12 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         &self.words
     }
 
+    /// Returns a mutable view into the backing words.
+    ///
+    /// # Safety
+    /// Callers must ensure all padding bits above `N` remain zero.
     #[inline]
-    pub fn words_mut(&mut self) -> &mut [u64; WORDS] {
+    pub unsafe fn words_mut(&mut self) -> &mut [u64; WORDS] {
         &mut self.words
     }
 
@@ -631,9 +635,8 @@ mod tests {
         let mut b: BitSet<10, { words_for_bits(10) }> = BitSet::empty();
         b.set(3);
 
-        // Inject a padding bit beyond N via direct word access.
-        let words = b.words_mut();
-        words[0] |= 1u64 << 63;
+        // Inject a padding bit beyond N via direct field access.
+        b.words[0] |= 1u64 << 63;
 
         assert_eq!(b.highest_set_bit(), Some(3));
     }
