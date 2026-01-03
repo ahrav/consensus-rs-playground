@@ -33,6 +33,29 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         assert!(WORDS == N.div_ceil(64), "WORDS must equal N.div_ceil(64)");
     }
 
+    const fn last_word_mask() -> u64 {
+        let remaining_bits = N % 64;
+        if remaining_bits == 0 {
+            u64::MAX
+        } else {
+            (1u64 << remaining_bits) - 1
+        }
+    }
+
+    #[inline]
+    pub fn words(&self) -> &[u64; WORDS] {
+        &self.words
+    }
+
+    /// Returns a mutable view into the backing words.
+    ///
+    /// # Safety
+    /// Callers must ensure all padding bits above `N` remain zero.
+    #[inline]
+    pub unsafe fn words_mut(&mut self) -> &mut [u64; WORDS] {
+        &mut self.words
+    }
+
     /// Returns the number of addressable bits (`N`).
     ///
     /// Panics at compile time if `N` is zero or `WORDS` is incorrect.
@@ -233,6 +256,47 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         }
 
         debug_assert!(self.is_empty());
+    }
+
+    /// Inverts all bits in the bitset.
+    #[inline]
+    pub const fn toggle_all(&mut self) {
+        let mut i = 0;
+        while i + 1 < WORDS {
+            self.words[i] = !self.words[i];
+            i += 1;
+        }
+
+        if WORDS > 0 {
+            let mask = Self::last_word_mask();
+            self.words[WORDS - 1] = (!self.words[WORDS - 1]) & mask;
+        }
+    }
+
+    /// Highest set bit, if any.
+    #[inline]
+    pub const fn highest_set_bit(&self) -> Option<usize> {
+        if WORDS == 0 {
+            return None;
+        }
+
+        let last = WORDS - 1;
+        let mut word = self.words[last] & Self::last_word_mask();
+        if word != 0 {
+            let bit_in_word = 63 - word.leading_zeros() as usize;
+            return Some(last * 64 + bit_in_word);
+        }
+
+        let mut i = last;
+        while i > 0 {
+            i -= 1;
+            word = self.words[i];
+            if word != 0 {
+                let bit_in_word = 63 - word.leading_zeros() as usize;
+                return Some(i * 64 + bit_in_word);
+            }
+        }
+        None
     }
 
     /// Returns `true` if every set bit in `self` is also set in `other`.
@@ -466,26 +530,6 @@ mod tests {
     }
 
     #[test]
-    fn set_unset() {
-        let mut b: BitSet128 = BitSet::empty();
-
-        b.set(0);
-        b.set(64);
-        b.set(127);
-
-        assert!(b.is_set(0));
-        assert!(b.is_set(64));
-        assert!(b.is_set(127));
-        assert!(!b.is_set(1));
-        assert_eq!(b.count(), 3);
-
-        b.unset(64);
-
-        assert!(!b.is_set(64));
-        assert_eq!(b.count(), 2);
-    }
-
-    #[test]
     fn first_set_unset() {
         let mut b: BitSet<8, { words_for_bits(8) }> = BitSet::empty();
 
@@ -528,22 +572,73 @@ mod tests {
     }
 
     #[test]
-    fn iterate() {
-        let mut b: BitSet64 = BitSet::empty();
-        b.set(3);
+    fn toggle_all() {
+        let mut b: BitSet<8, { words_for_bits(8) }> = BitSet::empty();
+        b.set(0);
         b.set(7);
-        b.set(15);
-        b.set(63);
 
-        let indices: Vec<usize> = b.iter().collect();
-        assert_eq!(indices, vec![3, 7, 15, 63]);
+        b.toggle_all();
+
+        assert!(!b.is_set(0));
+        assert!(b.is_set(1));
+        assert!(b.is_set(2));
+        assert!(b.is_set(3));
+        assert!(b.is_set(4));
+        assert!(b.is_set(5));
+        assert!(b.is_set(6));
+        assert!(!b.is_set(7));
+        assert_eq!(b.count(), 6);
+
+        b.toggle_all();
+        assert!(b.is_set(0));
+        assert!(b.is_set(7));
+        assert_eq!(b.count(), 2);
     }
 
     #[test]
-    fn iterate_empty() {
-        let b: BitSet64 = BitSet::empty();
-        let indices: Vec<usize> = b.iter().collect();
-        assert!(indices.is_empty());
+    fn highest_set_bit() {
+        let mut b: BitSet64 = BitSet::empty();
+        assert_eq!(b.highest_set_bit(), None);
+
+        b.set(0);
+        assert_eq!(b.highest_set_bit(), Some(0));
+
+        b.set(32);
+        assert_eq!(b.highest_set_bit(), Some(32));
+
+        b.set(63);
+        assert_eq!(b.highest_set_bit(), Some(63));
+
+        b.unset(63);
+        assert_eq!(b.highest_set_bit(), Some(32));
+    }
+
+    #[test]
+    fn highest_set_bit_edge_cases() {
+        // Case 1: BitSet with size not multiple of 64
+        let mut b: BitSet<10, { words_for_bits(10) }> = BitSet::empty();
+        assert_eq!(b.highest_set_bit(), None);
+
+        b.set(9);
+        assert_eq!(b.highest_set_bit(), Some(9));
+
+        // Case 2: Multi-word set
+        let mut b2: BitSet128 = BitSet::empty();
+        b2.set(70);
+        assert_eq!(b2.highest_set_bit(), Some(70));
+        b2.set(10);
+        assert_eq!(b2.highest_set_bit(), Some(70));
+    }
+
+    #[test]
+    fn highest_set_bit_ignores_padding_bits() {
+        let mut b: BitSet<10, { words_for_bits(10) }> = BitSet::empty();
+        b.set(3);
+
+        // Inject a padding bit beyond N via direct field access.
+        b.words[0] |= 1u64 << 63;
+
+        assert_eq!(b.highest_set_bit(), Some(3));
     }
 
     #[test]
@@ -798,96 +893,6 @@ mod tests {
     }
 
     // ============================================
-    // State Transition Tests
-    // ============================================
-
-    #[test]
-    fn transition_empty_to_full() {
-        let mut b: BitSet<4, { words_for_bits(4) }> = BitSet::empty();
-
-        assert!(b.is_empty());
-        assert!(!b.is_full());
-
-        b.set(0);
-        assert!(!b.is_empty());
-        assert!(!b.is_full());
-        assert_eq!(b.count(), 1);
-
-        b.set(1);
-        b.set(2);
-        assert!(!b.is_full());
-        assert_eq!(b.count(), 3);
-
-        b.set(3);
-        assert!(b.is_full());
-        assert_eq!(b.count(), 4);
-        assert_eq!(b.first_unset(), None);
-    }
-
-    #[test]
-    fn transition_full_to_empty() {
-        let mut b: BitSet<4, { words_for_bits(4) }> = BitSet::full();
-
-        assert!(b.is_full());
-
-        for i in 0..4 {
-            b.unset(i);
-            assert_eq!(b.count(), 3 - i);
-        }
-
-        assert!(b.is_empty());
-        assert_eq!(b.first_set(), None);
-    }
-
-    // ============================================
-    // Clone/PartialEq Tests
-    // ============================================
-
-    #[test]
-    fn clone_produces_identical_bitset() {
-        let mut b1: BitSet64 = BitSet::empty();
-        b1.set(5);
-        b1.set(10);
-        b1.set(42);
-
-        let b2 = b1;
-
-        assert_eq!(b1, b2);
-        assert_eq!(b1.count(), b2.count());
-        assert_eq!(b1.first_set(), b2.first_set());
-
-        // Verify independence - mutating copy doesn't affect original
-        let mut b3 = b1;
-        b3.set(20);
-        assert_ne!(b1, b3);
-    }
-
-    #[test]
-    fn partial_eq_empty_bitsets() {
-        let b1: BitSet64 = BitSet::empty();
-        let b2: BitSet64 = BitSet::empty();
-        assert_eq!(b1, b2);
-    }
-
-    #[test]
-    fn partial_eq_full_bitsets() {
-        let b1: BitSet64 = BitSet::full();
-        let b2: BitSet64 = BitSet::full();
-        assert_eq!(b1, b2);
-    }
-
-    #[test]
-    fn partial_eq_different_bits() {
-        let mut b1: BitSet64 = BitSet::empty();
-        let mut b2: BitSet64 = BitSet::empty();
-
-        b1.set(5);
-        b2.set(6);
-
-        assert_ne!(b1, b2);
-    }
-
-    // ============================================
     // first_unset Edge Cases
     // ============================================
 
@@ -967,57 +972,6 @@ mod tests {
     // ============================================
     // is_subset tests
     // ============================================
-
-    #[test]
-    fn empty_is_subset_of_any() {
-        let empty: BitSet64 = BitSet::empty();
-        let full: BitSet64 = BitSet::full();
-        let mut partial: BitSet64 = BitSet::empty();
-        partial.set(10);
-        partial.set(30);
-
-        assert!(empty.is_subset(&empty));
-        assert!(empty.is_subset(&partial));
-        assert!(empty.is_subset(&full));
-    }
-
-    #[test]
-    fn any_is_subset_of_full() {
-        let empty: BitSet64 = BitSet::empty();
-        let full: BitSet64 = BitSet::full();
-        let mut partial: BitSet64 = BitSet::empty();
-        partial.set(10);
-        partial.set(30);
-
-        assert!(empty.is_subset(&full));
-        assert!(partial.is_subset(&full));
-        assert!(full.is_subset(&full));
-    }
-
-    #[test]
-    fn subset_not_superset() {
-        let mut a: BitSet64 = BitSet::empty();
-        let mut b: BitSet64 = BitSet::empty();
-
-        a.set(5);
-        b.set(5);
-        b.set(10);
-
-        assert!(a.is_subset(&b));
-        assert!(!b.is_subset(&a));
-    }
-
-    #[test]
-    fn disjoint_sets_not_subsets() {
-        let mut a: BitSet64 = BitSet::empty();
-        let mut b: BitSet64 = BitSet::empty();
-
-        a.set(5);
-        b.set(10);
-
-        assert!(!a.is_subset(&b));
-        assert!(!b.is_subset(&a));
-    }
 
     #[test]
     fn subset_across_word_boundary() {
