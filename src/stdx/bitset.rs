@@ -33,6 +33,15 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
         assert!(WORDS == N.div_ceil(64), "WORDS must equal N.div_ceil(64)");
     }
 
+    const fn last_word_mask() -> u64 {
+        let remaining_bits = N % 64;
+        if remaining_bits == 0 {
+            u64::MAX
+        } else {
+            (1u64 << remaining_bits) - 1
+        }
+    }
+
     #[inline]
     pub fn words(&self) -> &[u64; WORDS] {
         &self.words
@@ -249,51 +258,38 @@ impl<const N: usize, const WORDS: usize> BitSet<N, WORDS> {
     #[inline]
     pub const fn toggle_all(&mut self) {
         let mut i = 0;
-        while i < WORDS {
+        while i + 1 < WORDS {
             self.words[i] = !self.words[i];
             i += 1;
         }
 
-        // Mask out padding bits beyond capacity in the last word.
         if WORDS > 0 {
-            let remaining_bits = N % 64;
-            if remaining_bits != 0 {
-                let mask = (1u64 << remaining_bits) - 1;
-                self.words[WORDS - 1] &= mask;
-            }
+            let mask = Self::last_word_mask();
+            self.words[WORDS - 1] = (!self.words[WORDS - 1]) & mask;
         }
     }
 
     /// Highest set bit, if any.
     #[inline]
     pub const fn highest_set_bit(&self) -> Option<usize> {
-        if N == 0 {
+        if WORDS == 0 {
             return None;
         }
 
-        let mut i = WORDS;
+        let last = WORDS - 1;
+        let mut word = self.words[last] & Self::last_word_mask();
+        if word != 0 {
+            let bit_in_word = 63 - word.leading_zeros() as usize;
+            return Some(last * 64 + bit_in_word);
+        }
+
+        let mut i = last;
         while i > 0 {
             i -= 1;
-            let word = self.words[i];
-
-            // If this is the last word and we have partial bits, we shouldn't have
-            // any garbage bits set because we maintain that invariant on write.
-            // But if we want to be extra defensive (or if we trust invariants):
-            // The invariants validation is done on write/toggle.
-
+            word = self.words[i];
             if word != 0 {
-                let lz = word.leading_zeros() as usize;
-                let bit_in_word = 63 - lz;
-                let idx = i * 64 + bit_in_word;
-                if idx < N {
-                    return Some(idx);
-                } else {
-                    // This implies garbage bits were set beyond N.
-                    // This should not happen if invariants are maintained.
-                    // In a const fn we can't easily panic with a format string,
-                    // but we can return None or act as if they aren't set.
-                    // For now, let's assume valid state (masked last word).
-                }
+                let bit_in_word = 63 - word.leading_zeros() as usize;
+                return Some(i * 64 + bit_in_word);
             }
         }
         None
@@ -628,6 +624,18 @@ mod tests {
         assert_eq!(b2.highest_set_bit(), Some(70));
         b2.set(10);
         assert_eq!(b2.highest_set_bit(), Some(70));
+    }
+
+    #[test]
+    fn highest_set_bit_ignores_padding_bits() {
+        let mut b: BitSet<10, { words_for_bits(10) }> = BitSet::empty();
+        b.set(3);
+
+        // Inject a padding bit beyond N via direct word access.
+        let words = b.words_mut();
+        words[0] |= 1u64 << 63;
+
+        assert_eq!(b.highest_set_bit(), Some(3));
     }
 
     #[test]
