@@ -1286,7 +1286,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ) {
         assert!(matches!(self.status, Status::Recovered));
         assert!(options.checksum != 0);
-        assert!(self.reads.available() > 0);
 
         let replica_ptr = self.replica_ptr();
         let replica = unsafe { &mut *replica_ptr };
@@ -1343,10 +1342,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(self.prepare_inhabited[slot.index()]);
         assert!(self.prepare_checksums[slot.index()] == options.checksum);
 
-        if options.destination_replica.is_none() {
-            assert!(self.reads.available() > 0);
-        }
-
         let mut message = replica.message_pool.get::<PrepareCmd>();
 
         // Default to full slot reads; exact headers can tighten this.
@@ -1386,10 +1381,20 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         // ---------------------------------------------------------------------
 
         if options.destination_replica.is_none() {
+            if self.reads.available() == 0 {
+                self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+                callback(replica_ptr, None, options);
+                return;
+            }
             self.reads_commit_count += 1;
         } else {
             // Repair reads are capped so they cannot starve commit reads.
             if self.reads_repair_count == READS_REPAIR_COUNT_MAX {
+                self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+                callback(replica_ptr, None, options);
+                return;
+            }
+            if self.reads.available() == 0 {
                 self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
                 callback(replica_ptr, None, options);
                 return;
@@ -1400,7 +1405,18 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(self.reads_commit_count <= READS_COMMIT_COUNT_MAX);
         assert!(self.reads_repair_count <= READS_REPAIR_COUNT_MAX);
 
-        let read = self.reads.acquire().expect("read pool exhausted");
+        let Some(read) = self.reads.acquire() else {
+            if options.destination_replica.is_none() {
+                assert!(self.reads_commit_count > 0);
+                self.reads_commit_count -= 1;
+            } else {
+                assert!(self.reads_repair_count > 0);
+                self.reads_repair_count -= 1;
+            }
+            self.read_prepare_log(options.op, Some(options.checksum), "waiting for IOP");
+            callback(replica_ptr, None, options);
+            return;
+        };
 
         unsafe {
             ptr::addr_of_mut!((*read).journal).write(self as *mut _);
@@ -1489,7 +1505,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 return Some("corrupt header after read");
             }
 
-            assert!(header.invalid().is_none());
+            if let Some(reason) = header.invalid() {
+                return Some(reason);
+            }
 
             if header.cluster != expected_cluster {
                 return Some("wrong cluster");
