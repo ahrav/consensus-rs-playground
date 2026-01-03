@@ -351,7 +351,9 @@ impl<'a, W: EwahWord> Decoder<'a, W> {
     /// # Arguments
     ///
     /// * `source_chunk` - A chunk of EWAH-compressed bytes. Must be
-    ///   word-aligned (length divisible by `size_of::<W>()`).
+    ///   word-aligned: length divisible by `size_of::<W>()` and the
+    ///   pointer aligned to `W`. Not all byte buffers guarantee this;
+    ///   callers must ensure alignment before calling.
     ///
     /// # Returns
     ///
@@ -480,7 +482,9 @@ impl<'a, W: EwahWord> Encoder<'a, W> {
     /// # Arguments
     ///
     /// * `target_chunk` - Mutable byte buffer for encoded output.
-    ///   Must be word-aligned (length divisible by `size_of::<W>()`).
+    ///   Must be word-aligned: length divisible by `size_of::<W>()` and
+    ///   the pointer aligned to `W`. Not all byte buffers guarantee this;
+    ///   callers must ensure alignment before calling.
     ///
     /// # Returns
     ///
