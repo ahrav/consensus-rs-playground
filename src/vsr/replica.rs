@@ -2,13 +2,13 @@
 
 use crate::{constants, message_pool::MessagePool};
 
-use super::{HeaderPrepare, checkpoint_after, prepare_max_for_checkpoint};
 use super::constants::ClusterId;
 use super::journal::Journal;
 use super::state::{CheckpointState, VsrState};
 use super::storage::Storage;
 use super::superblock::SuperBlockHeader;
 use super::view_change::ViewChangeArray;
+use super::{HeaderPrepare, checkpoint_after, prepare_max_for_checkpoint};
 
 /// Minimal replica stub used to align Journal callbacks with Zig.
 ///

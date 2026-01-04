@@ -36,8 +36,8 @@ pub use members::{Members, member_index, valid_members};
 pub use operation::{Operation, StateMachineOperation};
 pub use pool::{MessageHandle, MessagePool};
 pub use replica::Replica;
-pub use state::{checkpoint_after, durable, prepare_max_for_checkpoint, trigger_for_checkpoint};
 pub use state::VsrState;
+pub use state::{checkpoint_after, durable, prepare_max_for_checkpoint, trigger_for_checkpoint};
 pub use view_change::{ViewChangeArray, ViewChangeCommand, ViewChangeSlice};
 
 pub use client_operation::{
