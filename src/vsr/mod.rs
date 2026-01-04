@@ -31,7 +31,7 @@ pub use checksum::{Checksum128, checksum};
 pub use command::{Command, InvalidCommand};
 pub use framing::{DecodeError, MessageBuffer};
 pub use header::{Header, Release};
-pub use header_prepare::HeaderPrepare;
+pub use header_prepare::{HeaderPrepare, HeaderPrepareRaw};
 pub use members::{Members, member_index, valid_members};
 pub use operation::{Operation, StateMachineOperation};
 pub use pool::{MessageHandle, MessagePool};
