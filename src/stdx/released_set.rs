@@ -1,3 +1,15 @@
+//! A fixed-capacity, deterministic hash set optimized for tracking "released" items.
+//!
+//! This data structure combines a linear-probing hash table with a supplementary stack
+//! to support efficient iteration and clearing. It is designed for scenarios where:
+//! 1. The maximum number of elements is known in advance (no resizing).
+//! 2. Memory allocation should be static or upfront (no reallocation during insertion).
+//! 3. Iterating/draining the set needs to be proportional to the number of elements,
+//!    not the capacity of the table.
+//!
+//! The "stack" ensures that `pop()` is O(1) and `clear_retaining_capacity()` is fast,
+//! avoiding the need to scan the entire sparse hash table to find occupied slots.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleasedEntry {
     Empty,
@@ -6,12 +18,24 @@ enum ReleasedEntry {
 
 #[derive(Debug)]
 pub struct ReleasedSet {
+    /// The hash table backing storage. Uses open addressing with linear probing.
+    /// Capacity is always a power of two to allow efficient masking.
     entries: Vec<ReleasedEntry>,
+    /// A dense list of all keys currently in the set.
+    /// This allows O(1) selection of an element to remove (via `pop`) and
+    /// eliminates the need to scan `entries` to find active elements.
     stack: Vec<usize>,
+    /// Bitmask for fast modulo operations (size - 1).
     mask: usize,
 }
 
 impl ReleasedSet {
+    /// Creates a new set capable of holding *at least* `cap` elements without resizing.
+    ///
+    /// The underlying hash table will be sized to `2 * cap` (rounded up to the next power of two)
+    /// to ensure the load factor never exceeds 0.5. This low load factor is critical for
+    /// minimizing collision chain lengths in linear probing, maintaining high performance
+    /// without complex collision resolution strategies.
     pub fn with_capacity(cap: usize) -> Self {
         let slots = released_set_slots(cap);
         Self {
@@ -29,6 +53,11 @@ impl ReleasedSet {
         self.stack.is_empty()
     }
 
+    /// Removes all elements from the set but keeps the allocated memory.
+    ///
+    /// This operation is efficient because we simply clear the `stack` and reset the `entries`.
+    /// While resetting `entries` is linear in the table size, this is acceptable for a
+    /// reused component where allocations are the primary cost to avoid.
     pub fn clear_retaining_capacity(&mut self) {
         self.stack.clear();
         self.entries.fill(ReleasedEntry::Empty);
@@ -37,6 +66,9 @@ impl ReleasedSet {
     pub fn contains(&self, key: usize) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
+        // Linear probing: check slots sequentially until we find the key or an empty slot.
+        // The table guarantees enough capacity that we will eventually find an Empty slot
+        // if the key is missing, preventing an infinite loop.
         for _ in 0..self.entries.len() {
             // bound check
             match self.entries[idx] {
@@ -49,12 +81,21 @@ impl ReleasedSet {
         false
     }
 
+    /// Inserts a key into the set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the set is full (capacity exceeded). This design is intentional for
+    /// deterministic systems where resource limits must be explicitly modeled and respected.
     pub fn insert(&mut self, key: usize) {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
         for _ in 0..self.entries.len() {
             match self.entries[idx] {
                 ReleasedEntry::Empty => {
+                    // Enforce a max load factor of 0.5.
+                    // This keeps probe chains short, which is essential for the performance
+                    // of linear probing.
                     if self.stack.len() >= (self.entries.len() >> 1) {
                         panic!("released set capacity exceeded");
                     }
@@ -67,11 +108,16 @@ impl ReleasedSet {
             }
         }
 
+        // Should be unreachable given the load factor check and capacity calculation.
         panic!("released set probe exhaustion (table unexpectedly full");
     }
 
+    /// Removes and returns an arbitrary element from the set.
+    ///
+    /// Uses the internal `stack` to locate an element in O(1).
     pub fn pop(&mut self) -> Option<usize> {
         let key = self.stack.pop()?;
+        // We must remove from the table as well to keep `contains` consistent.
         let removed = self.remove(key);
         debug_assert!(
             removed,
@@ -80,6 +126,9 @@ impl ReleasedSet {
         Some(key)
     }
 
+    /// Internal removal from the linear-probing table.
+    ///
+    /// Returns `true` if the key was present and removed.
     fn remove(&mut self, key: usize) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
@@ -97,21 +146,35 @@ impl ReleasedSet {
         false
     }
 
+    /// Deletes an entry at `hole` and performs "backward shift deletion".
+    ///
+    /// In linear probing, simply marking a slot as Empty breaks the search chain for
+    /// any elements that collided and were stored in subsequent slots.
+    /// This function moves such elements "back" to fill the `hole`, ensuring that
+    /// all remaining elements are still reachable from their native hash index.
     fn backshift_delete(&mut self, mut hole: usize) {
         let mut i = (hole + 1) & self.mask;
 
         loop {
             match self.entries[i] {
                 ReleasedEntry::Empty => {
+                    // End of the chain. We can safely clear the hole now.
                     self.entries[hole] = ReleasedEntry::Empty;
                     return;
                 }
                 ReleasedEntry::Occupied(k) => {
                     let home = (released_set_hash(k) as usize) & self.mask;
 
+                    // Calculate distances to determine if this element 'belongs'
+                    // before the hole (and thus should be moved back).
+                    // We use wrapping arithmetic to handle the circular buffer topology.
                     let dist_home_to_i = i.wrapping_sub(home) & self.mask;
                     let dist_hole_to_i = i.wrapping_sub(hole) & self.mask;
 
+                    // If the element at `i` is effectively "farther" from its home bucket
+                    // than the hole is from that same home bucket, it means `k`'s probe
+                    // chain passed through `hole`. We must fill `hole` with `k` to restore
+                    // continuity.
                     if dist_home_to_i >= dist_hole_to_i {
                         self.entries[hole] = ReleasedEntry::Occupied(k);
                         hole = i;
@@ -123,6 +186,12 @@ impl ReleasedSet {
     }
 }
 
+/// Calculates the next power of two capacity for the hash table, ensuring a
+/// load factor <= 0.5.
+///
+/// We allocate `2 * limit` slots. The `limit` is the maximum number of items
+/// we expect to store. By doubling the size, we keep the table sparsely populated,
+/// which reduces the length of collision chains in linear probing.
 fn released_set_slots(limit: usize) -> usize {
     let min = limit
         .checked_mul(2)
@@ -147,6 +216,11 @@ const SHIFT_1: u32 = 30;
 const SHIFT_2: u32 = 27;
 const SHIFT_3: u32 = 31;
 
+/// Hashes a key using the SplitMix64 algorithm.
+///
+/// This is a high-quality, stateless hash function that is extremely fast on
+/// 64-bit architectures. It provides excellent avalanche properties, which is
+/// important for linear probing to avoid clustering.
 #[inline]
 fn released_set_hash(key: usize) -> u64 {
     let mut x = key as u64;
