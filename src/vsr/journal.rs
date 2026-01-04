@@ -359,38 +359,6 @@ pub type WritePrepareCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: 
 pub type RecoverCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> =
     fn(*mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS>);
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Phases of the recovery pipeline.
-enum RecoveryStage {
-    Headers,
-    Prepares,
-    Slots,
-    Fix,
-    Done,
-}
-
-#[allow(dead_code)]
-/// In-progress recovery bookkeeping.
-struct Recovery<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
-    callback: RecoverCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
-    cluster: u128,
-    op_prepare_max: u64,
-    op_checkpoint: u64,
-    solo: bool,
-
-    stage: RecoveryStage,
-    prepare_next_slot: usize,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Identifies what kind of recovery data a read buffer contains.
-enum RecoveryReadKind {
-    Headers,
-    Prepares,
-}
-
 /// A write operation descriptor for the range-locking machinery.
 ///
 /// `Write` represents a single in-flight write operation. It is allocated from
@@ -441,16 +409,13 @@ const _: () = {
 };
 
 /// Journal lifecycle state.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Status {
+#[derive(Debug, Clone, Copy)]
+pub enum Status<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize> {
     /// Initial state before recovery begins.
     Init,
-    /// Journal is recovering; header chunks being read and validated.
+    /// Journal is recovering; callback invoked on completion.
     Recovering {
-        /// Number of header sectors successfully read and validated.
-        headers_recovered: u64,
-        /// Total number of header sectors to recover.
-        headers_total: u64,
+        callback: RecoverCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
     },
     /// Recovery complete; journal is ready for normal operation.
     Recovered,
@@ -815,7 +780,7 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     pub prepare_inhabited: Vec<bool>,
 
     /// Current journal state (initializing, recovering, or recovered).
-    pub status: Status,
+    pub status: Status<S, WRITE_OPS, WRITE_OPS_WORDS>,
 }
 
 impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
@@ -1050,13 +1015,31 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     }
 
     pub fn op_maximum(&self) -> u64 {
-        assert!(matches!(self.status, Status::Recovered));
+        assert!(matches!(
+            self.status,
+            Status::Recovered | Status::Recovering { .. }
+        ));
 
         self.headers
             .iter()
             .filter_map(|h| (h.operation != Operation::RESERVED).then_some(h.op))
             .max()
             .unwrap_or(0)
+    }
+
+    // ---------------------------------------------------------------------
+    // Recovery initialization
+    // ---------------------------------------------------------------------
+
+    /// Enters recovery and stores the completion callback on `status`.
+    pub fn recover(&mut self, callback: RecoverCallback<S, WRITE_OPS, WRITE_OPS_WORDS>) {
+        assert!(matches!(self.status, Status::Init));
+        assert!(self.header_chunks_recovered.is_empty());
+        assert!(self.header_chunks_requested.is_empty());
+
+        self.status = Status::Recovering { callback };
+
+        // TODO: Kick off recover_headers once the recovery pipeline is implemented.
     }
 
     // ---------------------------------------------------------------------
