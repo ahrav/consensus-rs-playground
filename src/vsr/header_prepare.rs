@@ -158,6 +158,182 @@ unsafe impl Pod for HeaderPrepare {}
 /// - Validated by `HeaderPrepare::zeroed()` which asserts checksum == 0
 unsafe impl Zeroable for HeaderPrepare {}
 
+/// Raw on-disk header view for safely decoding untrusted Prepare headers.
+///
+/// This struct mirrors [`HeaderPrepare`] exactly in memory layout, but stores
+/// the `command` field as a raw `u8` instead of a [`Command`] enum. This allows
+/// safely reading headers from untrusted sources (disk, network) before
+/// validating that the command byte contains a valid discriminant.
+///
+/// # Use Cases
+///
+/// - **Journal recovery**: Reading headers from disk that may be corrupted
+/// - **Network receive**: Parsing headers before protocol validation
+/// - **Crash recovery**: Scanning log files for valid entries
+///
+/// # Layout
+///
+/// Identical to [`HeaderPrepare`] (256 bytes, 16-byte aligned). All fields
+/// except `command` have the same types. See [`HeaderPrepare`] for detailed
+/// field documentation.
+///
+/// # Example
+///
+/// ```ignore
+/// let raw: HeaderPrepareRaw = read_from_disk(slot);
+/// if raw.valid_checksum() {
+///     if let Some(header) = raw.as_typed() {
+///         // Command is valid, header can be used safely
+///     }
+/// }
+/// ```
+///
+/// TODO: Centralize `HeaderPrepare`/`HeaderPrepareRaw` into a single representation.
+#[repr(C, align(16))]
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub struct HeaderPrepareRaw {
+    // --- Checksum region (offset 0-63) ---
+    pub checksum: Checksum128,
+    pub checksum_padding: Checksum128,
+    pub checksum_body: Checksum128,
+    pub checksum_body_padding: Checksum128,
+
+    // --- Nonce/cluster region (offset 64-95) ---
+    pub nonce_reserved: Checksum128,
+    pub cluster: constants::ClusterId,
+
+    // --- Frame header (offset 96-127) ---
+    pub size: u32,
+    pub epoch: u32,
+    pub view: u32,
+    pub release: Release,
+    pub protocol: u16,
+    pub command: u8,
+    pub replica: u8,
+    pub reserved_frame: [u8; 12],
+
+    // --- Prepare-specific fields (offset 128-255) ---
+    pub parent: u128,
+    pub parent_padding: u128,
+    pub request_checksum: Checksum128,
+    pub request_checksum_padding: Checksum128,
+    pub checkpoint_id: u128,
+    pub client: u128,
+    pub op: u64,
+    pub commit: u64,
+    pub timestamp: u64,
+    pub request: u32,
+    pub operation: Operation,
+    pub reserved: [u8; 3],
+}
+
+/// # Safety
+///
+/// `HeaderPrepareRaw` satisfies the `Zeroable` requirements:
+/// - `#[repr(C)]` with only primitive types and arrays
+/// - All-zeros is a valid bit pattern for every field
+unsafe impl Zeroable for HeaderPrepareRaw {}
+
+const _: () = {
+    assert!(mem::size_of::<HeaderPrepareRaw>() == mem::size_of::<HeaderPrepare>());
+    assert!(mem::align_of::<HeaderPrepareRaw>() == mem::align_of::<HeaderPrepare>());
+    assert!(HeaderPrepareRaw::SIZE == HeaderPrepare::SIZE);
+    assert!(mem::offset_of!(HeaderPrepareRaw, command) == mem::offset_of!(HeaderPrepare, command));
+};
+
+impl HeaderPrepareRaw {
+    /// Size of the header in bytes (256).
+    pub const SIZE: usize = HeaderPrepare::SIZE;
+
+    /// Returns the header as a byte slice for checksumming or serialization.
+    ///
+    /// The returned slice is exactly 256 bytes, representing the complete
+    /// header in wire format.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self as *const Self as *const u8, Self::SIZE) }
+    }
+
+    /// Calculates the header checksum over bytes 16-255.
+    ///
+    /// The checksum covers all header bytes except the checksum field itself
+    /// (bytes 0-15). This matches the checksum calculation in [`HeaderPrepare`].
+    #[inline]
+    pub fn calculate_checksum(&self) -> Checksum128 {
+        let bytes = self.as_bytes();
+        let checksum_field_size = mem::size_of::<Checksum128>();
+
+        assert!(bytes.len() > checksum_field_size);
+        checksum(&bytes[checksum_field_size..])
+    }
+
+    /// Returns `true` if the stored checksum matches the calculated checksum.
+    ///
+    /// This is the first validation step when processing untrusted headers.
+    /// A valid checksum indicates the header bytes are internally consistent,
+    /// but does not guarantee the command byte is a valid discriminant.
+    #[inline]
+    pub fn valid_checksum(&self) -> bool {
+        self.checksum == self.calculate_checksum()
+    }
+
+    /// Attempts to interpret the raw command byte as a valid [`Command`].
+    ///
+    /// Returns `Some(command)` if the byte is a valid discriminant, or `None`
+    /// if it represents an unknown or reserved command value.
+    ///
+    /// Use this to validate the command before calling [`as_typed()`](Self::as_typed).
+    #[inline]
+    pub fn command_checked(&self) -> Option<Command> {
+        Command::try_from_u8(self.command)
+    }
+
+    /// Returns a typed [`HeaderPrepare`] reference if the command byte is valid.
+    ///
+    /// This is the safe way to convert a raw header to a typed header. It validates
+    /// that the command byte is a known discriminant before performing the cast.
+    ///
+    /// Returns `None` if [`command_checked()`](Self::command_checked) fails.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let raw: HeaderPrepareRaw = read_from_disk(slot);
+    /// if let Some(header) = raw.as_typed() {
+    ///     assert_eq!(header.command, Command::Prepare);
+    /// }
+    /// ```
+    #[inline]
+    pub fn as_typed(&self) -> Option<&HeaderPrepare> {
+        let _ = self.command_checked()?;
+        Some(unsafe { self.as_typed_unchecked() })
+    }
+
+    /// Casts this raw header to a typed [`HeaderPrepare`] without validation.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    ///
+    /// 1. The `command` byte is a valid [`Command`] discriminant (use
+    ///    [`command_checked()`](Self::command_checked) to verify)
+    /// 2. The `operation` byte is a valid [`Operation`] value
+    ///
+    /// Violating these requirements results in undefined behavior when
+    /// accessing the `command` or `operation` fields of the returned reference.
+    ///
+    /// # Prefer `as_typed()`
+    ///
+    /// In most cases, use [`as_typed()`](Self::as_typed) instead, which
+    /// performs the necessary validation.
+    #[inline]
+    pub unsafe fn as_typed_unchecked(&self) -> &HeaderPrepare {
+        // SAFETY: Caller guarantees command byte is valid; layout/alignment are
+        // verified at compile time by static assertions.
+        unsafe { &*(self as *const Self as *const HeaderPrepare) }
+    }
+}
+
 impl HeaderPrepare {
     /// Size of the header in bytes (256).
     pub const SIZE: usize = 256;

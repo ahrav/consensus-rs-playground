@@ -847,10 +847,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
         let headers_redundant_raw = unsafe {
-            AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(
-                SLOT_COUNT,
-                constants::SECTOR_SIZE,
-            )
+            AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
         let write_headers_sectors = unsafe {
             AlignedSlice::<[u8; constants::SECTOR_SIZE]>::new_zeroed_aligned(
@@ -1520,8 +1517,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
 
         // Validate header identity and message integrity using a raw header view.
-        let header_raw =
-            unsafe { &*(message.buffer_ptr() as *const HeaderPrepareRaw) };
+        let header_raw = unsafe { &*(message.buffer_ptr() as *const HeaderPrepareRaw) };
         let expected_cluster = replica.cluster;
 
         let error_reason: Option<&'static str> = (|| {
