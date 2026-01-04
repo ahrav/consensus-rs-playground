@@ -288,6 +288,20 @@ impl FreeSet {
         }
     }
 
+    /// Reserve `reserve_count` free blocks. The blocks are not acquired yet.
+    ///
+    /// Invariants:
+    ///
+    /// - If a reservation is returned, it covers exactly `reserve_count` free blocks, along with
+    ///   any interleaved already-acquired blocks.
+    /// - Active reservations are exclusive (i.e. disjoint).
+    ///   (A reservation is active until `forfeit()` is called.)
+    ///
+    /// Returns `None` if there are not enough blocks free and vacant.
+    /// Returns a reservation which can be used with `acquire()`:
+    /// - The caller should consider the returned `Reservation` as opaque and immutable.
+    /// - Each `reserve()` call which returns `Some` must correspond to exactly one `forfeit()`
+    ///   call.
     pub fn reserve(&mut self, reserve_count: usize) -> Option<Reservation> {
         assert!(self.opened);
         assert!(reserve_count > 0);
@@ -327,6 +341,7 @@ impl FreeSet {
         })
     }
 
+    /// After invoking `forfeit()`, the reservation must never be used again.
     pub fn forfeit(&mut self, reservation: Reservation) {
         assert!(self.opened);
         assert_eq!(reservation.session, self.reservation_session);
@@ -343,6 +358,16 @@ impl FreeSet {
         }
     }
 
+    /// Marks a free block from the reservation as acquired, and returns the address.
+    /// The reservation must not have been forfeited yet.
+    /// The reservation must belong to the current cycle of reservations.
+    ///
+    /// Invariants:
+    ///
+    /// - An acquired block cannot be acquired again until it has been released and the release
+    ///   has been checkpointed.
+    ///
+    /// Returns `None` if no free block is available in the reservation.
     pub fn acquire(&mut self, reservation: Reservation) -> Option<u64> {
         assert!(self.opened);
         assert!(reservation.block_count > 0);
