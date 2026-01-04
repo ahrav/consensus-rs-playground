@@ -1238,8 +1238,8 @@ fn recovery_cases_match_expected_decisions() {
         Some(header),
         20,
         10,
-        RecoveryDecision::Fix,
-        RecoveryDecision::Fix,
+        RecoveryDecision::Eql,
+        RecoveryDecision::Eql,
     );
 }
 
