@@ -245,6 +245,88 @@ impl FreeSet {
         }
     }
 
+    pub fn release(&mut self, address: u64) {
+        assert!(self.opened);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(!self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+
+        if self.checkpoint_durable {
+            self.blocks_released.set(block);
+        } else {
+            self.blocks_released_prior_checkpoint_durability
+                .insert(block as u64);
+        }
+    }
+
+    fn free(&mut self, address: u64) {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        let shard = block / SHARD_BITS;
+        self.index.unset(shard);
+
+        self.blocks_acquired.unset(block);
+        self.blocks_released.unset(block);
+    }
+
+    pub fn mark_checkpoint_not_durable(&mut self) {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        self.checkpoint_durable = false;
+    }
+
+    pub fn mark_checkpoint_durable(&mut self) {
+        assert!(self.opened);
+        assert!(!self.checkpoint_durable);
+
+        self.checkpoint_durable = true;
+
+        let released_word_len = self.blocks_released.word_len();
+        assert!(self.blocks_released.bit_length().is_multiple_of(64));
+
+        for wi in 0..released_word_len {
+            let mut word = self.blocks_released.words()[wi];
+            while word != 0 {
+                let tz = word.trailing_zeros() as usize;
+                let block = wi * 64 + tz;
+                debug_assert!(block < self.blocks_count());
+                self.free((block as u64) + 1);
+                word &= word - 1;
+            }
+        }
+
+        assert_eq!(self.blocks_released.count(), 0);
+
+        while let Some(block) = self.blocks_released_prior_checkpoint_durability.pop() {
+            self.blocks_released.set(block as usize);
+        }
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        self.verify_index();
+    }
+
     /// Asserts that the shard index is consistent with the block-level bitset.
     ///
     /// For each shard, verifies that `index.is_set(shard)` is `true` if and only if
