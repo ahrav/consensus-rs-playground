@@ -22,3 +22,5 @@ target
 
 .gemini/
 gha-creds-*.json
+
+.DS_Store
