@@ -21,8 +21,9 @@
 //!
 //! To prevent this, released blocks are buffered in
 //! [`FreeSet::blocks_released_prior_checkpoint_durability`] until the current
-//! checkpoint becomes durable on a quorum of replicas. Only then are they moved
-//! to [`FreeSet::blocks_released`] and made available for reuse.
+//! checkpoint becomes durable on a quorum of replicas. At durability, those
+//! blocks move to [`FreeSet::blocks_released`]. They are actually freed (and
+//! become reusable) when the *next* checkpoint is confirmed durable.
 //!
 //! # Reservation Workflow
 //!
@@ -153,8 +154,8 @@ pub struct FreeSet {
     ///
     /// When `false`, released blocks are buffered in
     /// [`blocks_released_prior_checkpoint_durability`]. When this transitions
-    /// to `true`, those blocks are moved to [`blocks_released`] and become
-    /// available for reuse.
+    /// to `true`, those blocks move to [`blocks_released`] and will be freed
+    /// on the next durability transition.
     pub checkpoint_durable: bool,
 
     /// Shard index for fast free-block lookup.
@@ -172,10 +173,10 @@ pub struct FreeSet {
     /// Bitset tracking acquired (in-use) blocks. Set bit = block is acquired.
     pub blocks_acquired: DynamicBitSet,
 
-    /// Bitset of blocks released during the previous (now durable) checkpoint.
+    /// Bitset of blocks released during the previous checkpoint interval.
     ///
-    /// These blocks are safe to reallocate. Updated when checkpoint durability
-    /// is confirmed.
+    /// These blocks are freed (and become reusable) when the next checkpoint
+    /// becomes durable.
     pub blocks_released: DynamicBitSet,
 
     /// Blocks released during the current (not yet durable) checkpoint interval.
@@ -183,7 +184,8 @@ pub struct FreeSet {
     /// These blocks CANNOT be reused yet. If the system crashes before the
     /// checkpoint becomes durable, recovery will restore from the previous
     /// checkpoint which may still reference these blocks. Once checkpoint
-    /// durability is confirmed, these move to [`blocks_released`].
+    /// durability is confirmed, these move to [`blocks_released`] and remain
+    /// acquired until the next durability transition.
     ///
     /// Stores 0-based block indices (not 1-based addresses).
     pub blocks_released_prior_checkpoint_durability: ReleasedSet,
