@@ -4,6 +4,7 @@ pub mod checksum;
 pub mod client_operation;
 pub mod command;
 pub mod framing;
+pub mod free_set;
 pub mod header;
 pub mod header_prepare;
 pub mod iops;
