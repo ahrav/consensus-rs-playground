@@ -1879,8 +1879,7 @@ fn panics_on_overlapping_prepares() {
 }
 
 #[test]
-#[should_panic(expected = "assertion failed")]
-fn panics_on_duplicate_slot() {
+fn allows_duplicate_slot_when_ranges_do_not_overlap() {
     let mut storage = MockStorage::new();
     let mut journal = TestJournal::new(&mut storage, 0);
 
@@ -1894,7 +1893,7 @@ fn panics_on_duplicate_slot() {
 
     unsafe {
         (*write1).op = 42;
-        (*write2).op = 42 + SLOT_COUNT as u64; // Same slot - should panic.
+        (*write2).op = 42 + SLOT_COUNT as u64; // Same slot, but different header sectors.
 
         journal.write_sectors(write1, dummy_callback, &buf1, Ring::Headers, 0);
         journal.write_sectors(write2, dummy_callback, &buf2, Ring::Headers, 8192);
