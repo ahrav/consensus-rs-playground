@@ -107,6 +107,7 @@ pub enum BitKind {
 /// - Time complexity: O(n/64) where n = `bit_max - bit_min`
 /// - The function processes 64 bits per iteration using efficient bitwise operations
 /// - Best case (match in first word): O(1)
+#[allow(dead_code)]
 fn find_bit(
     bit_set: &DynamicBitSet,
     bit_min: usize,
@@ -166,7 +167,7 @@ fn find_bit(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_bit, BitKind};
+    use super::{BitKind, find_bit};
     use crate::stdx::DynamicBitSet;
     use proptest::prelude::*;
 
