@@ -16,7 +16,7 @@ enum ReleasedEntry {
     /// Slot is available for insertion.
     Empty,
     /// Slot contains the given key.
-    Occupied(usize),
+    Occupied(u64),
 }
 
 /// A fixed-capacity hash set optimized for tracking "released" items.
@@ -59,7 +59,7 @@ pub struct ReleasedSet {
     /// A dense list of all keys currently in the set.
     /// This allows O(1) selection of an element to remove (via `pop`) and
     /// eliminates the need to scan `entries` to find active elements.
-    stack: Vec<usize>,
+    stack: Vec<u64>,
     /// Bitmask for fast modulo operations (size - 1).
     mask: usize,
     /// Maximum number of elements allowed in the set.
@@ -95,6 +95,12 @@ impl ReleasedSet {
         self.stack.len()
     }
 
+    /// Returns the number of elements in the set.
+    #[inline]
+    pub fn count(&self) -> usize {
+        self.len()
+    }
+
     /// Returns `true` if the set contains no elements.
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
@@ -114,7 +120,7 @@ impl ReleasedSet {
     ///
     /// This operation is O(1) on average, with worst-case O(n) if the table
     /// has many collisions (unlikely given the 0.5 load factor constraint).
-    pub fn contains(&self, key: usize) -> bool {
+    pub fn contains(&self, key: u64) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
         // Linear probing: check slots sequentially until we find the key or an empty slot.
@@ -138,7 +144,7 @@ impl ReleasedSet {
     ///
     /// Panics if the set is full (capacity exceeded). This design is intentional for
     /// deterministic systems where resource limits must be explicitly modeled and respected.
-    pub fn insert(&mut self, key: usize) {
+    pub fn insert(&mut self, key: u64) {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
         for _ in 0..self.entries.len() {
@@ -169,7 +175,7 @@ impl ReleasedSet {
     /// but this should not be relied upon.
     ///
     /// Uses the internal stack to locate an element in O(1).
-    pub fn pop(&mut self) -> Option<usize> {
+    pub fn pop(&mut self) -> Option<u64> {
         let key = self.stack.pop()?;
         // We must remove from the table as well to keep `contains` consistent.
         let removed = self.remove(key);
@@ -183,7 +189,7 @@ impl ReleasedSet {
     /// Internal removal from the linear-probing table.
     ///
     /// Returns `true` if the key was present and removed.
-    fn remove(&mut self, key: usize) -> bool {
+    fn remove(&mut self, key: u64) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
         for _ in 0..self.entries.len() {
@@ -278,8 +284,8 @@ const SHIFT_3: u32 = 31;
 /// 64-bit architectures. It provides excellent avalanche properties, which is
 /// important for linear probing to avoid clustering.
 #[inline]
-fn released_set_hash(key: usize) -> u64 {
-    let mut x = key as u64;
+fn released_set_hash(key: u64) -> u64 {
+    let mut x = key;
     x ^= x >> SHIFT_1;
     x = x.wrapping_mul(SPLITMIX64_MUL_1);
     x ^= x >> SHIFT_2;
@@ -297,7 +303,7 @@ mod tests {
     use std::time::Duration;
 
     const LIMIT: usize = 16;
-    const KEY_MAX: usize = 64;
+    const KEY_MAX: u64 = 64;
 
     #[test]
     fn empty_set_has_no_members() {
@@ -335,7 +341,7 @@ mod tests {
         set.insert(2);
         set.insert(3);
 
-        let mut drained = HashSet::new();
+        let mut drained: HashSet<u64> = HashSet::new();
         while let Some(key) = set.pop() {
             assert!(drained.insert(key));
         }
@@ -399,9 +405,9 @@ mod tests {
 
     proptest! {
         #[test]
-        fn prop_insert_contains_len(keys in proptest::collection::vec(0usize..KEY_MAX, 0..128)) {
+        fn prop_insert_contains_len(keys in proptest::collection::vec(0u64..KEY_MAX, 0..128)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);
-            let mut model: HashSet<usize> = HashSet::new();
+            let mut model: HashSet<u64> = HashSet::new();
 
             for key in keys {
                 if model.len() == LIMIT && !model.contains(&key) {
@@ -420,15 +426,15 @@ mod tests {
 
     proptest! {
         #[test]
-        fn prop_pop_drains(keys in proptest::collection::hash_set(0usize..KEY_MAX, 0..=LIMIT)) {
+        fn prop_pop_drains(keys in proptest::collection::hash_set(0u64..KEY_MAX, 0..=LIMIT)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);
-            let mut model: HashSet<usize> = HashSet::new();
+            let mut model: HashSet<u64> = HashSet::new();
             for key in &keys {
                 set.insert(*key);
                 model.insert(*key);
             }
 
-            let mut drained = HashSet::new();
+            let mut drained: HashSet<u64> = HashSet::new();
             while let Some(key) = set.pop() {
                 prop_assert!(drained.insert(key));
             }
@@ -440,16 +446,16 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum Op {
-        Insert(usize),
-        Contains(usize),
+        Insert(u64),
+        Contains(u64),
         Pop,
         Clear,
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
         prop_oneof![
-            (0usize..KEY_MAX).prop_map(Op::Insert),
-            (0usize..KEY_MAX).prop_map(Op::Contains),
+            (0u64..KEY_MAX).prop_map(Op::Insert),
+            (0u64..KEY_MAX).prop_map(Op::Contains),
             Just(Op::Pop),
             Just(Op::Clear),
         ]
@@ -459,7 +465,7 @@ mod tests {
         #[test]
         fn prop_operation_sequence(ops in proptest::collection::vec(op_strategy(), 0..256)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);
-            let mut model: HashSet<usize> = HashSet::new();
+            let mut model: HashSet<u64> = HashSet::new();
 
             for op in ops {
                 match op {
