@@ -364,7 +364,7 @@ pub type RecoverCallback<S, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize
 /// `Write` represents a single in-flight write operation. It is allocated from
 /// the `Journal`'s `IOPSType` pool and contains:
 /// - A back-pointer to the owning `Journal`
-/// - The op number (from the prepare header) used for concurrent-slot detection assertions
+/// - The op/checksum used by `writing()` to detect in-flight prepares
 /// - The `Range` descriptor with buffer and locking state
 ///
 /// # Lifecycle
@@ -391,10 +391,9 @@ pub struct Write<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usiz
     /// Prepare message being written.
     pub message: *mut MessagePrepare,
 
-    /// Operation number of the prepare whose slot is being written.
+    /// Operation number of the prepare whose payload/header is being written.
     ///
-    /// Used to derive the slot (`op % SLOT_COUNT`) and assert that we never have
-    /// two concurrent writes to the same slot.
+    /// Used by `writing()` to detect in-flight prepares for a slot.
     pub op: u64,
 
     /// Cached checksum of `message.header.checksum` (used by `writing()`).
@@ -1913,11 +1912,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             // SAFETY: All `Write` pointers from the iterator are valid pool entries.
             unsafe {
-                // Never allow concurrent writes to the same slot.
-                let other_slot = Slot::from_op((*other).op);
-                let write_slot = Slot::from_op((*write).op);
-                assert!(other_slot != write_slot);
-
                 if !(*other).range.locked {
                     continue;
                 }
