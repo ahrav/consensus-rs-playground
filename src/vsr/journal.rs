@@ -702,6 +702,38 @@ fn recovery_case(
     result.unwrap_or_else(|| panic!("recovery_case: no match for parameters={:?}", parameters))
 }
 
+/// Returns the header only if it has a valid checksum, command=Prepare, expected cluster,
+/// and resides in the correct slot.
+#[allow(dead_code)]
+#[inline]
+fn header_ok(
+    cluster: constants::ClusterId,
+    slot: Slot,
+    header: &HeaderPrepareRaw,
+) -> Option<&HeaderPrepare> {
+    // Validate checksum before accessing fields.
+    if !header.valid_checksum() {
+        return None;
+    }
+
+    if header.command_checked()? != Command::Prepare {
+        return None;
+    }
+
+    let slot_index = slot.index() as u64;
+    let valid_cluster_command_and_slot = if header.operation == Operation::RESERVED {
+        header.cluster == cluster && slot_index == header.op
+    } else {
+        header.cluster == cluster && slot_index == header.op % SLOT_COUNT as u64
+    };
+
+    if !valid_cluster_command_and_slot {
+        return None;
+    }
+
+    header.as_typed()
+}
+
 /// WAL journal implementing range-locked sector writes.
 ///
 /// The `Journal` coordinates write operations to the Write-Ahead Log, ensuring
