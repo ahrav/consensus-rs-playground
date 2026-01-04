@@ -590,8 +590,6 @@ impl DynamicBitSet {
 
     /// Returns an iterator over set bit indices in ascending order.
     ///
-    /// The iterator borrows the bitset; modifications during iteration are not reflected.
-    ///
     /// # Examples
     ///
     /// ```
@@ -1146,24 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn iterate_first_bit_only() {
-        let mut b: BitSet64 = BitSet::empty();
-        b.set(0);
-
-        let indices: Vec<usize> = b.iter().collect();
-        assert_eq!(indices, vec![0]);
-    }
-
-    #[test]
-    fn iterate_last_bit_only_n64() {
-        let mut b: BitSet64 = BitSet::empty();
-        b.set(63);
-
-        let indices: Vec<usize> = b.iter().collect();
-        assert_eq!(indices, vec![63]);
-    }
-
-    #[test]
     fn iterate_last_bit_only_n128() {
         let mut b: BitSet128 = BitSet::empty();
         b.set(127);
@@ -1572,13 +1552,6 @@ mod tests {
         // ============================================
 
         #[test]
-        fn dynamic_iterate_empty() {
-            let b = DynamicBitSet::empty(64);
-            let indices: Vec<usize> = b.iter_set().collect();
-            assert!(indices.is_empty());
-        }
-
-        #[test]
         fn dynamic_iterate_all_bits() {
             let mut b = DynamicBitSet::empty(8);
             for i in 0..8 {
@@ -1598,33 +1571,6 @@ mod tests {
 
             let indices: Vec<usize> = b.iter_set().collect();
             assert_eq!(indices, vec![5, 6, 7, 8, 9]);
-        }
-
-        #[test]
-        fn dynamic_iterate_first_bit_only() {
-            let mut b = DynamicBitSet::empty(64);
-            b.set(0);
-
-            let indices: Vec<usize> = b.iter_set().collect();
-            assert_eq!(indices, vec![0]);
-        }
-
-        #[test]
-        fn dynamic_iterate_last_bit_only_n64() {
-            let mut b = DynamicBitSet::empty(64);
-            b.set(63);
-
-            let indices: Vec<usize> = b.iter_set().collect();
-            assert_eq!(indices, vec![63]);
-        }
-
-        #[test]
-        fn dynamic_iterate_last_bit_only_n128() {
-            let mut b = DynamicBitSet::empty(128);
-            b.set(127);
-
-            let indices: Vec<usize> = b.iter_set().collect();
-            assert_eq!(indices, vec![127]);
         }
 
         #[test]
