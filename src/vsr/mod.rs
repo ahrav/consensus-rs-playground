@@ -1,6 +1,5 @@
 pub use crate::constants;
 
-pub mod checkpoint;
 pub mod checksum;
 pub mod client_operation;
 pub mod command;
@@ -26,7 +25,6 @@ pub use crate::constants::{
     MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE, VSR_VERSION,
 };
 
-pub use checkpoint::Checkpoint;
 #[cfg(target_os = "linux")]
 pub use checksum::checksum_aegis_mac;
 pub use checksum::{Checksum128, checksum};
@@ -38,6 +36,7 @@ pub use members::{Members, member_index, valid_members};
 pub use operation::{Operation, StateMachineOperation};
 pub use pool::{MessageHandle, MessagePool};
 pub use replica::Replica;
+pub use state::{checkpoint_after, durable, prepare_max_for_checkpoint, trigger_for_checkpoint};
 pub use state::VsrState;
 pub use view_change::{ViewChangeArray, ViewChangeCommand, ViewChangeSlice};
 

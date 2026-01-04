@@ -2,8 +2,7 @@
 
 use crate::{constants, message_pool::MessagePool};
 
-use super::HeaderPrepare;
-use super::checkpoint::Checkpoint;
+use super::{HeaderPrepare, checkpoint_after, prepare_max_for_checkpoint};
 use super::constants::ClusterId;
 use super::journal::Journal;
 use super::state::{CheckpointState, VsrState};
@@ -92,12 +91,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     #[inline]
     pub fn op_checkpoint_next(&self) -> u64 {
-        Checkpoint::checkpoint_after(self.op_checkpoint())
+        checkpoint_after(self.op_checkpoint())
     }
 
     #[inline]
     pub fn op_prepare_max(&self) -> u64 {
-        Checkpoint::prepare_max_for_checkpoint(self.op_checkpoint_next())
+        prepare_max_for_checkpoint(self.op_checkpoint_next())
             .expect("op_prepare_max requires a valid checkpoint")
     }
 
