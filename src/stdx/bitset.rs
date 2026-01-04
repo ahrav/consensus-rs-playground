@@ -1,4 +1,8 @@
-//! Fixed-size bitset backed by an array of `u64` words; capacity is compile-time known.
+//! Bitset implementations: fixed-size [`BitSet`] with compile-time capacity and
+//! heap-allocated [`DynamicBitSet`] for runtime-determined sizes.
+//!
+//! Both implementations store bits in `u64` words and guarantee that padding bits
+//! (indices beyond the logical capacity) remain zero.
 
 /// Computes the number of `u64` words needed to store `N` bits.
 pub const fn words_for_bits(n: usize) -> usize {
@@ -366,13 +370,28 @@ impl<const N: usize, const WORDS: usize> Iterator for BitSetIterator<N, WORDS> {
 
 /// Runtime-sized bitset backed by a `Vec<u64>`.
 ///
-/// Unlike `BitSet`, which has a compile-time fixed capacity `N`, `DynamicBitSet`
+/// Unlike [`BitSet`], which has a compile-time fixed capacity `N`, `DynamicBitSet`
 /// allows the capacity to be determined at runtime. It is useful when the number
 /// of bits is not known at compile time or varies per instance.
 ///
 /// The implementation ensures that unused bits in the last word (if `bit_length`
 /// is not a multiple of 64) are always zero. This invariant is critical for
 /// `PartialEq` correctness, as it relies on slice equality.
+///
+/// All indexing operations panic when `idx >= bit_length`. Use [`iter_set`](Self::iter_set)
+/// to traverse set bits in ascending order.
+///
+/// # Examples
+///
+/// ```
+/// use consensus::stdx::bitset::DynamicBitSet;
+///
+/// let mut bits = DynamicBitSet::empty(100);
+/// bits.set(1);
+/// bits.set(50);
+/// bits.set(99);
+/// assert_eq!(bits.iter_set().collect::<Vec<_>>(), vec![1, 50, 99]);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DynamicBitSet {
     words: Vec<u64>,
@@ -380,7 +399,11 @@ pub struct DynamicBitSet {
 }
 
 impl DynamicBitSet {
-    /// Creates an empty bitset of `bit_length` bits, all cleared.
+    /// Creates an empty bitset with capacity for `bit_length` bits, all initialized to zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `bit_length` - The number of addressable bits. May be zero.
     pub fn empty(bit_length: usize) -> Self {
         let words = vec![0u64; words_for_bits(bit_length)];
         Self { words, bit_length }
@@ -408,7 +431,10 @@ impl DynamicBitSet {
         }
     }
 
-    /// Returns a slice of backing words.
+    /// Returns a slice of the backing `u64` words.
+    ///
+    /// Useful for bulk operations or serialization. Padding bits beyond
+    /// `bit_length` are guaranteed to be zero.
     #[inline]
     pub fn words(&self) -> &[u64] {
         &self.words
@@ -562,14 +588,32 @@ impl DynamicBitSet {
         None
     }
 
-    /// Iterates over set bits in ascending order.
+    /// Returns an iterator over set bit indices in ascending order.
+    ///
+    /// The iterator borrows the bitset; modifications during iteration are not reflected.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use consensus::stdx::bitset::DynamicBitSet;
+    ///
+    /// let mut bits = DynamicBitSet::empty(64);
+    /// bits.set(5);
+    /// bits.set(10);
+    ///
+    /// for idx in bits.iter_set() {
+    ///     println!("Bit {} is set", idx);
+    /// }
+    /// ```
     #[inline]
     pub fn iter_set(&self) -> DynamicBitSetIterator<'_> {
         DynamicBitSetIterator::new(self)
     }
 }
 
-/// Iterator over set bit indices in ascending order for `DynamicBitSet`.
+/// Iterator over set bit indices in ascending order, produced by [`DynamicBitSet::iter_set`].
+///
+/// Yields each index where the corresponding bit is set, from lowest to highest.
 pub struct DynamicBitSetIterator<'a> {
     words: &'a [u64],
     word_idx: usize,
