@@ -365,6 +365,14 @@ impl<const N: usize, const WORDS: usize> Iterator for BitSetIterator<N, WORDS> {
 }
 
 /// Runtime-sized bitset backed by a `Vec<u64>`.
+///
+/// Unlike `BitSet`, which has a compile-time fixed capacity `N`, `DynamicBitSet`
+/// allows the capacity to be determined at runtime. It is useful when the number
+/// of bits is not known at compile time or varies per instance.
+///
+/// The implementation ensures that unused bits in the last word (if `bit_length`
+/// is not a multiple of 64) are always zero. This invariant is critical for
+/// `PartialEq` correctness, as it relies on slice equality.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DynamicBitSet {
     words: Vec<u64>,
@@ -409,7 +417,9 @@ impl DynamicBitSet {
     /// Returns a mutable slice of backing words.
     ///
     /// # Safety
-    /// Callers must ensure that any padding bits above `bit_length` remain zero.
+    ///
+    /// Callers must ensure that any padding bits in the last word (indices `>= bit_length`)
+    /// remain zero.
     #[inline]
     pub unsafe fn words_mut(&mut self) -> &mut [u64] {
         &mut self.words
@@ -496,6 +506,9 @@ impl DynamicBitSet {
         let word_idx = idx / 64;
         let bit_idx = idx % 64;
         let bit_mask = 1u64 << bit_idx;
+
+        // Optimization: Branchless update.
+        // Clear the bit using the inverted mask, then OR in the new value.
         let val_mask = (value as u64) << bit_idx;
         self.words[word_idx] = (self.words[word_idx] & !bit_mask) | val_mask;
     }
@@ -513,6 +526,9 @@ impl DynamicBitSet {
             *word = !*word;
         }
 
+        // We must clear any bits in the last word that are beyond `bit_length`.
+        // If we don't, `PartialEq` (which checks the full `Vec`) would fail against
+        // a clean bitset, as the padding bits would become 1s after inversion.
         if !self.words.is_empty() {
             let last = self.words.len() - 1;
             let mask = self.last_word_mask();
