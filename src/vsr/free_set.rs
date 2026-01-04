@@ -210,6 +210,8 @@ impl FreeSet {
 
         // Two bitsets (blocks_acquired and blocks_released) are EWAH-compressed
         // and stored in grid blocks during checkpoints. Reserve capacity for both.
+        // TODO: Consider using word_count instead of bit count to reduce over-allocation
+        // (Zig uses bits here too, but this may be overly conservative for large grids).
         let extra_trailer_blocks =
             2 * block_count_for_trailer_size(Ewah::<Word>::encode_size_max(blocks_count) as u64);
 
