@@ -1015,7 +1015,10 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     }
 
     pub fn op_maximum(&self) -> u64 {
-        assert!(matches!(self.status, Status::Recovered));
+        assert!(matches!(
+            self.status,
+            Status::Recovered | Status::Recovering { .. }
+        ));
 
         self.headers
             .iter()
