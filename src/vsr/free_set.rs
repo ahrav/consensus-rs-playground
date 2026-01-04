@@ -48,6 +48,8 @@
 // Allow dead code during development as methods are implemented incrementally.
 #![allow(dead_code)]
 
+use std::cmp::max;
+
 use crate::{
     constants,
     ewah::Ewah,
@@ -121,6 +123,21 @@ pub enum ReservationState {
     Forfeiting,
 }
 
+/// A reservation over a contiguous block-index range in the free set.
+///
+/// The fields are block indices (0-based) for ease of calculation. A reservation
+/// may span both free and acquired blocks; at creation time it is guaranteed to
+/// include exactly the number of free blocks requested by `reserve()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    /// Start of the reserved range in block indices (0-based, inclusive).
+    pub block_base: usize,
+    /// Length of the reserved range in blocks.
+    pub block_count: usize,
+    /// Reservation session token used to detect stale handles.
+    pub session: usize,
+}
+
 /// Configuration options for [`FreeSet::init`].
 #[derive(Debug, Clone, Copy)]
 pub struct InitOptions {
@@ -191,12 +208,14 @@ pub struct FreeSet {
     pub blocks_released_prior_checkpoint_durability: ReleasedSet,
 
     /// Number of blocks reserved by the current reservation session.
+    /// High-water mark (cursor position)
     reservation_blocks: usize,
     /// Number of active reservations in the current session.
     reservation_count: usize,
-    /// Current phase of the reservation workflow.
+    /// Current phase of the reservation workflow. (Reserving or Forfeiting)
     reservation_state: ReservationState,
     /// Session counter to detect stale reservation handles.
+    /// Used to invalidate old reservations.
     reservation_session: usize,
 }
 
@@ -267,6 +286,132 @@ impl FreeSet {
             reservation_state: ReservationState::Reserving,
             reservation_session: 0,
         }
+    }
+
+    /// Reserve `reserve_count` free blocks. The blocks are not acquired yet.
+    ///
+    /// Invariants:
+    ///
+    /// - If a reservation is returned, it covers exactly `reserve_count` free blocks, along with
+    ///   any interleaved already-acquired blocks.
+    /// - Active reservations are exclusive (i.e. disjoint).
+    ///   (A reservation is active until `forfeit()` is called.)
+    ///
+    /// Returns `None` if there are not enough blocks free and vacant.
+    /// Returns a reservation which can be used with `acquire()`:
+    /// - The caller should consider the returned `Reservation` as opaque and immutable.
+    /// - Each `reserve()` call which returns `Some` must correspond to exactly one `forfeit()`
+    ///   call.
+    pub fn reserve(&mut self, reserve_count: usize) -> Option<Reservation> {
+        assert!(self.opened);
+        assert!(reserve_count > 0);
+        assert_eq!(self.reservation_state, ReservationState::Reserving);
+
+        let shard_min = self.reservation_blocks / SHARD_BITS;
+        let shard_max = self.shards_count();
+
+        let shard_start = find_bit(&self.index, shard_min, shard_max, BitKind::Unset)?;
+
+        let mut block = max(shard_start * SHARD_BITS, self.reservation_blocks);
+
+        for _ in 0..reserve_count {
+            let free_bit = find_bit(
+                &self.blocks_acquired,
+                block,
+                self.blocks_count(),
+                BitKind::Unset,
+            )?;
+            block = free_bit + 1;
+
+            if (block as u64) > self.blocks_count_limit {
+                return None;
+            }
+        }
+
+        let block_base = self.reservation_blocks;
+        let block_count = block - block_base;
+
+        self.reservation_blocks += block_count;
+        self.reservation_count += 1;
+
+        Some(Reservation {
+            block_base,
+            block_count,
+            session: self.reservation_session,
+        })
+    }
+
+    /// After invoking `forfeit()`, the reservation must never be used again.
+    pub fn forfeit(&mut self, reservation: Reservation) {
+        assert!(self.opened);
+        assert_eq!(reservation.session, self.reservation_session);
+        assert!(reservation.block_base + reservation.block_count <= self.reservation_blocks);
+        assert!(self.reservation_count > 0);
+
+        self.reservation_count -= 1;
+        if self.reservation_count == 0 {
+            self.reservation_blocks = 0;
+            self.reservation_session = self.reservation_session.wrapping_add(1);
+            self.reservation_state = ReservationState::Reserving;
+        } else {
+            self.reservation_state = ReservationState::Forfeiting;
+        }
+    }
+
+    /// Marks a free block from the reservation as acquired, and returns the address.
+    /// The reservation must not have been forfeited yet.
+    /// The reservation must belong to the current cycle of reservations.
+    ///
+    /// Invariants:
+    ///
+    /// - An acquired block cannot be acquired again until it has been released and the release
+    ///   has been checkpointed.
+    ///
+    /// Returns `None` if no free block is available in the reservation.
+    pub fn acquire(&mut self, reservation: Reservation) -> Option<u64> {
+        assert!(self.opened);
+        assert!(reservation.block_count > 0);
+
+        assert!(self.reservation_count > 0);
+        assert!(reservation.block_base < self.reservation_blocks);
+        assert!(reservation.block_base + reservation.block_count <= self.reservation_blocks);
+        assert_eq!(reservation.session, self.reservation_session);
+
+        let shard_min = reservation.block_base / SHARD_BITS;
+        let shard_max = (reservation.block_base + reservation.block_count).div_ceil(SHARD_BITS);
+        let shard_start = find_bit(&self.index, shard_min, shard_max, BitKind::Unset)?;
+        assert!(!self.index.is_set(shard_start));
+
+        let reservation_start = max(shard_start * SHARD_BITS, reservation.block_base);
+        let reservation_end = reservation.block_base + reservation.block_count;
+
+        let block = find_bit(
+            &self.blocks_acquired,
+            reservation_start,
+            reservation_end,
+            BitKind::Unset,
+        )?;
+        assert!(block >= reservation.block_base);
+        assert!(block <= reservation.block_base + reservation.block_count);
+
+        assert!(!self.blocks_acquired.is_set(block));
+        assert!(!self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+
+        let shard = block / SHARD_BITS;
+        assert!(shard >= shard_start);
+
+        self.blocks_acquired.set(block);
+
+        if self.find_free_block_in_shard(shard).is_none() {
+            self.index.set(shard);
+        }
+
+        Some((block as u64) + 1)
     }
 
     /// Marks a block as released, scheduling it for deallocation.
