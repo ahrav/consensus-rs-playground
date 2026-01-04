@@ -1,5 +1,6 @@
 pub use crate::constants;
 
+pub mod checkpoint;
 pub mod checksum;
 pub mod client_operation;
 pub mod command;
@@ -25,6 +26,7 @@ pub use crate::constants::{
     MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE, VSR_VERSION,
 };
 
+pub use checkpoint::Checkpoint;
 #[cfg(target_os = "linux")]
 pub use checksum::checksum_aegis_mac;
 pub use checksum::{Checksum128, checksum};
