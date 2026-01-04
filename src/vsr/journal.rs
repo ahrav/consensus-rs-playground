@@ -646,8 +646,8 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
     // @P - normal path: prepare.
     RecoveryCase {
         label: "@P",
-        decision_multiple: RecoveryDecision::Fix,
-        decision_single: RecoveryDecision::Fix,
+        decision_multiple: RecoveryDecision::Eql,
+        decision_single: RecoveryDecision::Eql,
         pattern: [_1, _0, _1, _0, __, _0, _0, _1, A1, A0, A1],
     },
 ];
