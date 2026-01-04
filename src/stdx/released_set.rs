@@ -10,12 +10,47 @@
 //! The "stack" ensures that `pop()` is O(1) and `clear_retaining_capacity()` is fast,
 //! avoiding the need to scan the entire sparse hash table to find occupied slots.
 
+/// Entry state in the hash table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReleasedEntry {
+    /// Slot is available for insertion.
     Empty,
+    /// Slot contains the given key.
     Occupied(usize),
 }
 
+/// A fixed-capacity hash set optimized for tracking "released" items.
+///
+/// Combines a linear-probing hash table with a supplementary stack to provide
+/// O(1) `pop` operations and efficient clearing. Designed for deterministic
+/// systems where:
+///
+/// - The maximum capacity is known at construction time
+/// - No reallocation occurs during insertion
+/// - Iteration/draining is proportional to element count, not table capacity
+///
+/// # Panics
+///
+/// Panics on insertion if capacity is exceeded. This is intentional for
+/// deterministic systems where resource limits must be explicitly modeled.
+///
+/// # Example
+///
+/// ```
+/// use consensus::stdx::ReleasedSet;
+///
+/// let mut set = ReleasedSet::with_capacity(16);
+/// set.insert(42);
+/// set.insert(17);
+///
+/// assert!(set.contains(42));
+/// assert_eq!(set.len(), 2);
+///
+/// while let Some(key) = set.pop() {
+///     println!("Released: {}", key);
+/// }
+/// assert!(set.is_empty());
+/// ```
 #[derive(Debug)]
 pub struct ReleasedSet {
     /// The hash table backing storage. Uses open addressing with linear probing.
@@ -36,6 +71,11 @@ impl ReleasedSet {
     /// to ensure the load factor never exceeds 0.5. This low load factor is critical for
     /// minimizing collision chain lengths in linear probing, maintaining high performance
     /// without complex collision resolution strategies.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cap * 2` overflows or if the resulting capacity cannot be
+    /// represented as a power of two.
     pub fn with_capacity(cap: usize) -> Self {
         let slots = released_set_slots(cap);
         Self {
@@ -45,10 +85,12 @@ impl ReleasedSet {
         }
     }
 
+    /// Returns the number of elements in the set.
     pub fn len(&self) -> usize {
         self.stack.len()
     }
 
+    /// Returns `true` if the set contains no elements.
     pub fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
@@ -63,6 +105,10 @@ impl ReleasedSet {
         self.entries.fill(ReleasedEntry::Empty);
     }
 
+    /// Returns `true` if the set contains the specified key.
+    ///
+    /// This operation is O(1) on average, with worst-case O(n) if the table
+    /// has many collisions (unlikely given the 0.5 load factor constraint).
     pub fn contains(&self, key: usize) -> bool {
         let mut idx = (released_set_hash(key) as usize) & self.mask;
 
@@ -112,9 +158,13 @@ impl ReleasedSet {
         panic!("released set probe exhaustion (table unexpectedly full");
     }
 
-    /// Removes and returns an arbitrary element from the set.
+    /// Removes and returns an arbitrary element from the set, or `None` if empty.
     ///
-    /// Uses the internal `stack` to locate an element in O(1).
+    /// The element returned is not guaranteed to follow any particular order;
+    /// internally elements are removed in LIFO order relative to insertion,
+    /// but this should not be relied upon.
+    ///
+    /// Uses the internal stack to locate an element in O(1).
     pub fn pop(&mut self) -> Option<usize> {
         let key = self.stack.pop()?;
         // We must remove from the table as well to keep `contains` consistent.
@@ -211,9 +261,11 @@ fn released_set_slots(limit: usize) -> usize {
 const SPLITMIX64_MUL_1: u64 = 0xbf58476d1ce4e5b9;
 const SPLITMIX64_MUL_2: u64 = 0x94d049bb133111eb;
 
-// Shift amounts tuned with the multipliers for optimal avalanche
+/// First shift amount, tuned with `SPLITMIX64_MUL_1` for optimal avalanche.
 const SHIFT_1: u32 = 30;
+/// Second shift amount, tuned with `SPLITMIX64_MUL_2` for optimal avalanche.
 const SHIFT_2: u32 = 27;
+/// Final shift amount for output mixing.
 const SHIFT_3: u32 = 31;
 
 /// Hashes a key using the SplitMix64 algorithm.
