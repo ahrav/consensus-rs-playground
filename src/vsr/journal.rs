@@ -68,7 +68,8 @@ use super::replica::Replica;
 
 // The read path shares a single IOP pool across commit and repair reads. We reserve
 // a small number of slots for commit-path reads so repair traffic cannot starve
-// client commits. Accounting is enforced in `read_prepare_with_op_and_checksum`.
+// client commits. Accounting is enforced in `read_prepare_with_op_and_checksum`;
+// recovery reads use the same pool without touching commit/repair accounting.
 
 /// Total read IOPs available to the journal.
 ///
@@ -283,7 +284,7 @@ pub type MessagePrepare = Message<PrepareCmd>;
 pub struct ReadOptions {
     /// Operation number of the prepare to read.
     pub op: u64,
-    /// Expected checksum for identity verification.
+    /// Expected checksum for identity verification (unused for recovery reads).
     pub checksum: Checksum128,
     /// `None` for commit-path reads, `Some(replica)` for repair/request_prepare reads.
     pub destination_replica: Option<u8>,
@@ -326,7 +327,8 @@ pub struct Read<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize
     /// Read options passed through to the callback.
     pub options: ReadOptions,
     /// User callback invoked when the read completes (or is bypassed).
-    pub callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
+    /// Recovery reads leave this uninitialized (matching Zig's `undefined`).
+    pub callback: MaybeUninit<ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>>,
 }
 
 /// Callback invoked when `read_prepare` completes.
@@ -745,7 +747,7 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// Recovery-time: header chunks whose reads have completed and data copied.
     pub header_chunks_recovered: HeaderChunks,
 
-    /// Pool of read operation descriptors for prepare reads (commit + repair).
+    /// Pool of read operation descriptors for prepare reads (commit + repair) and recovery reads.
     pub reads: IOPSType<Read<S, WRITE_OPS, WRITE_OPS_WORDS>, READ_OPS, READ_OPS_WORDS>,
 
     /// In-flight reads attributed to the commit path (`destination_replica == None`).
@@ -1319,7 +1321,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// This is the shared primitive used by:
     /// - `read_prepare` (normal path)
     /// - request/repair paths once the checksum is known
-    /// - recovery checks (step 4) that need to validate/repair prepares
+    ///
+    /// Recovery reads use `read_recovery_acquire` to bypass commit/repair accounting.
     ///
     /// The caller must ensure:
     /// - `prepare_inhabited[slot] == true`
@@ -1423,7 +1426,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         unsafe {
             ptr::addr_of_mut!((*read).journal).write(self as *mut _);
             ptr::addr_of_mut!((*read).options).write(options);
-            ptr::addr_of_mut!((*read).callback).write(callback);
+            ptr::addr_of_mut!((*read).callback).write(MaybeUninit::new(callback));
             ptr::addr_of_mut!((*read).message).write(MaybeUninit::new(message));
         }
 
@@ -1460,7 +1463,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let journal = unsafe { &mut *(*read).journal };
         assert!(matches!(journal.status, Status::Recovered));
 
-        let callback = unsafe { (*read).callback };
+        let callback = unsafe { (*read).callback.assume_init() };
         let options = unsafe { (*read).options };
         let mut message = unsafe { ptr::read((*read).message.as_ptr()) };
         let message_ptr: *mut MessagePrepare = &mut message;
@@ -1568,6 +1571,43 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         } else {
             callback(replica_ptr, Some(message_ptr), options);
         }
+    }
+
+    /// Acquire a read descriptor for recovery without commit/repair accounting.
+    ///
+    /// Recovery reads use `options.op` for chunk/slot identity and do not populate
+    /// `options.checksum`.
+    #[allow(dead_code)]
+    fn read_recovery_acquire(
+        &mut self,
+        op: u64,
+    ) -> Option<*mut Read<S, WRITE_OPS, WRITE_OPS_WORDS>> {
+        assert!(matches!(self.status, Status::Recovering { .. }));
+
+        if self.reads.available() == 0 {
+            return None;
+        }
+
+        let replica_ptr = self.replica_ptr();
+        let replica = unsafe { &mut *replica_ptr };
+        let message = replica.message_pool.get::<PrepareCmd>();
+
+        let read = self.reads.acquire()?;
+
+        let options = ReadOptions {
+            op,
+            checksum: 0,
+            destination_replica: None,
+        };
+
+        unsafe {
+            ptr::addr_of_mut!((*read).journal).write(self as *mut _);
+            ptr::addr_of_mut!((*read).options).write(options);
+            ptr::addr_of_mut!((*read).callback).write(MaybeUninit::uninit());
+            ptr::addr_of_mut!((*read).message).write(MaybeUninit::new(message));
+        }
+
+        Some(read)
     }
 
     /// Debug hook for read-path notices; intentionally a no-op in production builds.
