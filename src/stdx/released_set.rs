@@ -162,6 +162,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::collections::HashSet;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     const LIMIT: usize = 16;
     const KEY_MAX: usize = 64;
@@ -229,6 +232,29 @@ mod tests {
         set.insert(1);
         set.insert(2);
         set.insert(3);
+    }
+
+    #[test]
+    fn contains_returns_within_timeout_after_limit_one_sequence() {
+        let mut set = ReleasedSet::with_capacity(1);
+        set.insert(0);
+        assert_eq!(set.pop(), Some(0));
+        set.insert(1);
+        assert_eq!(set.pop(), Some(1));
+        assert!(set.is_empty());
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let result = (set.contains(0), set.contains(1));
+            let _ = tx.send(result);
+        });
+
+        let (has_0, has_1) = rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("contains timed out");
+        assert!(!has_0);
+        assert!(!has_1);
+        handle.join().expect("contains thread panicked");
     }
 
     proptest! {
