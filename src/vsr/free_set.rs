@@ -21,8 +21,9 @@
 //!
 //! To prevent this, released blocks are buffered in
 //! [`FreeSet::blocks_released_prior_checkpoint_durability`] until the current
-//! checkpoint becomes durable on a quorum of replicas. Only then are they moved
-//! to [`FreeSet::blocks_released`] and made available for reuse.
+//! checkpoint becomes durable on a quorum of replicas. At durability, those
+//! blocks move to [`FreeSet::blocks_released`]. They are actually freed (and
+//! become reusable) when the *next* checkpoint is confirmed durable.
 //!
 //! # Reservation Workflow
 //!
@@ -153,8 +154,8 @@ pub struct FreeSet {
     ///
     /// When `false`, released blocks are buffered in
     /// [`blocks_released_prior_checkpoint_durability`]. When this transitions
-    /// to `true`, those blocks are moved to [`blocks_released`] and become
-    /// available for reuse.
+    /// to `true`, those blocks move to [`blocks_released`] and will be freed
+    /// on the next durability transition.
     pub checkpoint_durable: bool,
 
     /// Shard index for fast free-block lookup.
@@ -172,10 +173,10 @@ pub struct FreeSet {
     /// Bitset tracking acquired (in-use) blocks. Set bit = block is acquired.
     pub blocks_acquired: DynamicBitSet,
 
-    /// Bitset of blocks released during the previous (now durable) checkpoint.
+    /// Bitset of blocks released during the previous checkpoint interval.
     ///
-    /// These blocks are safe to reallocate. Updated when checkpoint durability
-    /// is confirmed.
+    /// These blocks are freed (and become reusable) when the next checkpoint
+    /// becomes durable.
     pub blocks_released: DynamicBitSet,
 
     /// Blocks released during the current (not yet durable) checkpoint interval.
@@ -183,7 +184,8 @@ pub struct FreeSet {
     /// These blocks CANNOT be reused yet. If the system crashes before the
     /// checkpoint becomes durable, recovery will restore from the previous
     /// checkpoint which may still reference these blocks. Once checkpoint
-    /// durability is confirmed, these move to [`blocks_released`].
+    /// durability is confirmed, these move to [`blocks_released`] and remain
+    /// acquired until the next durability transition.
     ///
     /// Stores 0-based block indices (not 1-based addresses).
     pub blocks_released_prior_checkpoint_durability: ReleasedSet,
@@ -199,6 +201,28 @@ pub struct FreeSet {
 }
 
 impl FreeSet {
+    /// Creates a new `FreeSet` configured for the specified storage capacity.
+    ///
+    /// Allocates all internal bitsets and indices sized to track blocks up to the
+    /// grid size limit. The block capacity is rounded up to the nearest shard
+    /// boundary ([`SHARD_BITS`]) for efficient index operations.
+    ///
+    /// The returned `FreeSet` is in an uninitialized state (`opened = false`) and
+    /// must be opened before use. See module-level documentation for the full
+    /// lifecycle.
+    ///
+    /// # Parameters
+    ///
+    /// * `options.grid_size_limit` - Maximum addressable storage in bytes. Determines
+    ///   the number of blocks tracked (`grid_size_limit / BLOCK_SIZE`).
+    /// * `options.blocks_released_prior_checkpoint_durability_max` - Upper bound on
+    ///   blocks that may be released during a single checkpoint interval. Additional
+    ///   capacity is added for EWAH-compressed trailer blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the capacity calculation for `blocks_released_prior_checkpoint_durability`
+    /// overflows.
     pub fn init(options: InitOptions) -> Self {
         let blocks_count = Self::block_count_max(options.grid_size_limit);
         assert!(blocks_count.is_multiple_of(SHARD_BITS));
@@ -243,6 +267,184 @@ impl FreeSet {
             reservation_state: ReservationState::Reserving,
             reservation_session: 0,
         }
+    }
+
+    /// Marks a block as released, scheduling it for deallocation.
+    ///
+    /// Released blocks remain in [`blocks_acquired`](Self::blocks_acquired) until the
+    /// current checkpoint becomes durable. This prevents premature reuse that could
+    /// cause data corruption on crash recovery. See module-level documentation for
+    /// the checkpoint durability workflow.
+    ///
+    /// # Parameters
+    ///
+    /// * `address` - The 1-based block address to release. Block addresses are 1-indexed
+    ///   so that address 0 can serve as a sentinel/null value.
+    ///
+    /// # Checkpoint Behavior
+    ///
+    /// * If `checkpoint_durable` is `true`: The block is added directly to
+    ///   [`blocks_released`](Self::blocks_released) for immediate deallocation on the
+    ///   next durable checkpoint.
+    /// * If `checkpoint_durable` is `false`: The block is buffered in
+    ///   [`blocks_released_prior_checkpoint_durability`](Self::blocks_released_prior_checkpoint_durability)
+    ///   until the checkpoint becomes durable.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The free set is not opened
+    /// * `address` is 0
+    /// * The block is not currently acquired
+    /// * The block is already marked as released
+    pub fn release(&mut self, address: u64) {
+        assert!(self.opened);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(!self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+
+        if self.checkpoint_durable {
+            self.blocks_released.set(block);
+        } else {
+            self.blocks_released_prior_checkpoint_durability
+                .insert(block as u64);
+        }
+    }
+
+    /// Deallocates a block, making it available for future acquisition.
+    ///
+    /// This is an internal method called by [`mark_checkpoint_durable`](Self::mark_checkpoint_durable)
+    /// to complete the deallocation of blocks that were previously released via
+    /// [`release`](Self::release). Unlike `release`, which only *schedules* deallocation,
+    /// `free` actually clears the block from both [`blocks_acquired`](Self::blocks_acquired)
+    /// and [`blocks_released`](Self::blocks_released), and updates the shard index to
+    /// indicate that the shard may now have free blocks.
+    ///
+    /// # Parameters
+    ///
+    /// * `address` - The 1-based block address to free.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The free set is not opened
+    /// * The checkpoint is not durable (blocks can only be freed after durability is confirmed)
+    /// * `address` is 0
+    /// * The block is not currently acquired
+    /// * The block is not marked as released (must call `release` before `free`)
+    /// * The block is in the pre-durability buffer (indicates state machine error)
+    /// * There are active reservations (freeing during reservation could cause races)
+    fn free(&mut self, address: u64) {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        let shard = block / SHARD_BITS;
+        self.index.unset(shard);
+
+        self.blocks_acquired.unset(block);
+        self.blocks_released.unset(block);
+    }
+
+    /// Transitions the checkpoint state from durable to not-durable.
+    ///
+    /// Called when starting a new checkpoint. After this call, any blocks released
+    /// via [`release`](Self::release) will be buffered in
+    /// [`blocks_released_prior_checkpoint_durability`](Self::blocks_released_prior_checkpoint_durability)
+    /// rather than added directly to [`blocks_released`](Self::blocks_released).
+    ///
+    /// This ensures crash safety: if the system fails before the new checkpoint
+    /// becomes durable, recovery will use the previous checkpoint, which may still
+    /// reference blocks released during the failed checkpoint interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The free set is not opened
+    /// * The checkpoint is already not-durable (double transition)
+    /// * The pre-durability buffer is not empty (previous checkpoint's releases not yet processed)
+    pub fn mark_checkpoint_not_durable(&mut self) {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        self.checkpoint_durable = false;
+    }
+
+    /// Transitions the checkpoint state from not-durable to durable.
+    ///
+    /// Called when a checkpoint has been confirmed durable on a quorum of replicas.
+    /// This method performs two critical operations:
+    ///
+    /// 1. **Free previously released blocks**: Iterates through all blocks in
+    ///    [`blocks_released`](Self::blocks_released) and calls [`free`](Self::free)
+    ///    on each, making them available for reallocation. Uses word-level iteration
+    ///    with `trailing_zeros` for efficient scanning.
+    ///
+    /// 2. **Promote buffered releases**: Moves all blocks from
+    ///    [`blocks_released_prior_checkpoint_durability`](Self::blocks_released_prior_checkpoint_durability)
+    ///    to [`blocks_released`](Self::blocks_released). These blocks were released
+    ///    during the now-durable checkpoint interval and will be freed on the *next*
+    ///    durability confirmation.
+    ///
+    /// # Crash Safety
+    ///
+    /// This two-phase approach ensures blocks are never reused until their release
+    /// is persisted across a quorum. If the system crashes before durability is
+    /// confirmed, recovery restores from the previous checkpoint, which may still
+    /// reference the "released" blocks.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The free set is not opened
+    /// * The checkpoint is already durable (double transition)
+    pub fn mark_checkpoint_durable(&mut self) {
+        assert!(self.opened);
+        assert!(!self.checkpoint_durable);
+
+        self.checkpoint_durable = true;
+
+        let released_word_len = self.blocks_released.word_len();
+        assert!(self.blocks_released.bit_length().is_multiple_of(64));
+
+        for wi in 0..released_word_len {
+            let mut word = self.blocks_released.words()[wi];
+            while word != 0 {
+                let tz = word.trailing_zeros() as usize;
+                let block = wi * 64 + tz;
+                debug_assert!(block < self.blocks_count());
+                self.free((block as u64) + 1);
+                word &= word - 1;
+            }
+        }
+
+        assert_eq!(self.blocks_released.count(), 0);
+
+        while let Some(block) = self.blocks_released_prior_checkpoint_durability.pop() {
+            self.blocks_released.set(block as usize);
+        }
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        self.verify_index();
     }
 
     /// Asserts that the shard index is consistent with the block-level bitset.
@@ -313,8 +515,27 @@ impl FreeSet {
         self.index.bit_length()
     }
 
-    /// Maximum number of blocks (bits) to represent for `grid_size_limit`,
-    /// rounded up to a shard multiple.
+    /// Calculates the block capacity for a given storage size limit.
+    ///
+    /// Computes the number of blocks needed to cover `grid_size_limit` bytes,
+    /// then rounds up to the nearest shard boundary ([`SHARD_BITS`]). This
+    /// ensures the internal bitsets align with shard boundaries for efficient
+    /// index operations.
+    ///
+    /// # Parameters
+    ///
+    /// * `grid_size_limit` - Maximum addressable storage in bytes.
+    ///
+    /// # Returns
+    ///
+    /// The number of blocks (bits) to allocate, guaranteed to be a multiple of
+    /// [`SHARD_BITS`].
+    ///
+    /// # Example
+    ///
+    /// With `BLOCK_SIZE = 512 KiB` and `SHARD_BITS = 4096`:
+    /// - 1 GiB storage = 2048 blocks -> rounds to 4096 blocks (1 shard)
+    /// - 10 GiB storage = 20480 blocks -> rounds to 20480 blocks (5 shards)
     pub fn block_count_max(grid_size_limit: usize) -> usize {
         let block_count_limit = (grid_size_limit as u64 / BLOCK_SIZE) as usize;
         block_count_limit.div_ceil(SHARD_BITS) * SHARD_BITS
