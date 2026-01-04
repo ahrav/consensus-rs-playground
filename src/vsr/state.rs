@@ -953,7 +953,7 @@ fn client_sessions_encode_size() -> u64 {
 /// `checkpoint + LSM_COMPACTION_OPS`, and checkpoints are only valid on bars.
 /// Returns `None` for checkpoint 0 (the root checkpoint has no trigger).
 #[inline]
-fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
+pub fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
     let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
     assert!(lsm_compaction_ops > 0);
 
@@ -982,7 +982,7 @@ fn trigger_for_checkpoint(checkpoint: u64) -> Option<u64> {
 /// Checkpoints are only valid at compaction bar boundaries, and the next
 /// checkpoint is `VSR_CHECKPOINT_OPS` ops later.
 #[inline]
-fn checkpoint_after(checkpoint: u64) -> u64 {
+pub fn checkpoint_after(checkpoint: u64) -> u64 {
     let lsm_compaction_ops = constants::LSM_COMPACTION_OPS;
     assert!(lsm_compaction_ops > 0);
 
@@ -1008,6 +1008,32 @@ fn checkpoint_after(checkpoint: u64) -> u64 {
 
     assert!((result + 1).is_multiple_of(lsm_compaction_ops));
     result
+}
+
+/// Returns the maximum prepare op allowed for a checkpoint.
+#[inline]
+pub fn prepare_max_for_checkpoint(checkpoint: u64) -> Option<u64> {
+    trigger_for_checkpoint(checkpoint).map(|trigger| {
+        let extra = (2u64)
+            .checked_mul(constants::PIPELINE_PREPARE_QUEUE_MAX as u64)
+            .expect("prepare_max_for_checkpoint overflow");
+        trigger
+            .checked_add(extra)
+            .expect("prepare_max_for_checkpoint overflow")
+    })
+}
+
+/// Returns true if `commit` is durable for `checkpoint`.
+#[inline]
+pub fn durable(checkpoint: u64, commit: u64) -> bool {
+    if let Some(trigger) = trigger_for_checkpoint(checkpoint) {
+        let threshold = trigger
+            .checked_add(constants::PIPELINE_PREPARE_QUEUE_MAX as u64)
+            .expect("durable checkpoint threshold overflow");
+        commit > threshold
+    } else {
+        true
+    }
 }
 
 #[cfg(test)]
