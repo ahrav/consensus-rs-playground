@@ -49,7 +49,7 @@ use crate::{
     stdx::BitSet,
     util::{utils::AlignedSlice, zero},
     vsr::{
-        Checksum128, Command, Header, HeaderPrepare, Operation,
+        Checksum128, Command, Header, HeaderPrepare, HeaderPrepareRaw, Operation,
         command::PrepareCmd,
         iops::IOPSType,
         journal_primitives::{
@@ -767,6 +767,11 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// is flushed, allowing recovery to detect and repair inconsistencies.
     pub headers_redundant: AlignedSlice<HeaderPrepare>,
 
+    /// Recovery-time raw redundant headers loaded from disk.
+    ///
+    /// TODO: Centralize raw/typed redundant headers into a single representation.
+    pub headers_redundant_raw: AlignedSlice<HeaderPrepareRaw>,
+
     /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
 
@@ -841,6 +846,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let headers_redundant = unsafe {
             AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
+        let headers_redundant_raw = unsafe {
+            AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+        };
         let write_headers_sectors = unsafe {
             AlignedSlice::<[u8; constants::SECTOR_SIZE]>::new_zeroed_aligned(
                 constants::JOURNAL_IOPS_WRITE_MAX as usize,
@@ -859,6 +867,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             replica,
             headers,
             headers_redundant,
+            headers_redundant_raw,
             write_headers_sectors,
             header_chunks_requested: HeaderChunks::empty(),
             header_chunks_recovered: HeaderChunks::empty(),
@@ -884,12 +893,23 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 0,
                 SLOT_COUNT * size_of::<HeaderPrepare>(),
             );
+            ptr::write_bytes(
+                journal.headers_redundant_raw.as_mut_ptr() as *mut u8,
+                0,
+                SLOT_COUNT * size_of::<HeaderPrepareRaw>(),
+            );
         }
 
         assert!(journal.headers.iter().all(|h| !h.valid_checksum()));
         assert!(
             journal
                 .headers_redundant
+                .iter()
+                .all(|h| !h.valid_checksum())
+        );
+        assert!(
+            journal
+                .headers_redundant_raw
                 .iter()
                 .all(|h| !h.valid_checksum())
         );
@@ -1155,12 +1175,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         }
     }
 
-    /// Reinterprets a byte slice as a slice of headers.
+    /// Reinterprets a byte slice as a slice of raw headers.
     ///
     /// # Safety
     ///
     /// This is safe because:
-    /// - `HeaderPrepare` is `#[repr(C)]` with fixed `WAL_HEADER_SIZE` layout
+    /// - `HeaderPrepareRaw` is `#[repr(C)]` with fixed `WAL_HEADER_SIZE` layout
     /// - Alignment is verified at runtime before the cast
     /// - Returned slice lifetime is tied to input slice
     ///
@@ -1170,20 +1190,20 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - `chunk_bytes.len()` is not a positive multiple of `WAL_HEADER_SIZE`
     /// - `chunk_bytes` is not properly aligned for `HeaderPrepare`
     #[inline]
-    pub fn header_chunk_bytes_as_headers(chunk_bytes: &[u8]) -> &[HeaderPrepare] {
+    pub fn header_chunk_bytes_as_headers(chunk_bytes: &[u8]) -> &[HeaderPrepareRaw] {
         assert!(chunk_bytes.len() >= WAL_HEADER_SIZE);
         assert!(chunk_bytes.len().is_multiple_of(WAL_HEADER_SIZE));
 
-        // HeaderPrepare requires specific alignment (typically 16-byte).
-        const REQUIRED_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
+        // HeaderPrepareRaw requires specific alignment (typically 16-byte).
+        const REQUIRED_ALIGN: usize = core::mem::align_of::<HeaderPrepareRaw>();
         assert!(
             (chunk_bytes.as_ptr() as usize).is_multiple_of(REQUIRED_ALIGN),
-            "chunk_bytes must be {}-byte aligned for HeaderPrepare",
+            "chunk_bytes must be {}-byte aligned for HeaderPrepareRaw",
             REQUIRED_ALIGN
         );
 
         let count = chunk_bytes.len() / WAL_HEADER_SIZE;
-        let headers = chunk_bytes.as_ptr() as *const HeaderPrepare;
+        let headers = chunk_bytes.as_ptr() as *const HeaderPrepareRaw;
         // SAFETY: Length and alignment are verified by assertions above.
         unsafe { std::slice::from_raw_parts(headers, count) }
     }
@@ -1496,14 +1516,19 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             return;
         }
 
-        // Validate header identity and message integrity.
-        let header = message.header();
+        // Validate header identity and message integrity using a raw header view.
+        let header_raw = unsafe { &*(message.buffer_ptr() as *const HeaderPrepareRaw) };
         let expected_cluster = replica.cluster;
 
         let error_reason: Option<&'static str> = (|| {
-            if !header.valid_checksum() {
+            if !header_raw.valid_checksum() {
                 return Some("corrupt header after read");
             }
+
+            let header = match header_raw.as_typed() {
+                Some(header) => header,
+                None => return Some("invalid command byte"),
+            };
 
             if let Some(reason) = header.invalid() {
                 return Some(reason);

@@ -6,8 +6,8 @@ use crate::vsr::superblock;
 use core::cell::RefCell;
 use std::collections::HashMap;
 
-/// Alignment required for `HeaderPrepare` (16 bytes).
-const HEADER_ALIGN: usize = core::mem::align_of::<HeaderPrepare>();
+/// Alignment required for `HeaderPrepareRaw` (16 bytes).
+const HEADER_ALIGN: usize = core::mem::align_of::<HeaderPrepareRaw>();
 
 // =========================================================================
 // Test Infrastructure: MockStorage
@@ -677,7 +677,7 @@ fn bytes_as_headers_panics_on_misaligned_input() {
     let buffer = vec![0u8; size];
 
     // Find a misaligned slice within the buffer
-    let align = core::mem::align_of::<HeaderPrepare>();
+    let align = core::mem::align_of::<HeaderPrepareRaw>();
     let base_addr = buffer.as_ptr() as usize;
     let offset = if base_addr.is_multiple_of(align) {
         1
@@ -3151,6 +3151,11 @@ fn journal_new_initializes_all_fields_correctly() {
         "headers_redundant should have SLOT_COUNT entries"
     );
     assert_eq!(
+        journal.headers_redundant_raw.len(),
+        SLOT_COUNT,
+        "headers_redundant_raw should have SLOT_COUNT entries"
+    );
+    assert_eq!(
         journal.write_headers_sectors.len(),
         constants::JOURNAL_IOPS_WRITE_MAX as usize,
         "write_headers_sectors should have JOURNAL_IOPS_WRITE_MAX entries"
@@ -3190,6 +3195,13 @@ fn journal_new_headers_have_invalid_checksums() {
             .iter()
             .all(|h| !h.valid_checksum()),
         "all redundant headers should have invalid checksums after initialization"
+    );
+    assert!(
+        journal
+            .headers_redundant_raw
+            .iter()
+            .all(|h| !h.valid_checksum()),
+        "all raw redundant headers should have invalid checksums after initialization"
     );
 }
 
