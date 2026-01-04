@@ -62,15 +62,19 @@ pub struct ReleasedSet {
     stack: Vec<usize>,
     /// Bitmask for fast modulo operations (size - 1).
     mask: usize,
+    /// Maximum number of elements allowed in the set.
+    limit: usize,
 }
 
 impl ReleasedSet {
-    /// Creates a new set capable of holding *at least* `cap` elements without resizing.
+    /// Creates a new set capable of holding *up to* `cap` elements without resizing.
     ///
     /// The underlying hash table will be sized to `2 * cap` (rounded up to the next power of two)
     /// to ensure the load factor never exceeds 0.5. This low load factor is critical for
     /// minimizing collision chain lengths in linear probing, maintaining high performance
     /// without complex collision resolution strategies.
+    ///
+    /// The `cap` is a strict maximum: inserting more than `cap` distinct elements will panic.
     ///
     /// # Panics
     ///
@@ -82,6 +86,7 @@ impl ReleasedSet {
             entries: vec![ReleasedEntry::Empty; slots],
             stack: Vec::with_capacity(cap),
             mask: slots - 1,
+            limit: cap,
         }
     }
 
@@ -139,10 +144,9 @@ impl ReleasedSet {
         for _ in 0..self.entries.len() {
             match self.entries[idx] {
                 ReleasedEntry::Empty => {
-                    // Enforce a max load factor of 0.5.
-                    // This keeps probe chains short, which is essential for the performance
-                    // of linear probing.
-                    if self.stack.len() >= (self.entries.len() >> 1) {
+                    // Enforce a strict element cap; released_set_slots guarantees that
+                    // limit <= entries.len() / 2, preserving the <= 0.5 load factor invariant.
+                    if self.stack.len() >= self.limit {
                         panic!("released set capacity exceeded");
                     }
                     self.entries[idx] = ReleasedEntry::Occupied(key);
@@ -358,6 +362,16 @@ mod tests {
         set.insert(1);
         set.insert(2);
         set.insert(3);
+    }
+
+    #[test]
+    #[should_panic(expected = "released set capacity exceeded")]
+    fn insert_panics_on_overflow_with_rounded_capacity() {
+        let mut set = ReleasedSet::with_capacity(3);
+        set.insert(1);
+        set.insert(2);
+        set.insert(3);
+        set.insert(4);
     }
 
     #[test]
