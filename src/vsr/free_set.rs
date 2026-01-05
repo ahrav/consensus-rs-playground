@@ -111,6 +111,12 @@ pub enum BitKind {
     Unset,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitsetKind {
+    BlocksAcquired,
+    BlocksReleased,
+}
+
 /// State machine for the block reservation workflow.
 ///
 /// See the module-level documentation for the full reservation lifecycle.
@@ -641,6 +647,20 @@ impl FreeSet {
         )
     }
 
+    fn encode(&self, bitset_kind: BitsetKind, target_chunks: &mut [&mut [u8]]) -> usize {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert_words_aligned_chunks_mut(target_chunks);
+
+        let word_count = self.blocks_word_count();
+
+        let source_words: &[Word] = match bitset_kind {
+            BitsetKind::BlocksAcquired => self.blocks_acquired.words(),
+            BitsetKind::BlocksReleased => self.blocks_released.words(),
+        };
+        assert_eq!(source_words.len(), word_count);
+    }
+
     /// Returns the total number of blocks tracked by the free set.
     ///
     /// This is the capacity of the block-level bitsets, rounded up to the nearest
@@ -658,6 +678,12 @@ impl FreeSet {
     #[inline]
     fn shards_count(&self) -> usize {
         self.index.bit_length()
+    }
+
+    #[inline]
+    fn blocks_word_count(&self) -> usize {
+        assert!(self.blocks_count().is_multiple_of(64));
+        self.blocks_count() / 64
     }
 
     /// Calculates the block capacity for a given storage size limit.
@@ -684,6 +710,22 @@ impl FreeSet {
     pub fn block_count_max(grid_size_limit: usize) -> usize {
         let block_count_limit = (grid_size_limit as u64 / BLOCK_SIZE) as usize;
         block_count_limit.div_ceil(SHARD_BITS) * SHARD_BITS
+    }
+}
+
+fn assert_words_aligned_chunks(chunks: &[&[u8]]) {
+    for chunk in chunks {
+        let (prefix, _, suffix) = unsafe { chunk.align_to::<Word>() };
+        assert!(!prefix.is_empty());
+        assert!(suffix.is_empty());
+    }
+}
+
+fn assert_words_aligned_chunks_mut(chunks: &mut [&mut [u8]]) {
+    for chunk in chunks.iter_mut() {
+        let (prefix, _, suffix) = unsafe { (*chunk).align_to_mut::<Word>() };
+        assert!(!prefix.is_empty());
+        assert!(suffix.is_empty());
     }
 }
 
