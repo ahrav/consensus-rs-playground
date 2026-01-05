@@ -162,6 +162,13 @@ pub struct InitOptions {
     pub blocks_released_prior_checkpoint_durability_max: usize,
 }
 
+/// Sizes returned by [`FreeSet::encode_chunks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedSizes {
+    pub encoded_size_blocks_acquired: u64,
+    pub encoded_size_blocks_released: u64,
+}
+
 /// Tracks free and allocated blocks in the VSR storage grid.
 ///
 /// See the module-level documentation for checkpoint durability semantics
@@ -291,6 +298,30 @@ impl FreeSet {
             reservation_count: 0,
             reservation_state: ReservationState::Reserving,
             reservation_session: 0,
+        }
+    }
+
+    /// Encodes both bitsets into the provided trailer chunks.
+    ///
+    /// Chunks must be `Word`-aligned and large enough for the EWAH output.
+    /// Returns the exact number of bytes to persist for each bitset (trailing zero runs omitted).
+    pub fn encode_chunks(
+        &self,
+        target_chunks_blocks_acquired: &mut [&mut [u8]],
+        target_chunks_blocks_released: &mut [&mut [u8]],
+    ) -> EncodedSizes {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        EncodedSizes {
+            encoded_size_blocks_acquired: self
+                .encode(BitsetKind::BlocksAcquired, target_chunks_blocks_acquired)
+                as u64,
+            encoded_size_blocks_released: self
+                .encode(BitsetKind::BlocksReleased, target_chunks_blocks_released)
+                as u64,
         }
     }
 
@@ -647,6 +678,10 @@ impl FreeSet {
         )
     }
 
+    /// EWAH-encodes the selected bitset into `target_chunks`.
+    ///
+    /// Streams output across the chunk slices until completion. The returned size excludes
+    /// trailing zero runs so the encoding is stable regardless of the configured storage limit.
     fn encode(&self, bitset_kind: BitsetKind, target_chunks: &mut [&mut [u8]]) -> usize {
         assert!(self.opened);
         assert!(self.checkpoint_durable);
@@ -659,6 +694,32 @@ impl FreeSet {
             BitsetKind::BlocksReleased => self.blocks_released.words(),
         };
         assert_eq!(source_words.len(), word_count);
+
+        let mut encoder = Ewah::<Word>::encode_chunk(source_words);
+
+        let mut bytes_encode_total: usize = 0;
+        let mut done = false;
+
+        for chunk in target_chunks.iter_mut() {
+            // Stream the EWAH output across chunk buffers until the encoder finishes.
+            let bytes_encoded = encoder.encode_chunk(chunk);
+            // The encoder must always make forward progress while data remains.
+            assert!(bytes_encoded > 0);
+            bytes_encode_total += bytes_encoded;
+
+            if encoder.done() {
+                done = true;
+                break;
+            }
+        }
+
+        // Caller must provide enough chunk space to hold the full encoding.
+        assert!(done);
+
+        // Drop trailing zero runs so output is independent of the grid size limit.
+        let bytes_trailing_zero_runs =
+            encoder.trailing_zero_runs_count * core::mem::size_of::<Word>();
+        bytes_encode_total - bytes_trailing_zero_runs
     }
 
     /// Returns the total number of blocks tracked by the free set.
@@ -680,6 +741,7 @@ impl FreeSet {
         self.index.bit_length()
     }
 
+    /// Returns the number of 64-bit words backing the block bitsets.
     #[inline]
     fn blocks_word_count(&self) -> usize {
         assert!(self.blocks_count().is_multiple_of(64));
@@ -713,19 +775,23 @@ impl FreeSet {
     }
 }
 
+/// Ensures each chunk is `Word`-aligned and sized to whole words for EWAH I/O.
 fn assert_words_aligned_chunks(chunks: &[&[u8]]) {
     for chunk in chunks {
+        // SAFETY: We only inspect the alignment split, no elements are reinterpreted.
         let (prefix, _, suffix) = unsafe { chunk.align_to::<Word>() };
-        assert!(!prefix.is_empty());
-        assert!(suffix.is_empty());
+        assert!(prefix.is_empty(), "source chunk not word-aligned");
+        assert!(suffix.is_empty(), "source chunk length not word-aligned");
     }
 }
 
+/// Ensures each mutable chunk is `Word`-aligned and sized to whole words for EWAH I/O.
 fn assert_words_aligned_chunks_mut(chunks: &mut [&mut [u8]]) {
     for chunk in chunks.iter_mut() {
+        // SAFETY: We only inspect the alignment split, no elements are reinterpreted.
         let (prefix, _, suffix) = unsafe { (*chunk).align_to_mut::<Word>() };
-        assert!(!prefix.is_empty());
-        assert!(suffix.is_empty());
+        assert!(prefix.is_empty(), "target chunk not word-aligned");
+        assert!(suffix.is_empty(), "target chunk length not word-aligned");
     }
 }
 
