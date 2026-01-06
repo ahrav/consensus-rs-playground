@@ -301,6 +301,39 @@ impl FreeSet {
         }
     }
 
+    /// Decodes EWAH-compressed bitset chunks into the free set.
+    ///
+    /// The free set must be unopened and empty. After decoding, the shard index
+    /// is rebuilt by scanning for fully-allocated shards. Panics if the encoding
+    /// is invalid or chunk alignment is incorrect.
+    pub fn decode_chunks(
+        &mut self,
+        encoded_blocks_acquired: &[&[u8]],
+        encoded_blocks_released: &[&[u8]],
+    ) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        assert_eq!(self.index.count(), 0);
+        assert_eq!(self.blocks_acquired.count(), 0);
+        assert_eq!(self.blocks_released.count(), 0);
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        self.decode(BitsetKind::BlocksAcquired, encoded_blocks_acquired);
+        self.decode(BitsetKind::BlocksReleased, encoded_blocks_released);
+
+        for shard in 0..self.shards_count() {
+            if self.find_free_block_in_shard(shard).is_none() {
+                self.index.set(shard);
+            }
+        }
+
+        self.verify_index();
+    }
+
     /// Encodes both bitsets into the provided trailer chunks.
     ///
     /// Chunks must be `Word`-aligned and large enough for the EWAH output.
@@ -676,6 +709,40 @@ impl FreeSet {
             shard_end,
             BitKind::Unset,
         )
+    }
+
+    /// Decodes compressed bitset chunks into the selected bitset.
+    ///
+    /// Panics if the encoding is invalid. The decoder does not emit trailing
+    /// zero runs, so any words beyond the decoded range must remain zero.
+    fn decode(&mut self, bitset_kind: BitsetKind, source_chunks: &[&[u8]]) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+        assert_words_aligned_chunks(source_chunks);
+
+        let word_count = self.blocks_word_count();
+        let blocks_count = self.blocks_count();
+
+        let target_words: &mut [Word] = match bitset_kind {
+            BitsetKind::BlocksAcquired => unsafe { self.blocks_acquired.words_mut() },
+            BitsetKind::BlocksReleased => unsafe { self.blocks_released.words_mut() },
+        };
+        assert_eq!(target_words.len(), word_count);
+
+        let source_size = source_chunks.iter().map(|c| c.len()).sum();
+
+        let mut decoder = Ewah::<Word>::decode_chunks(target_words, source_size);
+        let mut words_decoded = 0;
+        for &chunk in source_chunks {
+            words_decoded += decoder.decode_chunk(chunk);
+        }
+        assert!(decoder.done());
+
+        assert!(words_decoded * 64 <= blocks_count);
+
+        for &w in &target_words[words_decoded..] {
+            assert_eq!(w, 0);
+        }
     }
 
     /// EWAH-encodes the selected bitset into `target_chunks`.
