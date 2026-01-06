@@ -1151,6 +1151,8 @@ mod tests {
     use proptest::prelude::*;
     use std::mem::size_of;
 
+    /// Reference implementation of [`find_bit`] using linear scan.
+    /// Used to verify the optimized word-based implementation.
     fn expected_find_bit(
         bit_set: &DynamicBitSet,
         bit_min: usize,
@@ -1160,6 +1162,7 @@ mod tests {
         (bit_min..bit_max).find(|&idx| bit_set.is_set(idx) == (bit_kind == BitKind::Set))
     }
 
+    /// Empty ranges should return `None` regardless of bitset contents.
     #[test]
     fn find_bit_handles_empty_range() {
         let mut bits = DynamicBitSet::empty(8);
@@ -1168,13 +1171,17 @@ mod tests {
         assert_eq!(find_bit(&bits, 4, 4, BitKind::Unset), None);
     }
 
+    /// Tests masking logic at word boundaries (bits 63/64) and partial final words.
+    /// The implementation must correctly mask bits outside the search range when
+    /// `bit_min` or `bit_max` don't align to word boundaries.
     #[test]
     fn find_bit_respects_word_boundaries() {
+        // 130 bits spans 3 words: [0-63], [64-127], [128-129]
         let mut bits = DynamicBitSet::empty(130);
-        bits.set(1);
-        bits.set(63);
-        bits.set(64);
-        bits.set(129);
+        bits.set(1); // First word
+        bits.set(63); // Last bit of first word
+        bits.set(64); // First bit of second word
+        bits.set(129); // Partial third word
 
         assert_eq!(find_bit(&bits, 0, 64, BitKind::Set), Some(1));
         assert_eq!(find_bit(&bits, 2, 64, BitKind::Set), Some(63));
@@ -1182,11 +1189,16 @@ mod tests {
         assert_eq!(find_bit(&bits, 128, 130, BitKind::Set), Some(129));
 
         assert_eq!(find_bit(&bits, 0, 2, BitKind::Unset), Some(0));
+        // Range [63, 65) contains bits 63 and 64, both set - no unset bits
         assert_eq!(find_bit(&bits, 63, 65, BitKind::Unset), None);
     }
 
     proptest! {
         #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+        /// Verifies [`find_bit`] matches the reference linear scan for arbitrary
+        /// bitset patterns and search ranges. Catches off-by-one errors and
+        /// incorrect word masking that unit tests might miss.
         #[test]
         fn prop_find_bit_matches_linear_scan(
             (bit_length, set_bits, range, bit_kind) in (1usize..=256).prop_flat_map(|len| {
@@ -1217,6 +1229,12 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Test Helpers
+    // -------------------------------------------------------------------------
+
+    /// Creates an uninitialized [`FreeSet`] with the given block capacity.
+    /// The set is not opened and cannot be used for acquire/release operations.
     fn init_free_set(blocks_count: usize) -> FreeSet {
         assert!(blocks_count.is_multiple_of(SHARD_BITS));
         let grid_size_limit = (blocks_count as u64) * super::BLOCK_SIZE;
@@ -1228,6 +1246,8 @@ mod tests {
         })
     }
 
+    /// Creates an opened [`FreeSet`] with all blocks free and checkpoint marked durable.
+    /// Ready for immediate reserve/acquire/release operations.
     fn open_empty_free_set(blocks_count: usize) -> FreeSet {
         let mut set = init_free_set(blocks_count);
         set.open(&[], &[], &[], &[]);
@@ -1235,16 +1255,20 @@ mod tests {
         set
     }
 
+    /// Returns the maximum EWAH-encoded size in bytes for a bitset with `blocks_count` bits.
     fn encode_size_max_bytes(blocks_count: usize) -> usize {
         let word_count = blocks_count / 64;
         Ewah::<Word>::encode_size_max(word_count)
     }
 
+    /// Reinterprets a word slice as bytes for EWAH encoding/decoding.
+    /// Safe because `Word` has no padding and any bit pattern is valid.
     fn words_as_bytes(words: &[Word]) -> &[u8] {
         let byte_len = std::mem::size_of_val(words);
         unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) }
     }
 
+    /// Mutable variant of [`words_as_bytes`].
     fn words_as_bytes_mut(words: &mut [Word]) -> &mut [u8] {
         let byte_len = std::mem::size_of_val(words);
         unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, byte_len) }
@@ -1256,6 +1280,7 @@ mod tests {
         assert_eq!(a.words(), b.words());
     }
 
+    /// Compares two free sets for logical equality of their persistent state.
     fn assert_free_set_eq(a: &FreeSet, b: &FreeSet) {
         assert_bitset_eq(&a.blocks_acquired, &b.blocks_acquired);
         assert_bitset_eq(&a.blocks_released, &b.blocks_released);
@@ -1266,6 +1291,13 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // FreeSet Tests
+    // -------------------------------------------------------------------------
+
+    /// Verifies `highest_address_acquired` correctly tracks the maximum as blocks
+    /// are acquired and freed in various orders. Critical for determining storage
+    /// bounds during checkpointing.
     #[test]
     fn highest_address_acquired_tracks_maximum_after_acquire_and_free() {
         let blocks_count = SHARD_BITS;
@@ -1311,8 +1343,13 @@ mod tests {
         }
     }
 
+    /// Verifies that acquiring all blocks then releasing them returns the free set
+    /// to its initial empty state. Tests at shard boundary sizes (1, 2, 63, 64, 65)
+    /// to catch off-by-one errors in shard index maintenance.
     #[test]
     fn acquire_all_blocks_then_release_restores_initial_state() {
+        // Test at shard boundaries: 63/64/65 shards exercise word-boundary edge cases
+        // in the shard index (which is itself a bitset).
         for blocks_count in [
             SHARD_BITS,
             2 * SHARD_BITS,
@@ -1357,13 +1394,25 @@ mod tests {
         }
     }
 
+    /// Verifies that `acquire` only allocates blocks within its own reservation's
+    /// range, even when earlier reservations contain free blocks.
+    ///
+    /// Reservations form contiguous, non-overlapping ranges. When reservation A
+    /// claims range [0, 1) and reservation B claims [1, 8193), acquiring from B
+    /// must not "steal" block 0 from A's range - determinism requires each
+    /// reservation to allocate only within its bounds.
     #[test]
     fn acquire_respects_existing_reservations_across_shards() {
         let mut set = open_empty_free_set(SHARD_BITS * 3);
 
+        // Reservation A: 1 block -> range [0, 1)
+        // Reservation B: 8192 blocks -> range [1, 8193), spans shards 0-2
         let reservation_a = set.reserve(1).unwrap();
         let reservation_b = set.reserve(2 * SHARD_BITS).unwrap();
 
+        // Each acquire from B should return blocks starting at index 1 (address 2),
+        // skipping block 0 which belongs to A's range.
+        // Formula: address - 1 = block_index = reservation_a.block_count + i = 1 + i
         for i in 0..reservation_b.block_count {
             let address = set.acquire(reservation_b).unwrap();
             assert_eq!(address - 1, reservation_a.block_count as u64 + i as u64);
@@ -1375,16 +1424,32 @@ mod tests {
         set.forfeit(reservation_a);
     }
 
+    // -------------------------------------------------------------------------
+    // EWAH Encode/Decode Tests
+    // -------------------------------------------------------------------------
+
+    /// Tests EWAH roundtrip with a hand-crafted pattern that exercises:
+    /// - Zero runs (compressed as run-length)
+    /// - Literal words (stored verbatim)
+    /// - One runs (compressed as run-length)
+    ///
+    /// The encoded format uses marker words where low bit indicates literal (1)
+    /// or run (0), and remaining bits encode counts.
     #[test]
     fn encode_decode_roundtrip_preserves_bitset_patterns() {
+        // EWAH marker format: [zero_run_count:31 | literal_count:31 | is_ones_run:1]
+        // Word 0: 2 zero-words, then 3 literal words follow
+        // Words 1-3: literal data (alternating bit patterns)
+        // Word 4: 1 one-run marker, followed by (64-5) = 59 all-ones words
         let encoded_expect_words: [Word; 5] = [
-            (2u64 << 1) | (3u64 << 32),
+            (2u64 << 1) | (3u64 << 32), // marker: 2 zeros, 3 literals
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
             0b01010101_01010101_01010101_01010101_01010101_01010101_01010101_01010101u64,
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
-            1u64 | ((64u64 - 5) << 1),
+            1u64 | ((64u64 - 5) << 1), // marker: ones-run of 59 words
         ];
 
+        // Decoded: 2 zero words + 3 literal words + 59 all-ones words = 64 words
         let mut decoded_expect = Vec::with_capacity(64);
         decoded_expect.extend_from_slice(&[
             0u64,
@@ -1425,19 +1490,36 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // Pattern-Based EWAH Test Infrastructure
+    // -------------------------------------------------------------------------
+
+    /// Fill type for generating test bitset patterns. EWAH compresses uniform
+    /// runs efficiently, so we test all three cases to exercise different
+    /// encoding paths.
     #[derive(Clone, Copy, Debug)]
     enum TestPatternFill {
+        /// All bits set (0xFFFF...) - compresses to a "ones run" marker.
         UniformOnes,
+        /// All bits clear (0x0000...) - compresses to a "zeros run" marker.
         UniformZeros,
+        /// Mixed bits - stored as literal words (no compression).
         Literal,
     }
 
+    /// Describes a contiguous region of words with uniform fill type.
     #[derive(Clone, Copy, Debug)]
     struct TestPattern {
         fill: TestPatternFill,
         words: usize,
     }
 
+    /// Deterministic xorshift64 PRNG for reproducible test data.
+    ///
+    /// Using a custom PRNG instead of `rand` ensures:
+    /// - Identical sequences across Rust versions and platforms
+    /// - No external crate dependency for tests
+    /// - Failures can be reproduced exactly from the seed
     #[derive(Clone)]
     struct TestRng {
         state: u64,
@@ -1448,6 +1530,7 @@ mod tests {
             Self { state: seed }
         }
 
+        /// Xorshift64 with constants (13, 7, 17) for full 2^64-1 period.
         fn next_u64(&mut self) -> u64 {
             let mut x = self.state;
             x ^= x << 13;
@@ -1469,10 +1552,15 @@ mod tests {
         }
     }
 
+    /// Builds a bitset from pattern descriptors, encodes it, decodes it, and
+    /// verifies the roundtrip preserves all data. The seed controls literal
+    /// word generation for reproducibility.
     fn test_encode_patterns(patterns: &[TestPattern], seed: u64) {
         let blocks_count: usize = patterns.iter().map(|p| p.words * 64).sum();
         let mut decoded_expect = init_free_set(blocks_count);
 
+        // Start with all shards marked full (index bit set), then clear bits
+        // for shards containing any non-full words.
         for shard in 0..decoded_expect.index.bit_length() {
             decoded_expect.index.set(shard);
         }
@@ -1485,9 +1573,13 @@ mod tests {
                 let word = match pattern.fill {
                     TestPatternFill::UniformOnes => u64::MAX,
                     TestPatternFill::UniformZeros => 0,
+                    // Exclude 0 and MAX to ensure literal words aren't accidentally
+                    // treated as uniform runs.
                     TestPatternFill::Literal => rng.range_inclusive(1, u64::MAX - 1),
                 };
                 blocks_words[blocks_offset] = word;
+                // Update shard index: if any word in shard isn't all-ones,
+                // the shard has free blocks.
                 let index_bit = (blocks_offset * 64) / SHARD_BITS;
                 if word != u64::MAX {
                     decoded_expect.index.unset(index_bit);
@@ -1501,6 +1593,7 @@ mod tests {
         decoded_expect.opened = true;
         decoded_expect.checkpoint_durable = true;
 
+        // Encode -> decode roundtrip
         let encoded_size = encode_size_max_bytes(blocks_count);
         assert_eq!(encoded_size % size_of::<Word>(), 0);
         let mut encoded_words = vec![0u64; encoded_size / size_of::<Word>()];
@@ -1516,10 +1609,17 @@ mod tests {
         assert_free_set_eq(&decoded_expect, &decoded_actual);
     }
 
+    /// Exercises EWAH encoding/decoding across various fill patterns to ensure
+    /// the codec handles all edge cases:
+    /// - Single fill type (pure runs)
+    /// - Mixed patterns (run/literal transitions)
+    /// - Long runs exceeding marker field limits
+    /// - Randomly interleaved patterns
     #[test]
     fn encode_decode_handles_various_fill_patterns() {
         let words_per_shard = SHARD_BITS / 64;
 
+        // Single fill type tests - verify basic run compression
         test_encode_patterns(
             &[TestPattern {
                 fill: TestPatternFill::UniformOnes,
@@ -1541,6 +1641,8 @@ mod tests {
             }],
             0xC3D4_E5F6,
         );
+
+        // Long run exceeding u16::MAX - tests run count overflow handling
         test_encode_patterns(
             &[TestPattern {
                 fill: TestPatternFill::UniformOnes,
@@ -1549,6 +1651,7 @@ mod tests {
             0xD4E5_F607,
         );
 
+        // Mixed pattern - exercises run/literal/run transitions
         test_encode_patterns(
             &[
                 TestPattern {
@@ -1571,6 +1674,8 @@ mod tests {
             0xE5F6_0718,
         );
 
+        // Random interleaving - stress test with worst-case fragmentation
+        // (single-word patterns force frequent marker emissions)
         let fills = [
             TestPatternFill::UniformOnes,
             TestPatternFill::UniformZeros,
