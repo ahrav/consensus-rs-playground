@@ -111,9 +111,12 @@ pub enum BitKind {
     Unset,
 }
 
+/// Identifies which free-set bitset is being encoded or decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitsetKind {
+    /// Bitset tracking acquired (in-use) blocks.
     BlocksAcquired,
+    /// Bitset tracking released blocks awaiting final deallocation.
     BlocksReleased,
 }
 
@@ -165,7 +168,9 @@ pub struct InitOptions {
 /// Sizes returned by [`FreeSet::encode_chunks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncodedSizes {
+    /// Bytes of EWAH-encoded `blocks_acquired` data to persist.
     pub encoded_size_blocks_acquired: u64,
+    /// Bytes of EWAH-encoded `blocks_released` data to persist.
     pub encoded_size_blocks_released: u64,
 }
 
