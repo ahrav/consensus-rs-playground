@@ -1145,9 +1145,11 @@ fn block_count_for_trailer_size(trailer_size: u64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitKind, find_bit};
+    use super::{BitKind, BitsetKind, FreeSet, InitOptions, SHARD_BITS, Word, find_bit};
+    use crate::ewah::Ewah;
     use crate::stdx::DynamicBitSet;
     use proptest::prelude::*;
+    use std::mem::size_of;
 
     fn expected_find_bit(
         bit_set: &DynamicBitSet,
@@ -1212,6 +1214,373 @@ mod tests {
                 prop_assert!(idx < bit_max);
                 prop_assert_eq!(bits.is_set(idx), bit_kind == BitKind::Set);
             }
+        }
+    }
+
+    fn init_free_set(blocks_count: usize) -> FreeSet {
+        assert!(blocks_count.is_multiple_of(SHARD_BITS));
+        let grid_size_limit = (blocks_count as u64) * super::BLOCK_SIZE;
+        assert!(grid_size_limit <= usize::MAX as u64);
+
+        FreeSet::init(InitOptions {
+            grid_size_limit: grid_size_limit as usize,
+            blocks_released_prior_checkpoint_durability_max: 0,
+        })
+    }
+
+    fn open_empty_free_set(blocks_count: usize) -> FreeSet {
+        let mut set = init_free_set(blocks_count);
+        set.open(&[], &[], &[], &[]);
+        set.checkpoint_durable = true;
+        set
+    }
+
+    fn encode_size_max_bytes(blocks_count: usize) -> usize {
+        let word_count = blocks_count / 64;
+        Ewah::<Word>::encode_size_max(word_count)
+    }
+
+    fn words_as_bytes(words: &[Word]) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * size_of::<Word>()) }
+    }
+
+    fn words_as_bytes_mut(words: &mut [Word]) -> &mut [u8] {
+        unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * size_of::<Word>())
+        }
+    }
+
+    fn assert_bitset_eq(a: &DynamicBitSet, b: &DynamicBitSet) {
+        assert_eq!(a.bit_length(), b.bit_length());
+        assert_eq!(a.word_len(), b.word_len());
+        assert_eq!(a.words(), b.words());
+    }
+
+    fn assert_free_set_eq(a: &FreeSet, b: &FreeSet) {
+        assert_bitset_eq(&a.blocks_acquired, &b.blocks_acquired);
+        assert_bitset_eq(&a.blocks_released, &b.blocks_released);
+        assert_bitset_eq(&a.index, &b.index);
+        assert_eq!(
+            a.blocks_released_prior_checkpoint_durability.count(),
+            b.blocks_released_prior_checkpoint_durability.count()
+        );
+    }
+
+    #[test]
+    fn free_set_highest_address_acquired_matches_source() {
+        let blocks_count = SHARD_BITS;
+        let mut set = open_empty_free_set(blocks_count);
+
+        {
+            let reservation = set.reserve(6).unwrap();
+            assert_eq!(None, set.highest_address_acquired());
+            assert_eq!(Some(1), set.acquire(reservation));
+            assert_eq!(Some(2), set.acquire(reservation));
+            assert_eq!(Some(3), set.acquire(reservation));
+            set.forfeit(reservation);
+        }
+
+        assert_eq!(Some(3), set.highest_address_acquired());
+
+        set.release(2);
+        set.free(2);
+        assert_eq!(Some(3), set.highest_address_acquired());
+
+        set.release(3);
+        set.free(3);
+        assert_eq!(Some(1), set.highest_address_acquired());
+
+        set.release(1);
+        set.free(1);
+        assert_eq!(None, set.highest_address_acquired());
+
+        {
+            let reservation = set.reserve(6).unwrap();
+            assert_eq!(Some(1), set.acquire(reservation));
+            assert_eq!(Some(2), set.acquire(reservation));
+            assert_eq!(Some(3), set.acquire(reservation));
+            set.forfeit(reservation);
+        }
+
+        {
+            set.release(3);
+            assert_eq!(Some(3), set.highest_address_acquired());
+
+            set.free(3);
+            assert_eq!(Some(2), set.highest_address_acquired());
+        }
+    }
+
+    #[test]
+    fn free_set_acquire_release_matches_source() {
+        for blocks_count in [
+            SHARD_BITS,
+            2 * SHARD_BITS,
+            63 * SHARD_BITS,
+            64 * SHARD_BITS,
+            65 * SHARD_BITS,
+        ] {
+            let mut set = open_empty_free_set(blocks_count);
+            let empty = open_empty_free_set(blocks_count);
+
+            {
+                let reservation = set.reserve(blocks_count).unwrap();
+                for i in 0..blocks_count {
+                    assert_eq!(Some(i as u64 + 1), set.acquire(reservation));
+                }
+                assert_eq!(None, set.acquire(reservation));
+                set.forfeit(reservation);
+            }
+
+            assert_eq!(blocks_count, set.count_acquired());
+            assert_eq!(0, set.count_free());
+
+            for i in 0..blocks_count {
+                let address = i as u64 + 1;
+                set.release(address);
+                set.free(address);
+            }
+
+            assert_free_set_eq(&empty, &set);
+
+            assert_eq!(0, set.count_acquired());
+            assert_eq!(blocks_count, set.count_free());
+
+            {
+                let reservation = set.reserve(blocks_count).unwrap();
+                for i in 0..blocks_count {
+                    assert_eq!(Some(i as u64 + 1), set.acquire(reservation));
+                }
+                assert_eq!(None, set.acquire(reservation));
+                set.forfeit(reservation);
+            }
+        }
+    }
+
+    #[test]
+    fn free_set_acquire_part_way_through_shard_matches_source() {
+        let mut set = open_empty_free_set(SHARD_BITS * 3);
+
+        let reservation_a = set.reserve(1).unwrap();
+        let reservation_b = set.reserve(2 * SHARD_BITS).unwrap();
+
+        for i in 0..reservation_b.block_count {
+            let address = set.acquire(reservation_b).unwrap();
+            assert_eq!(address - 1, reservation_a.block_count as u64 + i as u64);
+            set.verify_index();
+        }
+        assert_eq!(None, set.acquire(reservation_b));
+
+        set.forfeit(reservation_b);
+        set.forfeit(reservation_a);
+    }
+
+    #[test]
+    fn free_set_encode_decode_manual_matches_source() {
+        let encoded_expect_words: [Word; 5] = [
+            0u64 | (2u64 << 1) | (3u64 << 32),
+            0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
+            0b01010101_01010101_01010101_01010101_01010101_01010101_01010101_01010101u64,
+            0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
+            1u64 | ((64u64 - 5) << 1),
+        ];
+
+        let mut decoded_expect = Vec::with_capacity(64);
+        decoded_expect.extend_from_slice(&[
+            0u64,
+            0u64,
+            0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
+            0b01010101_01010101_01010101_01010101_01010101_01010101_01010101_01010101u64,
+            0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
+        ]);
+        decoded_expect.extend(std::iter::repeat(u64::MAX).take(64 - 5));
+
+        let blocks_count = decoded_expect.len() * 64;
+        let mut decoded_actual = init_free_set(blocks_count);
+
+        let encoded_expect_bytes = words_as_bytes(&encoded_expect_words);
+        decoded_actual.decode(BitsetKind::BlocksAcquired, &[encoded_expect_bytes]);
+
+        assert_eq!(decoded_expect.len(), decoded_actual.blocks_acquired.word_len());
+        assert_eq!(&decoded_expect[..], decoded_actual.blocks_acquired.words());
+
+        decoded_actual.opened = true;
+        decoded_actual.checkpoint_durable = true;
+
+        let encoded_size = encode_size_max_bytes(blocks_count);
+        assert_eq!(encoded_size % size_of::<Word>(), 0);
+        let mut encoded_actual_words = vec![0u64; encoded_size / size_of::<Word>()];
+        let encoded_actual_len = {
+            let mut encoded_chunk = words_as_bytes_mut(&mut encoded_actual_words);
+            decoded_actual.encode(BitsetKind::BlocksAcquired, &mut [&mut encoded_chunk])
+        };
+
+        assert_eq!(encoded_actual_len, encoded_expect_bytes.len());
+        assert_eq!(
+            &words_as_bytes(&encoded_actual_words)[..encoded_actual_len],
+            encoded_expect_bytes
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TestPatternFill {
+        UniformOnes,
+        UniformZeros,
+        Literal,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct TestPattern {
+        fill: TestPatternFill,
+        words: usize,
+    }
+
+    #[derive(Clone)]
+    struct TestRng {
+        state: u64,
+    }
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        fn range_inclusive(&mut self, min: u64, max: u64) -> u64 {
+            assert!(min <= max);
+            let span = max - min + 1;
+            min + (self.next_u64() % span)
+        }
+
+        fn index(&mut self, len: usize) -> usize {
+            assert!(len > 0);
+            (self.next_u64() % len as u64) as usize
+        }
+    }
+
+    fn test_encode_patterns(patterns: &[TestPattern], seed: u64) {
+        let blocks_count: usize = patterns.iter().map(|p| p.words * 64).sum();
+        let mut decoded_expect = init_free_set(blocks_count);
+
+        for shard in 0..decoded_expect.index.bit_length() {
+            decoded_expect.index.set(shard);
+        }
+
+        let mut rng = TestRng::new(seed);
+        let blocks_words = unsafe { decoded_expect.blocks_acquired.words_mut() };
+        let mut blocks_offset: usize = 0;
+        for pattern in patterns {
+            for _ in 0..pattern.words {
+                let word = match pattern.fill {
+                    TestPatternFill::UniformOnes => u64::MAX,
+                    TestPatternFill::UniformZeros => 0,
+                    TestPatternFill::Literal => rng.range_inclusive(1, u64::MAX - 1),
+                };
+                blocks_words[blocks_offset] = word;
+                let index_bit = (blocks_offset * 64) / SHARD_BITS;
+                if word != u64::MAX {
+                    decoded_expect.index.unset(index_bit);
+                }
+                blocks_offset += 1;
+            }
+        }
+        assert_eq!(blocks_offset, blocks_words.len());
+
+        decoded_expect.verify_index();
+        decoded_expect.opened = true;
+        decoded_expect.checkpoint_durable = true;
+
+        let encoded_size = encode_size_max_bytes(blocks_count);
+        assert_eq!(encoded_size % size_of::<Word>(), 0);
+        let mut encoded_words = vec![0u64; encoded_size / size_of::<Word>()];
+        let encoded_len = {
+            let mut encoded_chunk = words_as_bytes_mut(&mut encoded_words);
+            decoded_expect.encode(BitsetKind::BlocksAcquired, &mut [&mut encoded_chunk])
+        };
+
+        let mut decoded_actual = init_free_set(blocks_count);
+        let encoded_bytes = words_as_bytes(&encoded_words);
+        decoded_actual.decode_chunks(&[&encoded_bytes[..encoded_len]], &[]);
+
+        assert_free_set_eq(&decoded_expect, &decoded_actual);
+    }
+
+    #[test]
+    fn free_set_encode_decode_patterns_match_source() {
+        let words_per_shard = SHARD_BITS / 64;
+
+        test_encode_patterns(
+            &[TestPattern {
+                fill: TestPatternFill::UniformOnes,
+                words: words_per_shard,
+            }],
+            0xA1B2_C3D4,
+        );
+        test_encode_patterns(
+            &[TestPattern {
+                fill: TestPatternFill::UniformZeros,
+                words: words_per_shard,
+            }],
+            0xB2C3_D4E5,
+        );
+        test_encode_patterns(
+            &[TestPattern {
+                fill: TestPatternFill::Literal,
+                words: words_per_shard,
+            }],
+            0xC3D4_E5F6,
+        );
+        test_encode_patterns(
+            &[TestPattern {
+                fill: TestPatternFill::UniformOnes,
+                words: u16::MAX as usize + 1,
+            }],
+            0xD4E5_F607,
+        );
+
+        test_encode_patterns(
+            &[
+                TestPattern {
+                    fill: TestPatternFill::UniformOnes,
+                    words: words_per_shard / 4,
+                },
+                TestPattern {
+                    fill: TestPatternFill::UniformZeros,
+                    words: words_per_shard / 4,
+                },
+                TestPattern {
+                    fill: TestPatternFill::Literal,
+                    words: words_per_shard / 4,
+                },
+                TestPattern {
+                    fill: TestPatternFill::UniformOnes,
+                    words: words_per_shard / 4,
+                },
+            ],
+            0xE5F6_0718,
+        );
+
+        let fills = [
+            TestPatternFill::UniformOnes,
+            TestPatternFill::UniformZeros,
+            TestPatternFill::Literal,
+        ];
+        let mut rng = TestRng::new(0xF607_1829);
+        for _ in 0..10 {
+            let mut patterns = Vec::with_capacity(words_per_shard);
+            for _ in 0..words_per_shard {
+                let fill = fills[rng.index(fills.len())];
+                patterns.push(TestPattern { fill, words: 1 });
+            }
+            test_encode_patterns(&patterns, rng.next_u64());
         }
     }
 }
