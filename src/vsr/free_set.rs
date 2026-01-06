@@ -1241,12 +1241,17 @@ mod tests {
     }
 
     fn words_as_bytes(words: &[Word]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * size_of::<Word>()) }
+        unsafe {
+            std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * size_of::<Word>())
+        }
     }
 
     fn words_as_bytes_mut(words: &mut [Word]) -> &mut [u8] {
         unsafe {
-            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * size_of::<Word>())
+            std::slice::from_raw_parts_mut(
+                words.as_mut_ptr() as *mut u8,
+                words.len() * size_of::<Word>(),
+            )
         }
     }
 
@@ -1401,7 +1406,10 @@ mod tests {
         let encoded_expect_bytes = words_as_bytes(&encoded_expect_words);
         decoded_actual.decode(BitsetKind::BlocksAcquired, &[encoded_expect_bytes]);
 
-        assert_eq!(decoded_expect.len(), decoded_actual.blocks_acquired.word_len());
+        assert_eq!(
+            decoded_expect.len(),
+            decoded_actual.blocks_acquired.word_len()
+        );
         assert_eq!(&decoded_expect[..], decoded_actual.blocks_acquired.words());
 
         decoded_actual.opened = true;
