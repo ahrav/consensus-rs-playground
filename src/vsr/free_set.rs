@@ -1267,7 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn free_set_highest_address_acquired_matches_source() {
+    fn highest_address_acquired_tracks_maximum_after_acquire_and_free() {
         let blocks_count = SHARD_BITS;
         let mut set = open_empty_free_set(blocks_count);
 
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn free_set_acquire_release_matches_source() {
+    fn acquire_all_blocks_then_release_restores_initial_state() {
         for blocks_count in [
             SHARD_BITS,
             2 * SHARD_BITS,
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn free_set_acquire_part_way_through_shard_matches_source() {
+    fn acquire_respects_existing_reservations_across_shards() {
         let mut set = open_empty_free_set(SHARD_BITS * 3);
 
         let reservation_a = set.reserve(1).unwrap();
@@ -1376,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn free_set_encode_decode_manual_matches_source() {
+    fn encode_decode_roundtrip_preserves_bitset_patterns() {
         let encoded_expect_words: [Word; 5] = [
             (2u64 << 1) | (3u64 << 32),
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
@@ -1517,7 +1517,7 @@ mod tests {
     }
 
     #[test]
-    fn free_set_encode_decode_patterns_match_source() {
+    fn encode_decode_handles_various_fill_patterns() {
         let words_per_shard = SHARD_BITS / 64;
 
         test_encode_patterns(
