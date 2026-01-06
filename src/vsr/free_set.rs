@@ -301,6 +301,38 @@ impl FreeSet {
         }
     }
 
+    /// Opens a free set from persisted state.
+    ///
+    /// Inputs:
+    /// - EWAH-encoded bitset chunks for `blocks_acquired` and `blocks_released`.
+    /// - The block addresses used to store those bitsets in the grid.
+    ///
+    /// The free-set block addresses are not included in the encoded acquired bitset
+    /// (see `CheckpointTrailer`), so they are patched in via [`mark_released`](Self::mark_released).
+    pub fn open(
+        &mut self,
+        encoded_blocks_acquired: &[&[u8]],
+        encoded_blocks_released: &[&[u8]],
+        free_set_block_addresses_blocks_acquired: &[u64],
+        free_set_block_addresses_blocks_released: &[u64],
+    ) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        let encoded_empty =
+            encoded_blocks_acquired.is_empty() && encoded_blocks_released.is_empty();
+        let addrs_empty = free_set_block_addresses_blocks_acquired.is_empty()
+            && free_set_block_addresses_blocks_released.is_empty();
+        assert_eq!(encoded_empty, addrs_empty);
+
+        self.decode_chunks(encoded_blocks_acquired, encoded_blocks_released);
+
+        self.mark_released(free_set_block_addresses_blocks_acquired);
+        self.mark_released(free_set_block_addresses_blocks_released);
+
+        self.opened = true;
+    }
+
     /// Decodes EWAH-compressed bitset chunks into the free set.
     ///
     /// The free set must be unopened and empty. After decoding, the shard index
@@ -528,6 +560,43 @@ impl FreeSet {
         if self.checkpoint_durable {
             self.blocks_released.set(block);
         } else {
+            self.blocks_released_prior_checkpoint_durability
+                .insert(block as u64);
+        }
+    }
+
+    /// Marks the blocks that store the free set itself as acquired and released.
+    ///
+    /// The on-disk free-set bitsets do not include the blocks that store them, so
+    /// they must be patched in after decoding. Because the next checkpoint will
+    /// write a different set of free-set blocks, these can be released in the
+    /// current interval. Addresses must be strictly increasing and nonzero.
+    fn mark_released(&mut self, addresses: &[u64]) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        let mut prev: u64 = 0;
+        for &address in addresses {
+            assert!(address > 0);
+            assert!(address > prev);
+            prev = address;
+
+            let block = (address - 1) as usize;
+
+            assert!(!self.blocks_acquired.is_set(block));
+            assert!(!self.blocks_released.is_set(block));
+            assert!(
+                !self
+                    .blocks_released_prior_checkpoint_durability
+                    .contains(block as u64)
+            );
+
+            self.blocks_acquired.set(block);
+            let shard = block / SHARD_BITS;
+            if self.find_free_block_in_shard(shard).is_none() {
+                self.index.set(shard);
+            }
+
             self.blocks_released_prior_checkpoint_durability
                 .insert(block as u64);
         }
