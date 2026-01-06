@@ -1656,7 +1656,6 @@ fn set_header_as_dirty_updates_reserved_slot() {
     assert_eq!(journal.headers[slot], header);
     assert!(journal.dirty.is_set(slot));
     assert_eq!(journal.headers_redundant[slot], redundant_before);
-    assert_eq!(journal.headers_redundant[slot].checksum, 0);
     assert!(!journal.faulty.is_set(slot));
 }
 

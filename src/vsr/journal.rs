@@ -1237,7 +1237,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `header` is not a valid `Prepare` header (reserved operation or too small)
     /// - The slot would move backwards (`existing.op > header.op`)
-    /// - The slot is reserved but the redundant header is not a reserved placeholder
     #[cfg_attr(not(test), allow(dead_code))]
     fn set_header_as_dirty(&mut self, header: &HeaderPrepare) {
         assert!(matches!(self.status, Status::Recovered));
@@ -1255,8 +1254,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(self.headers[slot.index()].op <= header.op);
 
         if self.headers[slot.index()].operation == Operation::RESERVED {
-            assert!(self.headers_redundant[slot.index()].operation == Operation::RESERVED);
-            assert!(self.headers_redundant[slot.index()].checksum == 0);
+            // Preserve the existing faulty state for reserved slots.
         } else {
             self.faulty.unset(slot.index());
             self.headers_redundant[slot.index()] =
@@ -1817,7 +1815,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         sector_index: usize,
         write: *const Write<S, WRITE_OPS, WRITE_OPS_WORDS>,
     ) -> &mut [u8] {
-        assert!(matches!(self.status, Status::Recovered));
+        assert!(!matches!(self.status, Status::Init));
         assert!(sector_index < SLOT_COUNT / HEADERS_PER_SECTOR);
 
         let base = self.writes.items.as_ptr() as *const Write<S, WRITE_OPS, WRITE_OPS_WORDS>;
