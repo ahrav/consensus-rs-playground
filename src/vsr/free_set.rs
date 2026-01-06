@@ -111,6 +111,15 @@ pub enum BitKind {
     Unset,
 }
 
+/// Identifies which free-set bitset is being encoded or decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitsetKind {
+    /// Bitset tracking acquired (in-use) blocks.
+    BlocksAcquired,
+    /// Bitset tracking released blocks awaiting final deallocation.
+    BlocksReleased,
+}
+
 /// State machine for the block reservation workflow.
 ///
 /// See the module-level documentation for the full reservation lifecycle.
@@ -154,6 +163,15 @@ pub struct InitOptions {
     /// might release. The actual capacity also includes headroom for trailer
     /// blocks used to store the compressed bitsets themselves.
     pub blocks_released_prior_checkpoint_durability_max: usize,
+}
+
+/// Sizes returned by [`FreeSet::encode_chunks`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedSizes {
+    /// Bytes of EWAH-encoded `blocks_acquired` data to persist.
+    pub encoded_size_blocks_acquired: u64,
+    /// Bytes of EWAH-encoded `blocks_released` data to persist.
+    pub encoded_size_blocks_released: u64,
 }
 
 /// Tracks free and allocated blocks in the VSR storage grid.
@@ -288,6 +306,95 @@ impl FreeSet {
         }
     }
 
+    /// Opens a free set from persisted state.
+    ///
+    /// Inputs:
+    /// - EWAH-encoded bitset chunks for `blocks_acquired` and `blocks_released`.
+    /// - The block addresses used to store those bitsets in the grid.
+    ///
+    /// The free-set block addresses are not included in the encoded acquired bitset
+    /// (see `CheckpointTrailer`), so they are patched in via [`mark_released`](Self::mark_released).
+    pub fn open(
+        &mut self,
+        encoded_blocks_acquired: &[&[u8]],
+        encoded_blocks_released: &[&[u8]],
+        free_set_block_addresses_blocks_acquired: &[u64],
+        free_set_block_addresses_blocks_released: &[u64],
+    ) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        let encoded_empty =
+            encoded_blocks_acquired.is_empty() && encoded_blocks_released.is_empty();
+        let addrs_empty = free_set_block_addresses_blocks_acquired.is_empty()
+            && free_set_block_addresses_blocks_released.is_empty();
+        assert_eq!(encoded_empty, addrs_empty);
+
+        self.decode_chunks(encoded_blocks_acquired, encoded_blocks_released);
+
+        self.mark_released(free_set_block_addresses_blocks_acquired);
+        self.mark_released(free_set_block_addresses_blocks_released);
+
+        self.opened = true;
+    }
+
+    /// Decodes EWAH-compressed bitset chunks into the free set.
+    ///
+    /// The free set must be unopened and empty. After decoding, the shard index
+    /// is rebuilt by scanning for fully-allocated shards. Panics if the encoding
+    /// is invalid or chunk alignment is incorrect.
+    pub fn decode_chunks(
+        &mut self,
+        encoded_blocks_acquired: &[&[u8]],
+        encoded_blocks_released: &[&[u8]],
+    ) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        assert_eq!(self.index.count(), 0);
+        assert_eq!(self.blocks_acquired.count(), 0);
+        assert_eq!(self.blocks_released.count(), 0);
+        assert!(self.blocks_released_prior_checkpoint_durability.is_empty());
+
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        self.decode(BitsetKind::BlocksAcquired, encoded_blocks_acquired);
+        self.decode(BitsetKind::BlocksReleased, encoded_blocks_released);
+
+        for shard in 0..self.shards_count() {
+            if self.find_free_block_in_shard(shard).is_none() {
+                self.index.set(shard);
+            }
+        }
+
+        self.verify_index();
+    }
+
+    /// Encodes both bitsets into the provided trailer chunks.
+    ///
+    /// Chunks must be `Word`-aligned and large enough for the EWAH output.
+    /// Returns the exact number of bytes to persist for each bitset (trailing zero runs omitted).
+    pub fn encode_chunks(
+        &self,
+        target_chunks_blocks_acquired: &mut [&mut [u8]],
+        target_chunks_blocks_released: &mut [&mut [u8]],
+    ) -> EncodedSizes {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        EncodedSizes {
+            encoded_size_blocks_acquired: self
+                .encode(BitsetKind::BlocksAcquired, target_chunks_blocks_acquired)
+                as u64,
+            encoded_size_blocks_released: self
+                .encode(BitsetKind::BlocksReleased, target_chunks_blocks_released)
+                as u64,
+        }
+    }
+
     /// Reserve `reserve_count` free blocks. The blocks are not acquired yet.
     ///
     /// Invariants:
@@ -414,6 +521,53 @@ impl FreeSet {
         Some((block as u64) + 1)
     }
 
+    /// Returns `true` if the address is free (not acquired).
+    ///
+    /// If the free set is not open yet, returns `false` conservatively.
+    pub fn is_free(&self, address: u64) -> bool {
+        if !self.opened {
+            return false;
+        }
+
+        assert!(address > 0);
+        !self.blocks_acquired.is_set((address - 1) as usize)
+    }
+
+    /// Returns `true` if the address is marked released in either buffer.
+    pub fn is_released(&self, address: u64) -> bool {
+        if !self.opened {
+            return false;
+        }
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        self.blocks_released_prior_checkpoint_durability
+            .contains(block as u64)
+            || self.blocks_released.is_set(block)
+    }
+
+    /// Returns `true` if the block would be freed when the current checkpoint
+    /// becomes durable.
+    ///
+    /// Only valid while `checkpoint_durable` is `false`. During this time,
+    /// `blocks_released` holds releases from the previous interval.
+    pub fn to_be_freed_at_checkpoint_durability(&self, address: u64) -> bool {
+        assert!(self.opened);
+        assert!(!self.checkpoint_durable);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(
+            !self.blocks_released.is_set(block)
+                || !self
+                    .blocks_released_prior_checkpoint_durability
+                    .contains(block as u64)
+        );
+
+        self.blocks_released.is_set(block)
+    }
+
     /// Marks a block as released, scheduling it for deallocation.
     ///
     /// Released blocks remain in [`blocks_acquired`](Self::blocks_acquired) until the
@@ -461,52 +615,6 @@ impl FreeSet {
             self.blocks_released_prior_checkpoint_durability
                 .insert(block as u64);
         }
-    }
-
-    /// Deallocates a block, making it available for future acquisition.
-    ///
-    /// This is an internal method called by [`mark_checkpoint_durable`](Self::mark_checkpoint_durable)
-    /// to complete the deallocation of blocks that were previously released via
-    /// [`release`](Self::release). Unlike `release`, which only *schedules* deallocation,
-    /// `free` actually clears the block from both [`blocks_acquired`](Self::blocks_acquired)
-    /// and [`blocks_released`](Self::blocks_released), and updates the shard index to
-    /// indicate that the shard may now have free blocks.
-    ///
-    /// # Parameters
-    ///
-    /// * `address` - The 1-based block address to free.
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// * The free set is not opened
-    /// * The checkpoint is not durable (blocks can only be freed after durability is confirmed)
-    /// * `address` is 0
-    /// * The block is not currently acquired
-    /// * The block is not marked as released (must call `release` before `free`)
-    /// * The block is in the pre-durability buffer (indicates state machine error)
-    /// * There are active reservations (freeing during reservation could cause races)
-    fn free(&mut self, address: u64) {
-        assert!(self.opened);
-        assert!(self.checkpoint_durable);
-        assert!(address > 0);
-
-        let block = (address - 1) as usize;
-        assert!(self.blocks_acquired.is_set(block));
-        assert!(self.blocks_released.is_set(block));
-        assert!(
-            !self
-                .blocks_released_prior_checkpoint_durability
-                .contains(block as u64)
-        );
-        assert_eq!(self.reservation_count, 0);
-        assert_eq!(self.reservation_blocks, 0);
-
-        let shard = block / SHARD_BITS;
-        self.index.unset(shard);
-
-        self.blocks_acquired.unset(block);
-        self.blocks_released.unset(block);
     }
 
     /// Transitions the checkpoint state from durable to not-durable.
@@ -592,6 +700,129 @@ impl FreeSet {
         self.verify_index();
     }
 
+    /// Marks the blocks that store the free set itself as acquired and released.
+    ///
+    /// The on-disk free-set bitsets do not include the blocks that store them, so
+    /// they must be patched in after decoding. Because the next checkpoint will
+    /// write a different set of free-set blocks, these can be released in the
+    /// current interval. Addresses must be strictly increasing and nonzero.
+    fn mark_released(&mut self, addresses: &[u64]) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+
+        let mut prev: u64 = 0;
+        for &address in addresses {
+            assert!(address > 0);
+            assert!(address > prev);
+            prev = address;
+
+            let block = (address - 1) as usize;
+
+            assert!(!self.blocks_acquired.is_set(block));
+            assert!(!self.blocks_released.is_set(block));
+            assert!(
+                !self
+                    .blocks_released_prior_checkpoint_durability
+                    .contains(block as u64)
+            );
+
+            self.blocks_acquired.set(block);
+            let shard = block / SHARD_BITS;
+            if self.find_free_block_in_shard(shard).is_none() {
+                self.index.set(shard);
+            }
+
+            self.blocks_released_prior_checkpoint_durability
+                .insert(block as u64);
+        }
+    }
+
+    /// Deallocates a block, making it available for future acquisition.
+    ///
+    /// This is an internal method called by [`mark_checkpoint_durable`](Self::mark_checkpoint_durable)
+    /// to complete the deallocation of blocks that were previously released via
+    /// [`release`](Self::release). Unlike `release`, which only *schedules* deallocation,
+    /// `free` actually clears the block from both [`blocks_acquired`](Self::blocks_acquired)
+    /// and [`blocks_released`](Self::blocks_released), and updates the shard index to
+    /// indicate that the shard may now have free blocks.
+    ///
+    /// # Parameters
+    ///
+    /// * `address` - The 1-based block address to free.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// * The free set is not opened
+    /// * The checkpoint is not durable (blocks can only be freed after durability is confirmed)
+    /// * `address` is 0
+    /// * The block is not currently acquired
+    /// * The block is not marked as released (must call `release` before `free`)
+    /// * The block is in the pre-durability buffer (indicates state machine error)
+    /// * There are active reservations (freeing during reservation could cause races)
+    fn free(&mut self, address: u64) {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(self.blocks_released.is_set(block));
+        assert!(
+            !self
+                .blocks_released_prior_checkpoint_durability
+                .contains(block as u64)
+        );
+        assert_eq!(self.reservation_count, 0);
+        assert_eq!(self.reservation_blocks, 0);
+
+        let shard = block / SHARD_BITS;
+        self.index.unset(shard);
+
+        self.blocks_acquired.unset(block);
+        self.blocks_released.unset(block);
+    }
+
+    /// Returns the highest acquired address, or `None` if no blocks are acquired.
+    pub fn highest_address_acquired(&self) -> Option<u64> {
+        assert!(self.opened);
+        self.blocks_acquired
+            .highest_set_bit()
+            .map(|bit| bit as u64 + 1)
+    }
+
+    /// Returns the highest released address in `blocks_released`, or `None` if none.
+    pub fn highest_address_released(&self) -> Option<u64> {
+        assert!(self.opened);
+        self.blocks_released
+            .highest_set_bit()
+            .map(|bit| bit as u64 + 1)
+    }
+
+    /// Returns the number of active reservations in the current session.
+    pub fn count_reservations(&self) -> usize {
+        assert!(self.opened);
+        self.reservation_count
+    }
+
+    /// Returns the number of acquired blocks.
+    pub fn count_acquired(&self) -> usize {
+        assert!(self.opened);
+        self.blocks_acquired.count()
+    }
+
+    /// Returns the number of free blocks (total minus acquired).
+    pub fn count_free(&self) -> usize {
+        assert!(self.opened);
+        self.blocks_count() - self.blocks_acquired.count()
+    }
+
+    /// Returns the number of blocks released across both release buffers.
+    pub fn count_released(&self) -> usize {
+        assert!(self.opened);
+        self.blocks_released.count() + self.blocks_released_prior_checkpoint_durability.count()
+    }
+
     /// Asserts that the shard index is consistent with the block-level bitset.
     ///
     /// For each shard, verifies that `index.is_set(shard)` is `true` if and only if
@@ -641,6 +872,84 @@ impl FreeSet {
         )
     }
 
+    /// Decodes compressed bitset chunks into the selected bitset.
+    ///
+    /// Panics if the encoding is invalid. The decoder does not emit trailing
+    /// zero runs, so any words beyond the decoded range must remain zero.
+    fn decode(&mut self, bitset_kind: BitsetKind, source_chunks: &[&[u8]]) {
+        assert!(!self.opened);
+        assert!(!self.checkpoint_durable);
+        assert_words_aligned_chunks(source_chunks);
+
+        let word_count = self.blocks_word_count();
+        let blocks_count = self.blocks_count();
+
+        let target_words: &mut [Word] = match bitset_kind {
+            BitsetKind::BlocksAcquired => unsafe { self.blocks_acquired.words_mut() },
+            BitsetKind::BlocksReleased => unsafe { self.blocks_released.words_mut() },
+        };
+        assert_eq!(target_words.len(), word_count);
+
+        let source_size = source_chunks.iter().map(|c| c.len()).sum();
+
+        let mut decoder = Ewah::<Word>::decode_chunks(target_words, source_size);
+        let mut words_decoded = 0;
+        for &chunk in source_chunks {
+            words_decoded += decoder.decode_chunk(chunk);
+        }
+        assert!(decoder.done());
+
+        assert!(words_decoded * 64 <= blocks_count);
+
+        for &w in &target_words[words_decoded..] {
+            assert_eq!(w, 0);
+        }
+    }
+
+    /// EWAH-encodes the selected bitset into `target_chunks`.
+    ///
+    /// Streams output across the chunk slices until completion. The returned size excludes
+    /// trailing zero runs so the encoding is stable regardless of the configured storage limit.
+    fn encode(&self, bitset_kind: BitsetKind, target_chunks: &mut [&mut [u8]]) -> usize {
+        assert!(self.opened);
+        assert!(self.checkpoint_durable);
+        assert_words_aligned_chunks_mut(target_chunks);
+
+        let word_count = self.blocks_word_count();
+
+        let source_words: &[Word] = match bitset_kind {
+            BitsetKind::BlocksAcquired => self.blocks_acquired.words(),
+            BitsetKind::BlocksReleased => self.blocks_released.words(),
+        };
+        assert_eq!(source_words.len(), word_count);
+
+        let mut encoder = Ewah::<Word>::encode_chunk(source_words);
+
+        let mut bytes_encode_total: usize = 0;
+        let mut done = false;
+
+        for chunk in target_chunks.iter_mut() {
+            // Stream the EWAH output across chunk buffers until the encoder finishes.
+            let bytes_encoded = encoder.encode_chunk(chunk);
+            // The encoder must always make forward progress while data remains.
+            assert!(bytes_encoded > 0);
+            bytes_encode_total += bytes_encoded;
+
+            if encoder.done() {
+                done = true;
+                break;
+            }
+        }
+
+        // Caller must provide enough chunk space to hold the full encoding.
+        assert!(done);
+
+        // Drop trailing zero runs so output is independent of the grid size limit.
+        let bytes_trailing_zero_runs =
+            encoder.trailing_zero_runs_count * core::mem::size_of::<Word>();
+        bytes_encode_total - bytes_trailing_zero_runs
+    }
+
     /// Returns the total number of blocks tracked by the free set.
     ///
     /// This is the capacity of the block-level bitsets, rounded up to the nearest
@@ -658,6 +967,13 @@ impl FreeSet {
     #[inline]
     fn shards_count(&self) -> usize {
         self.index.bit_length()
+    }
+
+    /// Returns the number of 64-bit words backing the block bitsets.
+    #[inline]
+    fn blocks_word_count(&self) -> usize {
+        assert!(self.blocks_count().is_multiple_of(64));
+        self.blocks_count() / 64
     }
 
     /// Calculates the block capacity for a given storage size limit.
@@ -684,6 +1000,26 @@ impl FreeSet {
     pub fn block_count_max(grid_size_limit: usize) -> usize {
         let block_count_limit = (grid_size_limit as u64 / BLOCK_SIZE) as usize;
         block_count_limit.div_ceil(SHARD_BITS) * SHARD_BITS
+    }
+}
+
+/// Ensures each chunk is `Word`-aligned and sized to whole words for EWAH I/O.
+fn assert_words_aligned_chunks(chunks: &[&[u8]]) {
+    for chunk in chunks {
+        // SAFETY: We only inspect the alignment split, no elements are reinterpreted.
+        let (prefix, _, suffix) = unsafe { chunk.align_to::<Word>() };
+        assert!(prefix.is_empty(), "source chunk not word-aligned");
+        assert!(suffix.is_empty(), "source chunk length not word-aligned");
+    }
+}
+
+/// Ensures each mutable chunk is `Word`-aligned and sized to whole words for EWAH I/O.
+fn assert_words_aligned_chunks_mut(chunks: &mut [&mut [u8]]) {
+    for chunk in chunks.iter_mut() {
+        // SAFETY: We only inspect the alignment split, no elements are reinterpreted.
+        let (prefix, _, suffix) = unsafe { (*chunk).align_to_mut::<Word>() };
+        assert!(prefix.is_empty(), "target chunk not word-aligned");
+        assert!(suffix.is_empty(), "target chunk length not word-aligned");
     }
 }
 
