@@ -1241,18 +1241,13 @@ mod tests {
     }
 
     fn words_as_bytes(words: &[Word]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * size_of::<Word>())
-        }
+        let byte_len = std::mem::size_of_val(words);
+        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, byte_len) }
     }
 
     fn words_as_bytes_mut(words: &mut [Word]) -> &mut [u8] {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                words.as_mut_ptr() as *mut u8,
-                words.len() * size_of::<Word>(),
-            )
-        }
+        let byte_len = std::mem::size_of_val(words);
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, byte_len) }
     }
 
     fn assert_bitset_eq(a: &DynamicBitSet, b: &DynamicBitSet) {
@@ -1383,7 +1378,7 @@ mod tests {
     #[test]
     fn free_set_encode_decode_manual_matches_source() {
         let encoded_expect_words: [Word; 5] = [
-            0u64 | (2u64 << 1) | (3u64 << 32),
+            (2u64 << 1) | (3u64 << 32),
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
             0b01010101_01010101_01010101_01010101_01010101_01010101_01010101_01010101u64,
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
@@ -1398,7 +1393,7 @@ mod tests {
             0b01010101_01010101_01010101_01010101_01010101_01010101_01010101_01010101u64,
             0b10101010_10101010_10101010_10101010_10101010_10101010_10101010_10101010u64,
         ]);
-        decoded_expect.extend(std::iter::repeat(u64::MAX).take(64 - 5));
+        decoded_expect.extend(std::iter::repeat_n(u64::MAX, 64 - 5));
 
         let blocks_count = decoded_expect.len() * 64;
         let mut decoded_actual = init_free_set(blocks_count);
