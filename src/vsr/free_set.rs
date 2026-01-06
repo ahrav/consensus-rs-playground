@@ -521,6 +521,53 @@ impl FreeSet {
         Some((block as u64) + 1)
     }
 
+    /// Returns `true` if the address is free (not acquired).
+    ///
+    /// If the free set is not open yet, returns `false` conservatively.
+    pub fn is_free(&self, address: u64) -> bool {
+        if !self.opened {
+            return false;
+        }
+
+        assert!(address > 0);
+        !self.blocks_acquired.is_set((address - 1) as usize)
+    }
+
+    /// Returns `true` if the address is marked released in either buffer.
+    pub fn is_released(&self, address: u64) -> bool {
+        if !self.opened {
+            return false;
+        }
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        self.blocks_released_prior_checkpoint_durability
+            .contains(block as u64)
+            || self.blocks_released.is_set(block)
+    }
+
+    /// Returns `true` if the block would be freed when the current checkpoint
+    /// becomes durable.
+    ///
+    /// Only valid while `checkpoint_durable` is `false`. During this time,
+    /// `blocks_released` holds releases from the previous interval.
+    pub fn to_be_freed_at_checkpoint_durability(&self, address: u64) -> bool {
+        assert!(self.opened);
+        assert!(!self.checkpoint_durable);
+        assert!(address > 0);
+
+        let block = (address - 1) as usize;
+        assert!(self.blocks_acquired.is_set(block));
+        assert!(
+            !self.blocks_released.is_set(block)
+                || !self
+                    .blocks_released_prior_checkpoint_durability
+                    .contains(block as u64)
+        );
+
+        self.blocks_released.is_set(block)
+    }
+
     /// Marks a block as released, scheduling it for deallocation.
     ///
     /// Released blocks remain in [`blocks_acquired`](Self::blocks_acquired) until the
