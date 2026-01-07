@@ -417,7 +417,7 @@ impl MessageBuffer {
         let valid_unprocessed = self.advance_size - self.process_size;
         if valid_unprocessed >= HEADER_SIZE {
             let header = self.copy_header();
-            if valid_unprocessed > header.size {
+            if valid_unprocessed >= header.size {
                 self.iterator_state = IteratorState::AfterPeek;
                 return Some(header);
             }
