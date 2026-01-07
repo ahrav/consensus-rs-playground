@@ -61,8 +61,8 @@ use std::mem;
 use crate::{
     message_pool::{Message, MessagePool},
     vsr::{
-        Command, HEADER_SIZE, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
-        command::CommandMarker, header::ProtoHeader,
+        Command, HEADER_SIZE, HEADER_SIZE_USIZE, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX,
+        MESSAGE_SIZE_MAX_USIZE, command::CommandMarker, header::ProtoHeader,
     },
 };
 
@@ -445,6 +445,82 @@ impl MessageBuffer {
         assert_eq!(self.advance_size, advance_size_idempotent);
 
         None
+    }
+
+    /// Consumes a message that was peeked via [`next_header`] and returns it as an owned [`RawMessage`].
+    ///
+    /// This method must be called after [`next_header`] returns `Some(header)`. It extracts the
+    /// message from the buffer and advances `process_size` past the consumed bytes.
+    ///
+    /// # Zero-Copy Fast Path
+    ///
+    /// When the message is the only one in the buffer (i.e., `process_size == 0` and
+    /// `receive_size == header.size`), the internal buffer is returned directly without copying.
+    /// A fresh buffer is acquired from the pool to replace it. This optimization avoids memory
+    /// copies when processing single messages.
+    ///
+    /// # Copy Path
+    ///
+    /// When multiple messages exist in the buffer, the message bytes are copied to a new buffer
+    /// acquired from the pool. The original buffer is retained for continued iteration.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - The message pool to acquire a new buffer from (for replacement or copying)
+    /// * `header` - The header returned by the preceding [`next_header`] call
+    ///
+    /// # Returns
+    ///
+    /// An owned [`RawMessage`] containing the consumed message data. The caller is responsible
+    /// for returning this message to the pool when done.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `iterator_state != AfterPeek` (must call [`next_header`] first)
+    /// - `advance_size - process_size < header.size` (message not fully validated)
+    /// - `invalid.is_some()` (buffer is in error state)
+    /// - Header checksum mismatch (internal consistency check)
+    pub fn consume_message(&mut self, pool: &MessagePool, header: &Header) -> RawMessage {
+        assert!(self.iterator_state == IteratorState::AfterPeek);
+        assert!(self.advance_size - self.process_size >= header.size);
+        assert!(self.invalid.is_none());
+
+        self.iterator_state = IteratorState::AfterConsumeSuspend;
+
+        if self.process_size == 0 && self.receive_size == header.size {
+            let header_in_buffer = self.copy_header();
+            assert_eq!(header_in_buffer.checksum, header.checksum);
+
+            assert_eq!(self.suspend_size, 0);
+            self.process_size = 0;
+            self.receive_size = 0;
+            self.advance_size = 0;
+            self.advance();
+            assert_eq!(self.advance_size, 0);
+
+            return mem::replace(&mut self.message, pool.get::<RawCommand>());
+        }
+
+        let mut message = pool.get::<RawCommand>();
+        {
+            let src_start = self.process_size as usize;
+            let src_end = src_start + header.size as usize;
+            raw_message_bytes_mut(&mut message)[..header.size as usize]
+                .copy_from_slice(&self.message_bytes()[src_start..src_end]);
+        }
+
+        self.process_size += header.size;
+        assert!(self.process_size <= self.receive_size);
+        self.advance();
+
+        let header_bytes = raw_message_bytes(&message)[..HEADER_SIZE_USIZE]
+            .try_into()
+            .expect("header slice length mismatch");
+        let copied_header = Header::from_bytes(header_bytes);
+        assert_eq!(copied_header.checksum, header.checksum);
+
+        message
     }
 
     /// Advances the parsing state machine by validating header and body.
