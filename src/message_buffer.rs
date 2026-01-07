@@ -319,7 +319,7 @@ impl MessageBuffer {
 
         self.receive_size += size;
         assert!(self.receive_size <= MESSAGE_SIZE_MAX);
-        // self.advance()
+        self.advance()
     }
 
     /// Marks this buffer as invalid and resets all cursor positions to zero.
@@ -338,6 +338,21 @@ impl MessageBuffer {
         self.receive_size = 0;
         self.iterator_state = IteratorState::Idle;
         self.invalid = Some(reason);
+        self.invariants();
+    }
+
+    /// Advances the parsing state machine by validating header and body.
+    ///
+    /// Calls [`advance_header`] then [`advance_body`], stopping early if
+    /// the buffer becomes invalid. Idempotent.
+    fn advance(&mut self) {
+        if self.invalid.is_none() {
+            self.advance_header();
+        }
+
+        if self.invalid.is_none() {
+            self.advance_body();
+        }
         self.invariants();
     }
 
@@ -391,6 +406,59 @@ impl MessageBuffer {
         }
 
         self.advance_size += HEADER_SIZE;
+    }
+
+    /// Validates the message body checksum if enough bytes are available.
+    ///
+    /// Idempotent: returns immediately if body already validated, header not yet
+    /// validated, or insufficient bytes. On validation failure, calls [`invalidate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `invalid.is_some()` (buffer already invalid).
+    fn advance_body(&mut self) {
+        assert!(self.invalid.is_none());
+        if self.advance_size < self.process_size + HEADER_SIZE {
+            return;
+        }
+
+        let header = self.copy_header();
+
+        if self.receive_size - self.process_size < header.size {
+            return;
+        }
+
+        if self.advance_size >= self.process_size + header.size {
+            return;
+        }
+
+        assert_eq!(self.advance_size - self.process_size, HEADER_SIZE);
+
+        let body_start = (self.process_size + HEADER_SIZE) as usize;
+        let body_end = (self.process_size + header.size) as usize;
+        let body = &self.message_bytes()[body_start..body_end];
+
+        if !header.is_valid_checksum_body(body) {
+            self.invalidate(InvalidReason::BodyChecksum);
+            return;
+        }
+
+        self.advance_size += header.size - HEADER_SIZE;
+    }
+
+    /// Copies and returns the header at the current process position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if fewer than [`HEADER_SIZE`] bytes are available.
+    fn copy_header(&mut self) -> Header {
+        assert!(self.receive_size - self.process_size >= HEADER_SIZE);
+        let start = self.process_size as usize;
+        let end = start + HEADER_SIZE as usize;
+        let header_bytes = self.message_bytes()[start..end]
+            .try_into()
+            .expect("header slice length mismatch");
+        Header::from_bytes(header_bytes)
     }
 
     /// Returns an immutable view of the message buffer bytes.
