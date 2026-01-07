@@ -61,7 +61,7 @@ use std::mem;
 use crate::{
     message_pool::{Message, MessagePool},
     vsr::{
-        Command, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
+        Command, HEADER_SIZE, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
         command::CommandMarker, header::ProtoHeader,
     },
 };
@@ -322,6 +322,77 @@ impl MessageBuffer {
         // self.advance()
     }
 
+    /// Marks this buffer as invalid and resets all cursor positions to zero.
+    ///
+    /// The MessageBus should terminate the associated connection when it
+    /// observes an invalid buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is already invalid.
+    pub fn invalidate(&mut self, reason: InvalidReason) {
+        assert!(self.invalid.is_none());
+        self.suspend_size = 0;
+        self.process_size = 0;
+        self.advance_size = 0;
+        self.receive_size = 0;
+        self.iterator_state = IteratorState::Idle;
+        self.invalid = Some(reason);
+        self.invariants();
+    }
+
+    /// Validates the next message header if enough bytes are available.
+    ///
+    /// Idempotent: returns immediately if header already validated or if
+    /// insufficient bytes are available. On success, advances `advance_size`
+    /// by [`HEADER_SIZE`]. On validation failure, calls [`invalidate`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `invalid.is_some()` (buffer already invalid)
+    /// - `advance_size > receive_size` (invariant violation)
+    /// - Unknown VSR command discriminant (protocol mismatch)
+    fn advance_header(&mut self) {
+        assert!(self.invalid.is_none());
+        assert!(self.advance_size <= self.receive_size);
+
+        if self.advance_size >= self.process_size + HEADER_SIZE {
+            return;
+        }
+        assert_eq!(self.advance_size, self.process_size);
+        if self.receive_size - self.process_size < HEADER_SIZE {
+            return;
+        }
+
+        let start = self.process_size as usize;
+        let end = start + HEADER_SIZE as usize;
+        let header_bytes = self.message_bytes()[start..end]
+            .try_into()
+            .expect("header slice length mismatch");
+        let header = Header::from_bytes(header_bytes);
+
+        if !header.is_valid_checksum() {
+            self.invalidate(InvalidReason::HeaderChecksum);
+            return;
+        }
+
+        let command_raw = header_bytes[COMMAND_OFFSET];
+        if Command::try_from_u8(command_raw).is_none() {
+            panic!(
+                "unknown VSR command (command={} protocol={} replica={} release={}",
+                command_raw, header.protocol, header.replica, header.release.0,
+            )
+        }
+
+        if header.size < HEADER_SIZE || header.size > MESSAGE_SIZE_MAX {
+            self.invalidate(InvalidReason::HeaderSize);
+            return;
+        }
+
+        self.advance_size += HEADER_SIZE;
+    }
+
     /// Returns an immutable view of the message buffer bytes.
     #[inline]
     fn message_bytes(&self) -> &[u8] {
@@ -336,6 +407,22 @@ impl MessageBuffer {
     #[inline]
     fn message_bytes_mut(&mut self) -> &mut [u8] {
         raw_message_bytes_mut(&mut self.message)
+    }
+
+    /// Asserts all internal invariants hold.
+    ///
+    /// Checks cursor ordering and invalid-state consistency.
+    fn invariants(&self) {
+        assert!(self.suspend_size <= self.process_size);
+        assert!(self.process_size <= self.advance_size);
+        assert!(self.advance_size <= self.receive_size);
+        if self.invalid.is_some() {
+            assert_eq!(self.suspend_size, 0);
+            assert_eq!(self.process_size, 0);
+            assert_eq!(self.advance_size, 0);
+            assert_eq!(self.receive_size, 0);
+            assert!(self.iterator_state == IteratorState::Idle);
+        }
     }
 }
 
