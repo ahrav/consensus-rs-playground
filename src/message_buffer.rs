@@ -523,6 +523,66 @@ impl MessageBuffer {
         message
     }
 
+    /// Suspends a message to be processed later, keeping it in the buffer.
+    ///
+    /// This method must be called after [`next_header`] returns `Some(header)`. Unlike
+    /// [`consume_message`], the message data stays in the buffer and will be available
+    /// in subsequent iteration cycles.
+    ///
+    /// # Buffer Compaction
+    ///
+    /// When there's a hole between suspended bytes and the current message (i.e.,
+    /// `suspend_size < process_size`), the message is moved to close the gap:
+    ///
+    /// ```text
+    /// Before:
+    /// |  bytes  |    hole     |    message    |     bytes    |
+    ///           ^suspend_size ^process_size                  ^receive_size
+    ///
+    /// After:
+    /// | bytes |    message    |     hole      |     bytes    |
+    ///                         ^suspend_size   ^process_size  ^receive_size
+    /// ```
+    ///
+    /// This compaction ensures suspended messages are contiguous at the front of the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - The header returned by the preceding [`next_header`] call
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `iterator_state != AfterPeek` (must call [`next_header`] first)
+    /// - `advance_size - process_size < header.size` (message not fully validated)
+    /// - `invalid.is_some()` (buffer is in error state)
+    /// - `header.size > MESSAGE_SIZE_MAX` (invalid message size)
+    /// - Header bytes in buffer don't match provided header (consistency check)
+    pub fn suspend_message(&mut self, header: &Header) {
+        assert!(self.iterator_state == IteratorState::AfterPeek);
+        assert!(self.advance_size - self.process_size >= header.size);
+        assert!(self.invalid.is_none());
+        assert!(header.size <= MESSAGE_SIZE_MAX);
+
+        let header_start = self.process_size as usize;
+        let header_end = header_start + HEADER_SIZE_USIZE;
+        let header_bytes = &self.message_bytes()[header_start..header_end];
+        assert_eq!(header_bytes, header.as_bytes());
+
+        self.iterator_state = IteratorState::AfterConsumeSuspend;
+
+        if self.suspend_size < self.process_size {
+            let src = self.process_size as usize;
+            let dst = self.suspend_size as usize;
+            let len = header.size as usize;
+            self.message_bytes_mut().copy_within(src..src + len, dst);
+        }
+
+        self.suspend_size += header.size;
+        self.process_size += header.size;
+        self.advance();
+    }
+
     /// Advances the parsing state machine by validating header and body.
     ///
     /// Calls [`advance_header`] then [`advance_body`], stopping early if
