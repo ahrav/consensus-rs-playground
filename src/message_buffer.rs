@@ -764,6 +764,11 @@ fn raw_message_bytes_mut(message: &mut RawMessage) -> &mut [u8] {
 mod tests {
     use super::*;
     use crate::vsr::{HeaderPrepare, Operation, Release};
+    use proptest::prelude::*;
+
+    const PROPTEST_CASES: u32 = 32;
+    const MESSAGES_MAX: usize = 100;
+    const BUFFER_MULTIPLIER: usize = 5;
 
     struct TestRng {
         state: u64,
@@ -814,122 +819,122 @@ mod tests {
         }
     }
 
-    #[test]
-    fn message_buffer_fuzz() {
-        const ITERATIONS: usize = 100;
-        const MESSAGES_MAX: usize = 100;
-        const BUFFER_MULTIPLIER: usize = 5;
-
-        let mut rng = TestRng::new(0x0ddc_0ffe_e100_fade);
+    fn run_scenario(seed: u64, fault: bool) {
+        let mut rng = TestRng::new(seed);
         let mut buffer = vec![0u8; BUFFER_MULTIPLIER * MESSAGE_SIZE_MAX_USIZE];
 
-        for _ in 0..ITERATIONS {
-            let fault = rng.boolean();
-            let mut total_size: usize = 0;
-            let mut headers: Vec<[u8; HEADER_SIZE_USIZE]> = Vec::new();
+        let mut total_size: usize = 0;
+        let mut headers: Vec<[u8; HEADER_SIZE_USIZE]> = Vec::new();
 
-            for _ in 0..MESSAGES_MAX {
-                let message_size = match rng.range_u32(0, 99) {
-                    0..=9 => HEADER_SIZE_USIZE,
-                    10..=19 => MESSAGE_SIZE_MAX_USIZE,
-                    _ => rng.range_usize(HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX_USIZE),
-                };
+        for _ in 0..MESSAGES_MAX {
+            let message_size = match rng.range_u32(0, 99) {
+                0..=9 => HEADER_SIZE_USIZE,
+                10..=19 => MESSAGE_SIZE_MAX_USIZE,
+                _ => rng.range_usize(HEADER_SIZE_USIZE, MESSAGE_SIZE_MAX_USIZE),
+            };
 
-                if total_size + message_size > buffer.len() {
-                    break;
-                }
-
-                let mut header = HeaderPrepare::new();
-                header.cluster = 1;
-                header.view = 1;
-                header.command = Command::Prepare;
-                header.parent = rng.next_u128();
-                header.request_checksum = rng.next_u128();
-                header.checkpoint_id = rng.next_u128();
-                header.client = 1;
-                header.commit = 10;
-                header.timestamp = 999;
-                header.request = 1;
-                header.operation = Operation::REGISTER;
-                header.release = Release::ZERO;
-                header.op = 1;
-                header.size = message_size as u32;
-
-                let body_start = total_size + HEADER_SIZE_USIZE;
-                let body_end = total_size + message_size;
-                let body = &mut buffer[body_start..body_end];
-                rng.fill_bytes(body);
-
-                header.set_checksum_body(body);
-                header.set_checksum();
-
-                buffer[total_size..total_size + HEADER_SIZE_USIZE]
-                    .copy_from_slice(header.as_bytes());
-
-                let header_bytes: [u8; HEADER_SIZE_USIZE] =
-                    header.as_bytes().try_into().expect("header size mismatch");
-                headers.push(header_bytes);
-
-                total_size += message_size;
+            if total_size + message_size > buffer.len() {
+                break;
             }
 
-            assert!(total_size > 0);
-            if fault {
-                let byte_index = rng.range_usize(0, total_size - 1);
-                let bit_index = rng.range_u32(0, 7) as u8;
-                buffer[byte_index] ^= 1u8 << bit_index;
+            let mut header = HeaderPrepare::new();
+            header.cluster = 1;
+            header.view = 1;
+            header.command = Command::Prepare;
+            header.parent = rng.next_u128();
+            header.request_checksum = rng.next_u128();
+            header.checkpoint_id = rng.next_u128();
+            header.client = 1;
+            header.commit = 10;
+            header.timestamp = 999;
+            header.request = 1;
+            header.operation = Operation::REGISTER;
+            header.release = Release::ZERO;
+            header.op = 1;
+            header.size = message_size as u32;
+
+            let body_start = total_size + HEADER_SIZE_USIZE;
+            let body_end = total_size + message_size;
+            let body = &mut buffer[body_start..body_end];
+            rng.fill_bytes(body);
+
+            header.set_checksum_body(body);
+            header.set_checksum();
+
+            buffer[total_size..total_size + HEADER_SIZE_USIZE].copy_from_slice(header.as_bytes());
+
+            let header_bytes: [u8; HEADER_SIZE_USIZE] =
+                header.as_bytes().try_into().expect("header size mismatch");
+            headers.push(header_bytes);
+
+            total_size += message_size;
+        }
+
+        assert!(total_size > 0);
+        if fault {
+            let byte_index = rng.range_usize(0, total_size - 1);
+            let bit_index = rng.range_u32(0, 7) as u8;
+            buffer[byte_index] ^= 1u8 << bit_index;
+        }
+
+        let pool = MessagePool::new(4);
+        let mut message_buffer = MessageBuffer::init(&pool);
+
+        let mut recv_size: usize = 0;
+        while !headers.is_empty() {
+            if message_buffer.receive_size < MESSAGE_SIZE_MAX && recv_size < total_size {
+                let recv_slice = message_buffer.recv_slice();
+                let remaining = total_size - recv_size;
+                let max_chunk = recv_slice.len().min(remaining);
+                let chunk_size = rng.range_usize(1, max_chunk);
+
+                recv_slice[..chunk_size]
+                    .copy_from_slice(&buffer[recv_size..recv_size + chunk_size]);
+                message_buffer.recv_advance(chunk_size as u32);
+                recv_size += chunk_size;
             }
 
-            let pool = MessagePool::new(4);
-            let mut message_buffer = MessageBuffer::init(&pool);
+            let mut header_index = 0usize;
+            while let Some(header) = message_buffer.next_header() {
+                message_buffer.invariants();
+                assert!(header_index < headers.len());
+                assert_eq!(header.as_bytes(), &headers[header_index]);
 
-            let mut recv_size: usize = 0;
-            while !headers.is_empty() {
-                if message_buffer.receive_size < MESSAGE_SIZE_MAX && recv_size < total_size {
-                    let recv_slice = message_buffer.recv_slice();
-                    let remaining = total_size - recv_size;
-                    let max_chunk = recv_slice.len().min(remaining);
-                    let chunk_size = rng.range_usize(1, max_chunk);
-
-                    recv_slice[..chunk_size]
-                        .copy_from_slice(&buffer[recv_size..recv_size + chunk_size]);
-                    message_buffer.recv_advance(chunk_size as u32);
-                    recv_size += chunk_size;
-                }
-
-                let mut header_index = 0usize;
-                while let Some(header) = message_buffer.next_header() {
-                    message_buffer.invariants();
-                    assert!(header_index < headers.len());
-                    assert_eq!(header.as_bytes(), &headers[header_index]);
-
-                    if rng.boolean() {
-                        let message = message_buffer.consume_message(&pool, &header);
-                        assert_eq!(message.header().as_bytes(), &headers[header_index]);
-                        headers.remove(header_index);
-                        drop(message);
-                    } else {
-                        message_buffer.suspend_message(&header);
-                        header_index += 1;
-                    }
-                }
-
-                assert!(message_buffer.iterator_state == IteratorState::Idle);
-
-                if let Some(reason) = message_buffer.invalid {
-                    if !fault {
-                        panic!("invalid without faults: {reason:?}");
-                    }
-                    break;
+                if rng.boolean() {
+                    let message = message_buffer.consume_message(&pool, &header);
+                    assert_eq!(message.header().as_bytes(), &headers[header_index]);
+                    headers.remove(header_index);
+                    drop(message);
+                } else {
+                    message_buffer.suspend_message(&header);
+                    header_index += 1;
                 }
             }
 
-            if fault {
-                assert!(message_buffer.invalid.is_some());
-            } else {
-                assert!(message_buffer.invalid.is_none());
-                assert!(headers.is_empty());
+            assert!(message_buffer.iterator_state == IteratorState::Idle);
+
+            if let Some(reason) = message_buffer.invalid {
+                if !fault {
+                    panic!("invalid without faults: {reason:?}");
+                }
+                break;
             }
+        }
+
+        if fault {
+            assert!(message_buffer.invalid.is_some());
+        } else {
+            assert!(message_buffer.invalid.is_none());
+            assert!(headers.is_empty());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+
+        #[test]
+        fn message_buffer_prop(seed in any::<u64>(), fault in any::<bool>()) {
+            run_scenario(seed, fault);
         }
     }
 }
