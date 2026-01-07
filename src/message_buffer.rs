@@ -356,7 +356,7 @@ impl MessageBuffer {
                 return true;
             }
         }
-        return false;
+        false
     }
 
     /// Returns the header of the next complete message, or `None` when iteration ends.
