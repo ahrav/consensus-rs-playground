@@ -341,6 +341,112 @@ impl MessageBuffer {
         self.invariants();
     }
 
+    /// Returns `true` if a complete, validated message is available for processing.
+    ///
+    /// This checks whether enough validated bytes exist (from `process_size` to `advance_size`)
+    /// to contain both a header and the full message body indicated by that header's size field.
+    ///
+    /// Note: This does not advance the iterator state. Use [`next_header`] to actually
+    /// retrieve the message header for processing.
+    pub fn has_message(&mut self) -> bool {
+        let valid_unprocessed = self.advance_size - self.process_size;
+        if valid_unprocessed >= HEADER_SIZE {
+            let header = self.copy_header();
+            if valid_unprocessed >= header.size {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Returns the header of the next complete message, or `None` when iteration ends.
+    ///
+    /// `MessageBuffer` is an iterator that must be driven to completion. When this method
+    /// returns `Some(header)`, the caller **must** immediately call either [`consume_message`]
+    /// or [`suspend_message`] before calling `next_header` again.
+    ///
+    /// # Iterator Protocol
+    ///
+    /// ```text
+    /// loop {
+    ///     match buffer.next_header() {
+    ///         Some(header) => {
+    ///             // MUST call one of these before next iteration:
+    ///             buffer.consume_message(...) // or
+    ///             buffer.suspend_message(...)
+    ///         }
+    ///         None => break, // Iteration complete, ready for next recv cycle
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Buffer Compaction
+    ///
+    /// When returning `None`, this method compacts the buffer by eliminating the hole
+    /// between suspended and unprocessed bytes:
+    ///
+    /// ```text
+    /// Before compaction:
+    /// |  bytes  |     hole     |     bytes     |    hole    |
+    ///           ^suspend_size  ^process_size   ^receive_size
+    ///
+    /// After compaction:
+    /// |           bytes             |         hole          |
+    /// ^ suspend_size,process_size   ^ receive_size
+    /// ```
+    ///
+    /// This compaction preserves suspended messages at the front while making room
+    /// for new data from the next `recv()` syscall.
+    ///
+    /// # Sticky Validation
+    ///
+    /// The method includes an idempotency check: after compaction, `advance()` is called
+    /// to verify that checksum validation results are preserved. This ensures messages
+    /// are validated exactly once, even across multiple iteration cycles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while in `AfterPeek` state (i.e., after `next_header` returned
+    /// `Some` but before `consume_message` or `suspend_message` was called).
+    pub fn next_header(&mut self) -> Option<Header> {
+        match self.iterator_state {
+            IteratorState::Idle | IteratorState::AfterConsumeSuspend => {}
+            IteratorState::AfterPeek => unreachable!("next_header called without consume/suspend"),
+        }
+
+        let valid_unprocessed = self.advance_size - self.process_size;
+        if valid_unprocessed >= HEADER_SIZE {
+            let header = self.copy_header();
+            if valid_unprocessed > header.size {
+                self.iterator_state = IteratorState::AfterPeek;
+                return Some(header);
+            }
+        }
+
+        assert!(self.suspend_size <= self.process_size);
+        assert!(self.process_size <= self.receive_size);
+
+        if self.suspend_size < self.process_size {
+            let start = self.process_size as usize;
+            let end = self.receive_size as usize;
+            let dst = self.suspend_size as usize;
+            self.message_bytes_mut().copy_within(start..end, dst);
+        }
+
+        let delta = self.process_size - self.suspend_size;
+        self.receive_size -= delta;
+        self.advance_size -= delta;
+        self.suspend_size = 0;
+        self.process_size = 0;
+        self.iterator_state = IteratorState::Idle;
+
+        let advance_size_idempotent = self.advance_size;
+        self.advance();
+        assert_eq!(self.advance_size, advance_size_idempotent);
+
+        None
+    }
+
     /// Advances the parsing state machine by validating header and body.
     ///
     /// Calls [`advance_header`] then [`advance_body`], stopping early if
