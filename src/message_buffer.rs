@@ -61,8 +61,8 @@ use std::mem;
 use crate::{
     message_pool::{Message, MessagePool},
     vsr::{
-        Command, HEADER_SIZE, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX, MESSAGE_SIZE_MAX_USIZE,
-        command::CommandMarker, header::ProtoHeader,
+        Command, HEADER_SIZE, HEADER_SIZE_USIZE, Header, HeaderPrepareRaw, MESSAGE_SIZE_MAX,
+        MESSAGE_SIZE_MAX_USIZE, command::CommandMarker, header::ProtoHeader,
     },
 };
 
@@ -339,6 +339,248 @@ impl MessageBuffer {
         self.iterator_state = IteratorState::Idle;
         self.invalid = Some(reason);
         self.invariants();
+    }
+
+    /// Returns `true` if a complete, validated message is available for processing.
+    ///
+    /// This checks whether enough validated bytes exist (from `process_size` to `advance_size`)
+    /// to contain both a header and the full message body indicated by that header's size field.
+    ///
+    /// Note: This does not advance the iterator state. Use [`next_header`] to actually
+    /// retrieve the message header for processing.
+    pub fn has_message(&mut self) -> bool {
+        let valid_unprocessed = self.advance_size - self.process_size;
+        if valid_unprocessed >= HEADER_SIZE {
+            let header = self.copy_header();
+            if valid_unprocessed >= header.size {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Returns the header of the next complete message, or `None` when iteration ends.
+    ///
+    /// `MessageBuffer` is an iterator that must be driven to completion. When this method
+    /// returns `Some(header)`, the caller **must** immediately call either [`consume_message`]
+    /// or [`suspend_message`] before calling `next_header` again.
+    ///
+    /// # Iterator Protocol
+    ///
+    /// ```text
+    /// loop {
+    ///     match buffer.next_header() {
+    ///         Some(header) => {
+    ///             // MUST call one of these before next iteration:
+    ///             buffer.consume_message(...) // or
+    ///             buffer.suspend_message(...)
+    ///         }
+    ///         None => break, // Iteration complete, ready for next recv cycle
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Buffer Compaction
+    ///
+    /// When returning `None`, this method compacts the buffer by eliminating the hole
+    /// between suspended and unprocessed bytes:
+    ///
+    /// ```text
+    /// Before compaction:
+    /// |  bytes  |     hole     |     bytes     |    hole    |
+    ///           ^suspend_size  ^process_size   ^receive_size
+    ///
+    /// After compaction:
+    /// |           bytes             |         hole          |
+    /// ^ suspend_size,process_size   ^ receive_size
+    /// ```
+    ///
+    /// This compaction preserves suspended messages at the front while making room
+    /// for new data from the next `recv()` syscall.
+    ///
+    /// # Sticky Validation
+    ///
+    /// The method includes an idempotency check: after compaction, `advance()` is called
+    /// to verify that checksum validation results are preserved. This ensures messages
+    /// are validated exactly once, even across multiple iteration cycles.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called while in `AfterPeek` state (i.e., after `next_header` returned
+    /// `Some` but before `consume_message` or `suspend_message` was called).
+    pub fn next_header(&mut self) -> Option<Header> {
+        match self.iterator_state {
+            IteratorState::Idle | IteratorState::AfterConsumeSuspend => {}
+            IteratorState::AfterPeek => unreachable!("next_header called without consume/suspend"),
+        }
+
+        let valid_unprocessed = self.advance_size - self.process_size;
+        if valid_unprocessed >= HEADER_SIZE {
+            let header = self.copy_header();
+            if valid_unprocessed >= header.size {
+                self.iterator_state = IteratorState::AfterPeek;
+                return Some(header);
+            }
+        }
+
+        assert!(self.suspend_size <= self.process_size);
+        assert!(self.process_size <= self.receive_size);
+
+        if self.suspend_size < self.process_size {
+            let start = self.process_size as usize;
+            let end = self.receive_size as usize;
+            let dst = self.suspend_size as usize;
+            self.message_bytes_mut().copy_within(start..end, dst);
+        }
+
+        let delta = self.process_size - self.suspend_size;
+        self.receive_size -= delta;
+        self.advance_size -= delta;
+        self.suspend_size = 0;
+        self.process_size = 0;
+        self.iterator_state = IteratorState::Idle;
+
+        let advance_size_idempotent = self.advance_size;
+        self.advance();
+        assert_eq!(self.advance_size, advance_size_idempotent);
+
+        None
+    }
+
+    /// Consumes a message that was peeked via [`next_header`] and returns it as an owned [`RawMessage`].
+    ///
+    /// This method must be called after [`next_header`] returns `Some(header)`. It extracts the
+    /// message from the buffer and advances `process_size` past the consumed bytes.
+    ///
+    /// # Zero-Copy Fast Path
+    ///
+    /// When the message is the only one in the buffer (i.e., `process_size == 0` and
+    /// `receive_size == header.size`), the internal buffer is returned directly without copying.
+    /// A fresh buffer is acquired from the pool to replace it. This optimization avoids memory
+    /// copies when processing single messages.
+    ///
+    /// # Copy Path
+    ///
+    /// When multiple messages exist in the buffer, the message bytes are copied to a new buffer
+    /// acquired from the pool. The original buffer is retained for continued iteration.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - The message pool to acquire a new buffer from (for replacement or copying)
+    /// * `header` - The header returned by the preceding [`next_header`] call
+    ///
+    /// # Returns
+    ///
+    /// An owned [`RawMessage`] containing the consumed message data. The caller is responsible
+    /// for returning this message to the pool when done.
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `iterator_state != AfterPeek` (must call [`next_header`] first)
+    /// - `advance_size - process_size < header.size` (message not fully validated)
+    /// - `invalid.is_some()` (buffer is in error state)
+    /// - Header checksum mismatch (internal consistency check)
+    pub fn consume_message(&mut self, pool: &MessagePool, header: &Header) -> RawMessage {
+        assert!(self.iterator_state == IteratorState::AfterPeek);
+        assert!(self.advance_size - self.process_size >= header.size);
+        assert!(self.invalid.is_none());
+
+        self.iterator_state = IteratorState::AfterConsumeSuspend;
+
+        if self.process_size == 0 && self.receive_size == header.size {
+            let header_in_buffer = self.copy_header();
+            assert_eq!(header_in_buffer.checksum, header.checksum);
+
+            assert_eq!(self.suspend_size, 0);
+            self.process_size = 0;
+            self.receive_size = 0;
+            self.advance_size = 0;
+            self.advance();
+            assert_eq!(self.advance_size, 0);
+
+            return mem::replace(&mut self.message, pool.get::<RawCommand>());
+        }
+
+        let mut message = pool.get::<RawCommand>();
+        {
+            let src_start = self.process_size as usize;
+            let src_end = src_start + header.size as usize;
+            raw_message_bytes_mut(&mut message)[..header.size as usize]
+                .copy_from_slice(&self.message_bytes()[src_start..src_end]);
+        }
+
+        self.process_size += header.size;
+        assert!(self.process_size <= self.receive_size);
+        self.advance();
+
+        let header_bytes = raw_message_bytes(&message)[..HEADER_SIZE_USIZE]
+            .try_into()
+            .expect("header slice length mismatch");
+        let copied_header = Header::from_bytes(header_bytes);
+        assert_eq!(copied_header.checksum, header.checksum);
+
+        message
+    }
+
+    /// Suspends a message to be processed later, keeping it in the buffer.
+    ///
+    /// This method must be called after [`next_header`] returns `Some(header)`. Unlike
+    /// [`consume_message`], the message data stays in the buffer and will be available
+    /// in subsequent iteration cycles.
+    ///
+    /// # Buffer Compaction
+    ///
+    /// When there's a hole between suspended bytes and the current message (i.e.,
+    /// `suspend_size < process_size`), the message is moved to close the gap:
+    ///
+    /// ```text
+    /// Before:
+    /// |  bytes  |    hole     |    message    |     bytes    |
+    ///           ^suspend_size ^process_size                  ^receive_size
+    ///
+    /// After:
+    /// | bytes |    message    |     hole      |     bytes    |
+    ///                         ^suspend_size   ^process_size  ^receive_size
+    /// ```
+    ///
+    /// This compaction ensures suspended messages are contiguous at the front of the buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - The header returned by the preceding [`next_header`] call
+    ///
+    /// # Panics
+    ///
+    /// Panics if:
+    /// - `iterator_state != AfterPeek` (must call [`next_header`] first)
+    /// - `advance_size - process_size < header.size` (message not fully validated)
+    /// - `invalid.is_some()` (buffer is in error state)
+    /// - `header.size > MESSAGE_SIZE_MAX` (invalid message size)
+    /// - Header bytes in buffer don't match provided header (consistency check)
+    pub fn suspend_message(&mut self, header: &Header) {
+        assert!(self.iterator_state == IteratorState::AfterPeek);
+        assert!(self.advance_size - self.process_size >= header.size);
+        assert!(self.invalid.is_none());
+        assert!(header.size <= MESSAGE_SIZE_MAX);
+
+        let header_start = self.process_size as usize;
+        let header_end = header_start + HEADER_SIZE_USIZE;
+        let header_bytes = &self.message_bytes()[header_start..header_end];
+        assert_eq!(header_bytes, header.as_bytes());
+
+        self.iterator_state = IteratorState::AfterConsumeSuspend;
+
+        if self.suspend_size < self.process_size {
+            let src = self.process_size as usize;
+            let dst = self.suspend_size as usize;
+            let len = header.size as usize;
+            self.message_bytes_mut().copy_within(src..src + len, dst);
+        }
+
+        self.suspend_size += header.size;
+        self.process_size += header.size;
+        self.advance();
     }
 
     /// Advances the parsing state machine by validating header and body.
