@@ -262,6 +262,11 @@ impl MessageBuffer {
         }
     }
 
+    /// Releases the internal buffer back to the message pool.
+    pub fn deinit(self) {
+        drop(self);
+    }
+
     /// Returns a mutable slice to pass to the kernel for reading.
     ///
     /// This slice starts at `receive_size` and extends to the end of the buffer,
