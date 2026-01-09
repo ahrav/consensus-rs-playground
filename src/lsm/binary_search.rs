@@ -121,7 +121,7 @@ pub struct BinarySearchRangeUpsertIndexes {
     /// Lower bound (inclusive): first position >= key_min.
     pub start: u32,
 
-    /// Upper bound (exclusive): first position > key_max.
+    /// Upper-bound upsert index: rightmost match for key_max, or insertion point.
     pub end: u32,
 }
 
@@ -397,7 +397,7 @@ where
 ///
 /// Returns [`BinarySearchRangeUpsertIndexes`] with:
 /// - `start`: Lower bound (first position >= `key_min`)
-/// - `end`: Upper bound (first position > `key_max`)
+/// - `end`: Upper-bound upsert index (rightmost match for `key_max`, or insertion point)
 ///
 /// # Panics
 ///
