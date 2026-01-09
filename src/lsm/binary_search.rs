@@ -448,7 +448,7 @@ where
     }
 }
 
-/// Finds insertion indexes for a key range within a sorted key slice.
+/// Finds upsert indexes for a key range within a sorted key slice.
 ///
 /// Convenience wrapper around [`binary_search_values_range_upsert_indexes`]
 /// for slices where the values are the keys themselves.
