@@ -19,9 +19,6 @@ const _: () = assert!(
 /// CPU cache line size in bytes.
 pub const CACHE_LINE_SIZE: u64 = 64;
 
-/// Enable extra verification checks in debug builds or with the `verify` feature.
-pub const VERIFY: bool = cfg!(any(debug_assertions, feature = "verify"));
-
 // =============================================================================
 // Disk / storage constants
 // =============================================================================
