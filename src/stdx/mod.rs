@@ -1,5 +1,6 @@
 pub mod bitset;
 pub mod bounded_array;
+pub mod fastrange;
 pub mod list;
 pub mod queue;
 pub mod released_set;
