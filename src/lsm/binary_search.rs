@@ -30,6 +30,18 @@ pub struct BinarySearchResult {
     pub exact: bool,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BinarySearchRangeUpsertIndexes {
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct BinarySearchRange {
+    pub start: u32,
+    pub count: u32,
+}
+
 #[inline(always)]
 fn as_u32(x: usize) -> u32 {
     debug_assert!(x <= u32::MAX as usize);
@@ -164,4 +176,46 @@ where
     }
 
     as_u32(offset)
+}
+
+#[inline(always)]
+pub fn binary_search_keys_upsert_index<Key>(keys: &[Key], key: Key, config: Config) -> u32
+where
+    Key: Ord + Copy,
+{
+    let key_from_key = |k: &Key| *k;
+    binary_search_values_upsert_index(keys, key, config, &key_from_key)
+}
+
+#[inline(always)]
+pub fn binary_search_values<'a, Key, Value, F>(
+    values: &'a [Value],
+    key: Key,
+    config: Config,
+    key_from_value: &F,
+) -> Option<&'a Value>
+where
+    Key: Ord + Copy,
+    F: Fn(&Value) -> Key,
+{
+    let index = binary_search_values_upsert_index(values, key, config, key_from_value) as usize;
+
+    if index < values.len() && key_from_value(&values[index]) == key {
+        Some(&values[index])
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+pub fn binary_search_keys<Key>(keys: &[Key], key: Key, config: Config) -> BinarySearchResult
+where
+    Key: Ord + Copy,
+{
+    let index = binary_search_keys_upsert_index(keys, key, config);
+    let i = index as usize;
+    BinarySearchResult {
+        index,
+        exact: i < keys.len() && keys[i] == key,
+    }
 }
