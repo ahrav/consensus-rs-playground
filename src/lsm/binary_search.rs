@@ -160,7 +160,7 @@ unsafe fn prefetch_read_data(addr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_MM_HINT_NTA, _mm_prefetch};
-        _mm_prefetch(addr as *const i8, _MM_HINT_NTA);
+        unsafe { _mm_prefetch(addr as *const i8, _MM_HINT_NTA) };
     }
     #[cfg(target_arch = "x86")]
     {
