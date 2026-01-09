@@ -5,15 +5,14 @@
 //!
 //! # Key Features
 //!
-//! - **Branchless implementation**: Eliminates branch mispredictions by using
-//!   arithmetic instead of conditional jumps, critical for performance in
-//!   tight loops over large datasets.
+//! - **Branch-reduced offset update**: Uses arithmetic to update the offset
+//!   instead of an unpredictable branch during the mid comparison.
 //!
 //! - **Cache prefetching**: Optionally prefetches memory at the 1/4 and 3/4
 //!   positions during each iteration, reducing cache misses on large arrays.
 //!
-//! - **Lower/upper bound modes**: Supports both bound types for range queries
-//!   common in LSM tree operations.
+//! - **Lower/upper bound modes**: Selects the first or last duplicate match,
+//!   which is useful for range queries in LSM trees.
 //!
 //! # When to Use
 //!
@@ -84,7 +83,6 @@ pub struct Config {
     /// current search range on each iteration. This hides memory latency
     /// for large arrays but adds overhead for small arrays.
     ///
-    /// **Recommendation**: Enable for arrays larger than ~1000 elements.
     pub prefetch: bool,
 }
 
@@ -113,9 +111,8 @@ pub struct BinarySearchResult {
 
 /// Index bounds for range operations, using upsert semantics.
 ///
-/// Both `start` and `end` represent insertion points, not necessarily
-/// positions of existing elements. This is useful for determining where
-/// new elements would be inserted while maintaining sort order.
+/// `start` and `end` point at matching elements when they exist; otherwise
+/// they are insertion points that preserve sort order.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct BinarySearchRangeUpsertIndexes {
     /// Lower bound (inclusive): first position >= key_min.
@@ -153,9 +150,6 @@ fn as_u32(x: usize) -> u32 {
 /// # Safety
 ///
 /// - `addr` must be a valid pointer within mapped memory.
-/// - On most architectures, prefetching an invalid address is silently ignored,
-///   but this is not guaranteed.
-///
 /// # Platform Support
 ///
 /// - **x86/x86_64**: Uses `_mm_prefetch` with `_MM_HINT_NTA`
@@ -210,12 +204,16 @@ unsafe fn prefetch_value<T>(ptr: *const T) {
     }
 }
 
-/// Finds the insertion index for a key within sorted values.
+/// Finds the upsert index for a key within sorted values.
 ///
-/// Returns the index where `key` should be inserted to maintain sort order.
-/// The exact position depends on the [`Mode`] configuration:
+/// Returns either the index of a value equal to `key`, or the index where `key`
+/// would be inserted. The exact position depends on the [`Mode`] configuration:
 /// - [`Mode::LowerBound`]: First position where element >= key
 /// - [`Mode::UpperBound`]: Rightmost match if any, otherwise insertion point
+///
+/// If duplicates exist, returns the first match for `LowerBound` and the last
+/// match for `UpperBound`. Expects `values` to be sorted by key. This function
+/// does not perform the extra comparison to determine whether the match is exact.
 ///
 /// # Panics
 ///
@@ -259,16 +257,16 @@ where
     }
 }
 
-/// Core branchless binary search implementation.
+/// Core binary search implementation.
 ///
 /// # Algorithm
 ///
-/// Uses a branchless variant that eliminates conditional jumps by computing:
+/// Uses an arithmetic offset update instead of branching on the mid comparison:
 /// ```text
 /// offset += half * (condition as usize)
 /// ```
-/// This converts the branch to an arithmetic operation, avoiding branch
-/// misprediction penalties at the cost of slightly more work per iteration.
+/// This avoids an unpredictable branch at the cost of slightly more work per
+/// iteration.
 ///
 /// # Prefetch Strategy
 ///
@@ -393,11 +391,14 @@ where
     }
 }
 
-/// Finds insertion indexes for a key range within sorted values.
+/// Finds upsert indexes for a key range within sorted values.
 ///
 /// Returns [`BinarySearchRangeUpsertIndexes`] with:
 /// - `start`: Lower bound (first position >= `key_min`)
 /// - `end`: Upper-bound upsert index (rightmost match for `key_max`, or insertion point)
+///
+/// If duplicates exist, returns the first match for `key_min` and the last
+/// match for `key_max`.
 ///
 /// # Panics
 ///
@@ -464,13 +465,15 @@ where
     binary_search_values_range_upsert_indexes(keys, key_min, key_max, &key_from_key)
 }
 
-/// Finds all values with keys in the inclusive range `[key_min, key_max]`.
+/// Returns the index of the first value >= `key_min` and the count of elements
+/// until the last value <= `key_max`.
 ///
 /// Returns a [`BinarySearchRange`] with:
 /// - `start`: Index of the first matching element
 /// - `count`: Number of elements in the range (0 if none match)
 ///
-/// This is the primary range query function for LSM tree lookups.
+/// The result is always safe for slicing using `values[start..][0..count]`,
+/// even when no elements match.
 #[inline(always)]
 pub fn binary_search_values_range<Key, Value, F>(
     values: &[Value],
