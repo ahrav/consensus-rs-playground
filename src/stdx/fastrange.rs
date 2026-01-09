@@ -14,6 +14,7 @@
 /// ```
 #[inline]
 pub fn fast_range(word: u64, p: u64) -> u64 {
+    debug_assert!(p > 0);
     let ln = (word as u128).wrapping_mul(p as u128);
     (ln >> 64) as u64
 }
