@@ -5,8 +5,8 @@
 //!
 //! # Key Features
 //!
-//! - **Branch-reduced offset update**: Uses arithmetic to update the offset
-//!   instead of an unpredictable branch during the mid comparison.
+//! - **Branching offset update**: Uses a conditional branch to select the next
+//!   half, matching the TigerBeetle implementation.
 //!
 //! - **Cache prefetching**: Optionally prefetches memory at the 1/4 and 3/4
 //!   positions during each iteration, reducing cache misses on large arrays.
@@ -261,12 +261,10 @@ where
 ///
 /// # Algorithm
 ///
-/// Uses an arithmetic offset update instead of branching on the mid comparison:
+/// Uses a conditional branch to update the offset:
 /// ```text
-/// offset += half * (condition as usize)
+/// if take_upper_half { offset = mid }
 /// ```
-/// This avoids an unpredictable branch at the cost of slightly more work per
-/// iteration.
 ///
 /// # Prefetch Strategy
 ///
@@ -323,7 +321,9 @@ where
 
         let take_upper_half = if UPPER { mid_key <= key } else { mid_key < key };
 
-        offset += half * (take_upper_half as usize);
+        if take_upper_half {
+            offset = mid;
+        }
 
         length -= half;
     }
