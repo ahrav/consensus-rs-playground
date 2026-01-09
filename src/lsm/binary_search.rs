@@ -619,13 +619,12 @@ mod tests {
                 }
             }
 
+            let actual = binary_search_keys(&keys, target_key, config);
             if LOG {
                 println!("keys: {:?}", keys);
                 println!("target key: {}", target_key);
-                println!("expected: {:?}, actual: {:?}", expect, config);
+                println!("expected: {:?}, actual: {:?}", expect, actual);
             }
-
-            let actual = binary_search_keys(&keys, target_key, config);
             assert_eq!(expect.index, actual.index);
             assert_eq!(expect.exact, actual.exact);
 
