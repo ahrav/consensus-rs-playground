@@ -1,11 +1,11 @@
-use consensus::lsm::binary_search::{binary_search_values_upsert_index, Config, Mode};
+use consensus::lsm::binary_search::{Config, Mode, binary_search_values_upsert_index};
+use core::mem::size_of;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use proptest::prelude::*;
 use proptest::strategy::ValueTree;
 use proptest::test_runner::{TestRng, TestRunner};
-use std::hint::black_box;
 use std::env;
-use core::mem::size_of;
+use std::hint::black_box;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
@@ -283,12 +283,8 @@ fn bench_custom<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
                 let page_index = fixture.page_picker[i % fixture.page_picker.len()];
                 let offset = page_index * fixture.values_per_page;
                 let page = &fixture.values[offset..offset + fixture.values_per_page];
-                let hit_index = binary_search_values_upsert_index(
-                    page,
-                    target_key,
-                    config,
-                    &key_from_value,
-                );
+                let hit_index =
+                    binary_search_values_upsert_index(page, target_key, config, &key_from_value);
                 let hit = unsafe { page.get_unchecked(hit_index as usize) };
                 let hit_key = key_from_value(hit);
                 debug_assert!(hit_key == target_key);
@@ -373,8 +369,7 @@ fn bench_partition_point<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
                 let page_index = fixture.page_picker[i % fixture.page_picker.len()];
                 let offset = page_index * fixture.values_per_page;
                 let page = &fixture.values[offset..offset + fixture.values_per_page];
-                let hit_index =
-                    page.partition_point(|value| key_from_value(value) < target_key);
+                let hit_index = page.partition_point(|value| key_from_value(value) < target_key);
                 let hit_key = key_from_value(unsafe { page.get_unchecked(hit_index) });
                 debug_assert!(hit_key == target_key);
                 checksum = checksum.wrapping_add(key_to_checksum(hit_key));
