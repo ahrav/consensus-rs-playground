@@ -159,7 +159,7 @@ fn as_u32(x: usize) -> u32 {
 /// # Platform Support
 ///
 /// - **x86/x86_64**: Uses `_mm_prefetch` with `_MM_HINT_NTA`
-/// - **aarch64**: Uses `prfm pldl1stream` instruction
+/// - **aarch64**: Uses `prfm pldl1strm` instruction
 /// - **Other**: No-op
 #[inline(always)]
 unsafe fn prefetch_read_data(addr: *const u8) {
@@ -178,7 +178,7 @@ unsafe fn prefetch_read_data(addr: *const u8) {
         use core::arch::asm;
         unsafe {
             asm!(
-                "prfm pldl1stream, [{0}]",
+                "prfm pldl1strm, [{0}]",
                 in(reg) addr,
                 options(nostack, preserves_flags)
             )
