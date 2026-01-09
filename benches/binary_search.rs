@@ -14,7 +14,7 @@ const MAX_PAGE_COUNT: usize = 1_048_576;
 
 const DEFAULT_SAMPLE_SIZE: usize = 32;
 const DEFAULT_SEARCHES: usize = 20_000;
-const DEFAULT_BLOB_SIZE: usize = 1 * GIB;
+const DEFAULT_BLOB_SIZE: usize = GIB;
 
 #[derive(Clone, Copy)]
 struct Scenario {
@@ -32,7 +32,7 @@ const SCENARIOS: [Scenario; 2] = [
     Scenario {
         name: "out-of-cache",
         values_per_page: 4_096,
-        page_buffer_size: 1 * GIB,
+        page_buffer_size: GIB,
     },
 ];
 
@@ -74,17 +74,23 @@ fn bench_binary_search(c: &mut Criterion) {
             &mut runner_128,
         );
 
-        bench_custom(
-            &mut group,
+        let input_128 = BenchInput {
             scenario,
             search_count,
-            "K=8B V=128B",
-            &fixture_128,
-            Config {
-                mode: Mode::LowerBound,
-                prefetch: true,
+            layout_name: "K=8B V=128B",
+            fixture: &fixture_128,
+        };
+
+        bench_custom(
+            &mut group,
+            input_128,
+            CustomOptions {
+                config: Config {
+                    mode: Mode::LowerBound,
+                    prefetch: true,
+                },
+                label: "custom prefetch-on",
             },
-            "custom prefetch-on",
             key_from_value_u64,
             key_from_index_u64,
             checksum_u64,
@@ -92,15 +98,14 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_custom(
             &mut group,
-            scenario,
-            search_count,
-            "K=8B V=128B",
-            &fixture_128,
-            Config {
-                mode: Mode::LowerBound,
-                prefetch: false,
+            input_128,
+            CustomOptions {
+                config: Config {
+                    mode: Mode::LowerBound,
+                    prefetch: false,
+                },
+                label: "custom prefetch-off",
             },
-            "custom prefetch-off",
             key_from_value_u64,
             key_from_index_u64,
             checksum_u64,
@@ -108,10 +113,7 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_std(
             &mut group,
-            scenario,
-            search_count,
-            "K=8B V=128B",
-            &fixture_128,
+            input_128,
             key_from_value_u64,
             key_from_index_u64,
             checksum_u64,
@@ -119,10 +121,7 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_partition_point(
             &mut group,
-            scenario,
-            search_count,
-            "K=8B V=128B",
-            &fixture_128,
+            input_128,
             key_from_value_u64,
             key_from_index_u64,
             checksum_u64,
@@ -139,17 +138,23 @@ fn bench_binary_search(c: &mut Criterion) {
             &mut runner_32,
         );
 
-        bench_custom(
-            &mut group,
+        let input_32 = BenchInput {
             scenario,
             search_count,
-            "K=32B V=32B",
-            &fixture_32,
-            Config {
-                mode: Mode::LowerBound,
-                prefetch: true,
+            layout_name: "K=32B V=32B",
+            fixture: &fixture_32,
+        };
+
+        bench_custom(
+            &mut group,
+            input_32,
+            CustomOptions {
+                config: Config {
+                    mode: Mode::LowerBound,
+                    prefetch: true,
+                },
+                label: "custom prefetch-on",
             },
-            "custom prefetch-on",
             key_from_value_32,
             key_from_index_32,
             checksum_key32,
@@ -157,15 +162,14 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_custom(
             &mut group,
-            scenario,
-            search_count,
-            "K=32B V=32B",
-            &fixture_32,
-            Config {
-                mode: Mode::LowerBound,
-                prefetch: false,
+            input_32,
+            CustomOptions {
+                config: Config {
+                    mode: Mode::LowerBound,
+                    prefetch: false,
+                },
+                label: "custom prefetch-off",
             },
-            "custom prefetch-off",
             key_from_value_32,
             key_from_index_32,
             checksum_key32,
@@ -173,10 +177,7 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_std(
             &mut group,
-            scenario,
-            search_count,
-            "K=32B V=32B",
-            &fixture_32,
+            input_32,
             key_from_value_32,
             key_from_index_32,
             checksum_key32,
@@ -184,10 +185,7 @@ fn bench_binary_search(c: &mut Criterion) {
 
         bench_partition_point(
             &mut group,
-            scenario,
-            search_count,
-            "K=32B V=32B",
-            &fixture_32,
+            input_32,
             key_from_value_32,
             key_from_index_32,
             checksum_key32,
@@ -202,6 +200,20 @@ struct Fixture<Value> {
     page_picker: Vec<usize>,
     value_picker: Vec<usize>,
     values_per_page: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BenchInput<'a, Value> {
+    scenario: Scenario,
+    search_count: usize,
+    layout_name: &'a str,
+    fixture: &'a Fixture<Value>,
+}
+
+#[derive(Clone, Copy)]
+struct CustomOptions<'a> {
+    config: Config,
+    label: &'a str,
 }
 
 fn build_fixture<Value, MakeValue>(
@@ -252,12 +264,8 @@ where
 
 fn bench_custom<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    scenario: Scenario,
-    search_count: usize,
-    layout_name: &str,
-    fixture: &Fixture<Value>,
-    config: Config,
-    label: &str,
+    input: BenchInput<'_, Value>,
+    options: CustomOptions<'_>,
     key_from_value: KeyFromValue,
     key_from_index: KeyFromIndex,
     key_to_checksum: KeyToChecksum,
@@ -269,22 +277,29 @@ fn bench_custom<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     KeyToChecksum: Fn(Key) -> u64,
 {
     let bench_id = BenchmarkId::new(
-        format!("{} {} {}", label, scenario.name, layout_name),
-        format!("N={}", fixture.values_per_page),
+        format!(
+            "{} {} {}",
+            options.label, input.scenario.name, input.layout_name
+        ),
+        format!("N={}", input.fixture.values_per_page),
     );
-    group.throughput(Throughput::Elements(search_count as u64));
+    group.throughput(Throughput::Elements(input.search_count as u64));
 
     group.bench_function(bench_id, |b| {
         b.iter(|| {
             let mut checksum = 0u64;
-            for i in 0..search_count {
-                let target_index = fixture.value_picker[i % fixture.value_picker.len()];
+            for i in 0..input.search_count {
+                let target_index = input.fixture.value_picker[i % input.fixture.value_picker.len()];
                 let target_key = key_from_index(target_index);
-                let page_index = fixture.page_picker[i % fixture.page_picker.len()];
-                let offset = page_index * fixture.values_per_page;
-                let page = &fixture.values[offset..offset + fixture.values_per_page];
-                let hit_index =
-                    binary_search_values_upsert_index(page, target_key, config, &key_from_value);
+                let page_index = input.fixture.page_picker[i % input.fixture.page_picker.len()];
+                let offset = page_index * input.fixture.values_per_page;
+                let page = &input.fixture.values[offset..offset + input.fixture.values_per_page];
+                let hit_index = binary_search_values_upsert_index(
+                    page,
+                    target_key,
+                    options.config,
+                    &key_from_value,
+                );
                 let hit = unsafe { page.get_unchecked(hit_index as usize) };
                 let hit_key = key_from_value(hit);
                 debug_assert!(hit_key == target_key);
@@ -297,10 +312,7 @@ fn bench_custom<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
 
 fn bench_std<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    scenario: Scenario,
-    search_count: usize,
-    layout_name: &str,
-    fixture: &Fixture<Value>,
+    input: BenchInput<'_, Value>,
     key_from_value: KeyFromValue,
     key_from_index: KeyFromIndex,
     key_to_checksum: KeyToChecksum,
@@ -312,22 +324,25 @@ fn bench_std<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     KeyToChecksum: Fn(Key) -> u64,
 {
     let bench_id = BenchmarkId::new(
-        format!("std binary_search {} {}", scenario.name, layout_name),
-        format!("N={}", fixture.values_per_page),
+        format!(
+            "std binary_search {} {}",
+            input.scenario.name, input.layout_name
+        ),
+        format!("N={}", input.fixture.values_per_page),
     );
-    group.throughput(Throughput::Elements(search_count as u64));
+    group.throughput(Throughput::Elements(input.search_count as u64));
 
     group.bench_function(bench_id, |b| {
         b.iter(|| {
             let mut checksum = 0u64;
-            for i in 0..search_count {
-                let target_index = fixture.value_picker[i % fixture.value_picker.len()];
+            for i in 0..input.search_count {
+                let target_index = input.fixture.value_picker[i % input.fixture.value_picker.len()];
                 let target_key = key_from_index(target_index);
-                let page_index = fixture.page_picker[i % fixture.page_picker.len()];
-                let offset = page_index * fixture.values_per_page;
-                let page = &fixture.values[offset..offset + fixture.values_per_page];
+                let page_index = input.fixture.page_picker[i % input.fixture.page_picker.len()];
+                let offset = page_index * input.fixture.values_per_page;
+                let page = &input.fixture.values[offset..offset + input.fixture.values_per_page];
                 let hit_index = page
-                    .binary_search_by_key(&target_key, |value| key_from_value(value))
+                    .binary_search_by_key(&target_key, &key_from_value)
                     .expect("target key missing");
                 let hit_key = key_from_value(unsafe { page.get_unchecked(hit_index) });
                 debug_assert!(hit_key == target_key);
@@ -340,10 +355,7 @@ fn bench_std<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
 
 fn bench_partition_point<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
-    scenario: Scenario,
-    search_count: usize,
-    layout_name: &str,
-    fixture: &Fixture<Value>,
+    input: BenchInput<'_, Value>,
     key_from_value: KeyFromValue,
     key_from_index: KeyFromIndex,
     key_to_checksum: KeyToChecksum,
@@ -355,20 +367,23 @@ fn bench_partition_point<Value, Key, KeyFromValue, KeyFromIndex, KeyToChecksum>(
     KeyToChecksum: Fn(Key) -> u64,
 {
     let bench_id = BenchmarkId::new(
-        format!("std partition_point {} {}", scenario.name, layout_name),
-        format!("N={}", fixture.values_per_page),
+        format!(
+            "std partition_point {} {}",
+            input.scenario.name, input.layout_name
+        ),
+        format!("N={}", input.fixture.values_per_page),
     );
-    group.throughput(Throughput::Elements(search_count as u64));
+    group.throughput(Throughput::Elements(input.search_count as u64));
 
     group.bench_function(bench_id, |b| {
         b.iter(|| {
             let mut checksum = 0u64;
-            for i in 0..search_count {
-                let target_index = fixture.value_picker[i % fixture.value_picker.len()];
+            for i in 0..input.search_count {
+                let target_index = input.fixture.value_picker[i % input.fixture.value_picker.len()];
                 let target_key = key_from_index(target_index);
-                let page_index = fixture.page_picker[i % fixture.page_picker.len()];
-                let offset = page_index * fixture.values_per_page;
-                let page = &fixture.values[offset..offset + fixture.values_per_page];
+                let page_index = input.fixture.page_picker[i % input.fixture.page_picker.len()];
+                let offset = page_index * input.fixture.values_per_page;
+                let page = &input.fixture.values[offset..offset + input.fixture.values_per_page];
                 let hit_index = page.partition_point(|value| key_from_value(value) < target_key);
                 let hit_key = key_from_value(unsafe { page.get_unchecked(hit_index) });
                 debug_assert!(hit_key == target_key);
