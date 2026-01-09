@@ -219,3 +219,105 @@ where
         exact: i < keys.len() && keys[i] == key,
     }
 }
+
+#[inline(always)]
+pub fn binary_search_values_range_upsert_indexes<Key, Value, F>(
+    values: &[Value],
+    key_min: Key,
+    key_max: Key,
+    key_from_value: &F,
+) -> BinarySearchRangeUpsertIndexes
+where
+    Key: Ord + Copy,
+    F: Fn(&Value) -> Key,
+{
+    debug_assert!(key_min <= key_max);
+
+    let start = binary_search_values_upsert_index(
+        values,
+        key_min,
+        Config {
+            mode: Mode::LowerBound,
+            ..Config::default()
+        },
+        key_from_value,
+    );
+
+    if start as usize == values.len() {
+        return BinarySearchRangeUpsertIndexes { start, end: start };
+    }
+
+    let tail = &values[start as usize..];
+    let end_rel = binary_search_values_upsert_index(
+        tail,
+        key_max,
+        Config {
+            mode: Mode::UpperBound,
+            ..Config::default()
+        },
+        key_from_value,
+    );
+
+    let end_size = (start as usize) + (end_rel as usize);
+    BinarySearchRangeUpsertIndexes {
+        start: start,
+        end: as_u32(end_size),
+    }
+}
+
+#[inline(always)]
+pub fn binary_search_keys_range_upsert_indexes<Key>(
+    keys: &[Key],
+    key_min: Key,
+    key_max: Key,
+) -> BinarySearchRangeUpsertIndexes
+where
+    Key: Ord + Copy,
+{
+    let key_from_key = |k: &Key| *k;
+    binary_search_values_range_upsert_indexes(keys, key_min, key_max, &key_from_key)
+}
+
+#[inline(always)]
+pub fn binary_search_values_range<Key, Value, F>(
+    values: &[Value],
+    key_min: Key,
+    key_max: Key,
+    key_from_value: &F,
+) -> BinarySearchRange
+where
+    Key: Ord + Copy,
+    F: Fn(&Value) -> Key,
+{
+    let upsert =
+        binary_search_values_range_upsert_indexes(values, key_min, key_max, key_from_value);
+    let len_u32 = as_u32(values.len());
+
+    if upsert.start == len_u32 {
+        return BinarySearchRange {
+            start: upsert.start.saturating_sub(1),
+            count: 0,
+        };
+    }
+
+    let end = upsert.end as usize;
+    let inclusive = if end < values.len() && key_from_value(&values[end]) == key_max {
+        1
+    } else {
+        0
+    };
+
+    BinarySearchRange {
+        start: upsert.start,
+        count: (upsert.end - upsert.start) + inclusive,
+    }
+}
+
+#[inline(always)]
+pub fn binary_search_keys_range<Key>(keys: &[Key], key_min: Key, key_max: Key) -> BinarySearchRange
+where
+    Key: Ord + Copy,
+{
+    let key_from_key = |k: &Key| *k;
+    binary_search_values_range(keys, key_min, key_max, &key_from_key)
+}
