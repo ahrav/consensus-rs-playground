@@ -518,3 +518,659 @@ where
     let key_from_key = |k: &Key| *k;
     binary_search_values_range(keys, key_min, key_max, &key_from_key)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cmp::Ordering;
+
+    const LOG: bool = false;
+    const SEED: u64 = 0x5eed_5eed_5eed_5eed;
+
+    #[derive(Clone)]
+    struct TestRng {
+        state: u64,
+    }
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.state = x;
+            x
+        }
+
+        fn next_f64(&mut self) -> f64 {
+            let bits = self.next_u64() >> 11;
+            let denom = (1u64 << 53) as f64;
+            ((bits as f64) + 1.0) / (denom + 1.0)
+        }
+
+        fn boolean(&mut self) -> bool {
+            (self.next_u64() & 1) == 1
+        }
+
+        fn range_inclusive_u32(&mut self, min: u32, max: u32) -> u32 {
+            assert!(min <= max);
+            let span = (max - min) as u64 + 1;
+            min + (self.next_u64() % span) as u32
+        }
+    }
+
+    fn random_int_exponential_u32(rng: &mut TestRng, avg: u32) -> u32 {
+        if avg == 0 {
+            return 0;
+        }
+        let exp = -rng.next_f64().ln() * (avg as f64);
+        if exp >= u32::MAX as f64 {
+            u32::MAX
+        } else {
+            exp as u32
+        }
+    }
+
+    fn random_int_exponential_usize(rng: &mut TestRng, avg: usize) -> usize {
+        if avg == 0 {
+            return 0;
+        }
+        let exp = -rng.next_f64().ln() * (avg as f64);
+        if exp >= usize::MAX as f64 {
+            usize::MAX
+        } else {
+            exp as usize
+        }
+    }
+
+    fn exhaustive_search(keys_count: u32, mode: Mode) {
+        let mut keys = Vec::with_capacity(keys_count as usize);
+        for i in 0..keys_count {
+            keys.push(7 * i + 3);
+        }
+
+        let config = Config {
+            mode,
+            prefetch: false,
+        };
+
+        let mut target_key: u32 = 0;
+        while target_key < keys_count + 13 {
+            let mut expect = BinarySearchResult {
+                index: 0,
+                exact: false,
+            };
+
+            for (i, &key) in keys.iter().enumerate() {
+                match key.cmp(&target_key) {
+                    Ordering::Less => expect.index = (i as u32) + 1,
+                    Ordering::Equal => {
+                        expect.index = i as u32;
+                        expect.exact = true;
+                        if mode == Mode::LowerBound {
+                            break;
+                        }
+                    }
+                    Ordering::Greater => break,
+                }
+            }
+
+            if LOG {
+                println!("keys: {:?}", keys);
+                println!("target key: {}", target_key);
+                println!("expected: {:?}, actual: {:?}", expect, config);
+            }
+
+            let actual = binary_search_keys(&keys, target_key, config);
+            assert_eq!(expect.index, actual.index);
+            assert_eq!(expect.exact, actual.exact);
+
+            target_key += 1;
+        }
+    }
+
+    fn explicit_search(
+        keys: &[u32],
+        target_keys: &[u32],
+        expected_results: &[BinarySearchResult],
+        mode: Mode,
+    ) {
+        assert_eq!(target_keys.len(), expected_results.len());
+        let config = Config {
+            mode,
+            prefetch: false,
+        };
+
+        for (i, &target_key) in target_keys.iter().enumerate() {
+            let expect = expected_results[i];
+            let actual = binary_search_keys(keys, target_key, config);
+            assert_eq!(expect.index, actual.index);
+            assert_eq!(expect.exact, actual.exact);
+        }
+    }
+
+    fn random_sequence(rng: &mut TestRng, iter: usize) -> Vec<u32> {
+        let keys_count = random_int_exponential_usize(rng, iter).min(1_000_000);
+        let mut keys = Vec::with_capacity(keys_count);
+        for _ in 0..keys_count {
+            keys.push(random_int_exponential_u32(rng, 100));
+        }
+        keys.sort_unstable();
+        keys
+    }
+
+    fn random_search(rng: &mut TestRng, iter: usize, mode: Mode) {
+        let keys = random_sequence(rng, iter);
+        let target_key = random_int_exponential_u32(rng, 100);
+
+        let mut expect = BinarySearchResult {
+            index: 0,
+            exact: false,
+        };
+        for (i, &key) in keys.iter().enumerate() {
+            match key.cmp(&target_key) {
+                Ordering::Less => expect.index = (i as u32) + 1,
+                Ordering::Equal => {
+                    expect.index = i as u32;
+                    expect.exact = true;
+                    if mode == Mode::LowerBound {
+                        break;
+                    }
+                }
+                Ordering::Greater => break,
+            }
+        }
+
+        let actual = binary_search_keys(
+            &keys,
+            target_key,
+            Config {
+                mode,
+                prefetch: false,
+            },
+        );
+
+        assert_eq!(expect.index, actual.index);
+        assert_eq!(expect.exact, actual.exact);
+    }
+
+    fn explicit_range_search(
+        sequence: &[u32],
+        key_min: u32,
+        key_max: u32,
+        expected: BinarySearchRange,
+    ) {
+        let actual = binary_search_keys_range(sequence, key_min, key_max);
+
+        assert_eq!(expected.start, actual.start);
+        assert_eq!(expected.count, actual.count);
+
+        let expected_slice =
+            &sequence[expected.start as usize..][..expected.count as usize];
+        let actual_slice = &sequence[actual.start as usize..][..actual.count as usize];
+        assert_eq!(expected_slice, actual_slice);
+    }
+
+    fn random_range_search(rng: &mut TestRng, iter: usize) {
+        let keys = random_sequence(rng, iter);
+
+        let (key_min, key_max) = {
+            let mut key_min = if !keys.is_empty() && rng.boolean() {
+                rng.range_inclusive_u32(keys[0], *keys.last().unwrap())
+            } else {
+                random_int_exponential_u32(rng, 100)
+            };
+
+            let mut key_max = if !keys.is_empty() && rng.boolean() {
+                rng.range_inclusive_u32(keys[0], *keys.last().unwrap())
+            } else if rng.boolean() {
+                key_min
+            } else {
+                random_int_exponential_u32(rng, 100)
+            };
+
+            if key_max < key_min {
+                core::mem::swap(&mut key_min, &mut key_max);
+            }
+
+            (key_min, key_max)
+        };
+
+        let mut expect_start: usize = 0;
+        let mut expect_count: usize = 0;
+        let mut looking_for_min = true;
+
+        for &key in &keys {
+            if looking_for_min {
+                match key.cmp(&key_min) {
+                    Ordering::Less => {
+                        if expect_start < keys.len() - 1 {
+                            expect_start += 1;
+                        }
+                    }
+                    Ordering::Equal | Ordering::Greater => {
+                        looking_for_min = false;
+                    }
+                }
+            }
+
+            if !looking_for_min {
+                match key.cmp(&key_max) {
+                    Ordering::Less | Ordering::Equal => expect_count += 1,
+                    Ordering::Greater => break,
+                }
+            }
+        }
+
+        let actual = binary_search_keys_range(&keys, key_min, key_max);
+        assert_eq!(expect_start as u32, actual.start);
+        assert_eq!(expect_count as u32, actual.count);
+    }
+
+    #[test]
+    fn binary_search_exhaustive() {
+        if LOG {
+            println!();
+        }
+        for mode in [Mode::LowerBound, Mode::UpperBound] {
+            for i in 1..300 {
+                exhaustive_search(i as u32, mode);
+            }
+        }
+    }
+
+    #[test]
+    fn binary_search_explicit() {
+        if LOG {
+            println!();
+        }
+
+        for mode in [Mode::LowerBound, Mode::UpperBound] {
+            explicit_search(
+                &[],
+                &[0],
+                &[BinarySearchResult {
+                    index: 0,
+                    exact: false,
+                }],
+                mode,
+            );
+
+            let repeated = [4u32; 10];
+            explicit_search(
+                &repeated,
+                &[4],
+                &[BinarySearchResult {
+                    index: if mode == Mode::LowerBound { 0 } else { 9 },
+                    exact: true,
+                }],
+                mode,
+            );
+
+            explicit_search(
+                &[],
+                &[0],
+                &[BinarySearchResult {
+                    index: 0,
+                    exact: false,
+                }],
+                mode,
+            );
+
+            explicit_search(
+                &[1],
+                &[0, 1, 2],
+                &[
+                    BinarySearchResult {
+                        index: 0,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 0,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 1,
+                        exact: false,
+                    },
+                ],
+                mode,
+            );
+
+            explicit_search(
+                &[1, 3],
+                &[0, 1, 2, 3, 4],
+                &[
+                    BinarySearchResult {
+                        index: 0,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 0,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 1,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 1,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 2,
+                        exact: false,
+                    },
+                ],
+                mode,
+            );
+
+            explicit_search(
+                &[1, 3, 5, 8, 9, 11],
+                &[
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                ],
+                &[
+                    BinarySearchResult {
+                        index: 0,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 0,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 1,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 1,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 2,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 2,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 3,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 3,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 3,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 4,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 5,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 5,
+                        exact: true,
+                    },
+                    BinarySearchResult {
+                        index: 6,
+                        exact: false,
+                    },
+                    BinarySearchResult {
+                        index: 6,
+                        exact: false,
+                    },
+                ],
+                mode,
+            );
+        }
+    }
+
+    #[test]
+    fn binary_search_duplicates() {
+        if LOG {
+            println!();
+        }
+        explicit_search(
+            &[0, 0, 3, 3, 3, 5, 5, 5, 5],
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[
+                BinarySearchResult {
+                    index: 0,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 2,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 2,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 2,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 5,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 5,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 9,
+                    exact: false,
+                },
+            ],
+            Mode::LowerBound,
+        );
+        explicit_search(
+            &[0, 0, 3, 3, 3, 5, 5, 5, 5],
+            &[0, 1, 2, 3, 4, 5, 6],
+            &[
+                BinarySearchResult {
+                    index: 1,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 2,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 2,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 4,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 5,
+                    exact: false,
+                },
+                BinarySearchResult {
+                    index: 8,
+                    exact: true,
+                },
+                BinarySearchResult {
+                    index: 9,
+                    exact: false,
+                },
+            ],
+            Mode::UpperBound,
+        );
+    }
+
+    #[test]
+    fn binary_search_random() {
+        let mut rng = TestRng::new(SEED);
+        for mode in [Mode::LowerBound, Mode::UpperBound] {
+            for i in 0..2048 {
+                random_search(&mut rng, i, mode);
+            }
+        }
+    }
+
+    #[test]
+    fn binary_search_explicit_range() {
+        if LOG {
+            println!();
+        }
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            3,
+            1000,
+            BinarySearchRange {
+                start: 0,
+                count: 9,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            2,
+            1001,
+            BinarySearchRange {
+                start: 0,
+                count: 9,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            3,
+            9,
+            BinarySearchRange {
+                start: 0,
+                count: 2,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            5,
+            10,
+            BinarySearchRange {
+                start: 2,
+                count: 1,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            5,
+            14,
+            BinarySearchRange {
+                start: 2,
+                count: 1,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            15,
+            100,
+            BinarySearchRange {
+                start: 3,
+                count: 5,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            10,
+            10,
+            BinarySearchRange {
+                start: 2,
+                count: 1,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            1,
+            2,
+            BinarySearchRange {
+                start: 0,
+                count: 0,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            1_001,
+            10_000,
+            BinarySearchRange {
+                start: 8,
+                count: 0,
+            },
+        );
+
+        explicit_range_search(
+            &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
+            31,
+            99,
+            BinarySearchRange {
+                start: 7,
+                count: 0,
+            },
+        );
+
+        explicit_range_search(
+            &[],
+            1,
+            2,
+            BinarySearchRange {
+                start: 0,
+                count: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn binary_search_duplicated_range() {
+        if LOG {
+            println!();
+        }
+        explicit_range_search(
+            &[1, 3, 3, 3, 5, 5, 5, 7],
+            3,
+            5,
+            BinarySearchRange {
+                start: 1,
+                count: 6,
+            },
+        );
+        explicit_range_search(
+            &[1, 1, 1, 3, 5, 7],
+            1,
+            1,
+            BinarySearchRange {
+                start: 0,
+                count: 3,
+            },
+        );
+    }
+
+    #[test]
+    fn binary_search_random_range() {
+        let mut rng = TestRng::new(SEED);
+        for i in 0..2048 {
+            random_range_search(&mut rng, i);
+        }
+    }
+}
