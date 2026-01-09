@@ -708,8 +708,7 @@ mod tests {
         assert_eq!(expected.start, actual.start);
         assert_eq!(expected.count, actual.count);
 
-        let expected_slice =
-            &sequence[expected.start as usize..][..expected.count as usize];
+        let expected_slice = &sequence[expected.start as usize..][..expected.count as usize];
         let actual_slice = &sequence[actual.start as usize..][..actual.count as usize];
         assert_eq!(expected_slice, actual_slice);
     }
@@ -870,9 +869,7 @@ mod tests {
 
             explicit_search(
                 &[1, 3, 5, 8, 9, 11],
-                &[
-                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
-                ],
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
                 &[
                     BinarySearchResult {
                         index: 0,
@@ -1033,111 +1030,73 @@ mod tests {
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             3,
             1000,
-            BinarySearchRange {
-                start: 0,
-                count: 9,
-            },
+            BinarySearchRange { start: 0, count: 9 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             2,
             1001,
-            BinarySearchRange {
-                start: 0,
-                count: 9,
-            },
+            BinarySearchRange { start: 0, count: 9 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             3,
             9,
-            BinarySearchRange {
-                start: 0,
-                count: 2,
-            },
+            BinarySearchRange { start: 0, count: 2 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             5,
             10,
-            BinarySearchRange {
-                start: 2,
-                count: 1,
-            },
+            BinarySearchRange { start: 2, count: 1 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             5,
             14,
-            BinarySearchRange {
-                start: 2,
-                count: 1,
-            },
+            BinarySearchRange { start: 2, count: 1 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             15,
             100,
-            BinarySearchRange {
-                start: 3,
-                count: 5,
-            },
+            BinarySearchRange { start: 3, count: 5 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             10,
             10,
-            BinarySearchRange {
-                start: 2,
-                count: 1,
-            },
+            BinarySearchRange { start: 2, count: 1 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             1,
             2,
-            BinarySearchRange {
-                start: 0,
-                count: 0,
-            },
+            BinarySearchRange { start: 0, count: 0 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             1_001,
             10_000,
-            BinarySearchRange {
-                start: 8,
-                count: 0,
-            },
+            BinarySearchRange { start: 8, count: 0 },
         );
 
         explicit_range_search(
             &[3, 4, 10, 15, 20, 25, 30, 100, 1000],
             31,
             99,
-            BinarySearchRange {
-                start: 7,
-                count: 0,
-            },
+            BinarySearchRange { start: 7, count: 0 },
         );
 
-        explicit_range_search(
-            &[],
-            1,
-            2,
-            BinarySearchRange {
-                start: 0,
-                count: 0,
-            },
-        );
+        explicit_range_search(&[], 1, 2, BinarySearchRange { start: 0, count: 0 });
     }
 
     #[test]
@@ -1149,19 +1108,13 @@ mod tests {
             &[1, 3, 3, 3, 5, 5, 5, 7],
             3,
             5,
-            BinarySearchRange {
-                start: 1,
-                count: 6,
-            },
+            BinarySearchRange { start: 1, count: 6 },
         );
         explicit_range_search(
             &[1, 1, 1, 3, 5, 7],
             1,
             1,
-            BinarySearchRange {
-                start: 0,
-                count: 3,
-            },
+            BinarySearchRange { start: 0, count: 3 },
         );
     }
 
