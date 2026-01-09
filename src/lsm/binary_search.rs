@@ -497,11 +497,7 @@ where
     }
 
     let end = upsert.end as usize;
-    let inclusive = if end < values.len() && key_from_value(&values[end]) == key_max {
-        1
-    } else {
-        0
-    };
+    let inclusive = u32::from(end < values.len() && key_from_value(&values[end]) == key_max);
 
     BinarySearchRange {
         start: upsert.start,
