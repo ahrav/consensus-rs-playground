@@ -181,3 +181,92 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         *w = (*w & !mask) | ((value as u64) << shift);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::PackedUnsignedIntegerArray;
+    use proptest::prelude::*;
+
+    #[test]
+    fn packed_unsigned_integer_array_unit() {
+        let mut array =
+            PackedUnsignedIntegerArray::<2>::from_words(vec![0, 0b10110010, 0, 0, 0, 0, 0, 0]);
+
+        assert_eq!(0b10, array.get(32 + 0));
+        assert_eq!(0b00, array.get(32 + 1));
+        assert_eq!(0b11, array.get(32 + 2));
+        assert_eq!(0b10, array.get(32 + 3));
+
+        array.set(0, 0b01);
+        assert_eq!(0b00000001u64, array.words()[0]);
+        assert_eq!(0b01, array.get(0));
+        array.set(1, 0b10);
+        assert_eq!(0b00001001u64, array.words()[0]);
+        assert_eq!(0b10, array.get(1));
+        array.set(2, 0b11);
+        assert_eq!(0b00111001u64, array.words()[0]);
+        assert_eq!(0b11, array.get(2));
+        array.set(3, 0b11);
+        assert_eq!(0b11111001u64, array.words()[0]);
+        assert_eq!(0b11, array.get(3));
+        array.set(3, 0b01);
+        assert_eq!(0b01111001u64, array.words()[0]);
+        assert_eq!(0b01, array.get(3));
+        array.set(3, 0b00);
+        assert_eq!(0b00111001u64, array.words()[0]);
+        assert_eq!(0b00, array.get(3));
+
+        array.set(4, 0b11);
+        assert_eq!(
+            0b0000000000000000000000000000000000000000000000000000001100111001u64,
+            array.words()[0],
+        );
+        array.set(31, 0b11);
+        assert_eq!(
+            0b1100000000000000000000000000000000000000000000000000001100111001u64,
+            array.words()[0],
+        );
+    }
+
+    const LEN: usize = 1024;
+
+    fn packed_unsigned_integer_array_case<const BITS: usize>(ops: &[(usize, u8)]) {
+        let words_len = PackedUnsignedIntegerArray::<BITS>::words_for_len(LEN);
+        let mut array = PackedUnsignedIntegerArray::<BITS>::new_zeroed(words_len);
+        let mut reference = vec![0u8; LEN];
+
+        for &(index, value) in ops {
+            array.set(index as u64, value);
+            reference[index] = value;
+
+            for (i, &expected) in reference.iter().enumerate() {
+                assert_eq!(expected, array.get(i as u64));
+            }
+        }
+    }
+
+    fn packed_unsigned_integer_array_ops<const BITS: usize>()
+    -> impl Strategy<Value = Vec<(usize, u8)>> {
+        let mask = ((1u16 << BITS) - 1) as u8;
+        prop::collection::vec((0usize..LEN, 0u8..=mask), 0..512)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_u1(ops in packed_unsigned_integer_array_ops::<1>()) {
+            packed_unsigned_integer_array_case::<1>(&ops);
+        }
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_u2(ops in packed_unsigned_integer_array_ops::<2>()) {
+            packed_unsigned_integer_array_case::<2>(&ops);
+        }
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_u4(ops in packed_unsigned_integer_array_ops::<4>()) {
+            packed_unsigned_integer_array_case::<4>(&ops);
+        }
+    }
+}
