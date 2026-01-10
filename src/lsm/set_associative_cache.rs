@@ -2,7 +2,7 @@
 
 use std::{
     alloc::{Layout as AllocLayout, alloc, dealloc},
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     marker::PhantomData,
     mem::MaybeUninit,
     ptr::NonNull,
@@ -332,6 +332,133 @@ impl<T> Drop for AlignedBuf<T> {
             dealloc(self.ptr.as_ptr() as *mut u8, self.layout);
         }
     }
+}
+
+pub struct Options<'a> {
+    pub name: &'a str,
+}
+
+pub struct UpsertResult<V> {
+    pub index: usize,
+    pub updated: UpdateOrInsert,
+    pub evicted: Option<V>,
+}
+
+/// Per-set view used during lookups and insertions.
+///
+/// Each key maps to a set of `WAYS` consecutive slots; this bundles the derived
+/// tag and pointers into the backing tag/value arrays for that set. The
+/// `offset` is the base index used to address the set's ways.
+#[derive(Clone, Copy)]
+struct Set<TagT, ValueT, const WAYS: usize> {
+    /// Tag derived from the lookup key's hash entropy.
+    tage: TagT,
+    /// Base index for this set in the tag/value arrays.
+    offset: u64,
+    /// Tag storage for the `WAYS` slots in this set.
+    tags: *mut [TagT; WAYS],
+    /// Value storage for the `WAYS` slots in this set.
+    values: *mut [ValueT; WAYS],
+}
+
+/// N-way set-associative cache with CLOCK Nth-Chance eviction.
+///
+/// Each key maps to one set of `WAYS` consecutive slots that may contain its
+/// value. Tags provide a compact hash prefix to avoid full key comparisons on
+/// most misses, while counts/clocks drive the replacement policy.
+pub struct SetAssociativeCache<
+    'a,
+    C,
+    TagT,
+    const WAYS: usize,
+    const CLOCK_BITS: usize,
+    const CACHE_LINE_SIZE: usize,
+    const VALUE_ALIGNMENT: usize,
+    const CLOCK_HAND_BITS: usize,
+> where
+    C: SetAssociativeCacheContext,
+    TagT: Tag,
+{
+    /// Human-readable cache name for diagnostics.
+    name: &'a str,
+    /// Number of sets in the cache.
+    sets: u64,
+
+    /// Hit/miss counters stored behind interior mutability.
+    metrics: Box<UnsafeCell<Metrics>>,
+
+    /// Short, partial hashes of keys stored alongside cached values.
+    ///
+    /// Because the tag is small, collisions are possible: `tag(k1) == tag(k2)`
+    /// does not imply `k1 == k2`. However, most of the time, where the tag
+    /// differs, a full key comparison can be avoided. Since tags are 16-32x
+    /// smaller than keys, they can also be kept hot in cache.
+    tags: Vec<TagT>,
+
+    /// Cache values; a slot is present when its count is non-zero.
+    values: AlignedBuf<C::Value>,
+
+    /// Per-slot access counts, tracking recent reads.
+    ///
+    /// * A count is incremented when a value is accessed by `get`.
+    /// * A count is decremented when a cache write to the value's set misses.
+    /// * A value is evicted when its count reaches zero.
+    counts: UnsafeCell<PackedUnsignedIntegerArray<CLOCK_BITS>>,
+
+    /// Per-set clock hand that rotates across ways to find eviction candidates.
+    ///
+    /// On cache write, entries are checked for occupancy (or eviction) beginning
+    /// from the clock's position, wrapping around. The algorithm implemented is
+    /// CLOCK Nth-Chance, where each way has more than one bit to give entries
+    /// multiple chances before eviction. A similar algorithm called "RRIParoo"
+    /// is described in "Kangaroo: Caching Billions of Tiny Objects on Flash".
+    /// For general background, see:
+    /// https://en.wikipedia.org/wiki/Page_replacement_algorithm.
+    clocks: UnsafeCell<PackedUnsignedIntegerArray<CLOCK_HAND_BITS>>,
+
+    /// Marker for the cache context's key/value types.
+    _marker: PhantomData<C>,
+}
+
+impl<
+    C,
+    TagT,
+    const WAYS: usize,
+    const CLOCK_BITS: usize,
+    const CACHE_LINE_SIZE: usize,
+    const VALUE_ALIGNMENT: usize,
+    const CLOCK_HAND_BITS: usize,
+>
+    SetAssociativeCache<
+        '_,
+        C,
+        TagT,
+        WAYS,
+        CLOCK_BITS,
+        CACHE_LINE_SIZE,
+        VALUE_ALIGNMENT,
+        CLOCK_HAND_BITS,
+    >
+where
+    C: SetAssociativeCacheContext,
+    TagT: Tag,
+{
+    pub const VALUE_COUNT_MAX_MULTIPLE: u64 = {
+        const fn max_u(a: u64, b: u64) -> u64 {
+            if a > b { a } else { b }
+        }
+
+        const fn min_u(a: u64, b: u64) -> u64 {
+            if a < b { a } else { b }
+        }
+
+        let value_size = size_of::<C::Value>() as u64;
+        let cache_line = CACHE_LINE_SIZE as u64;
+        let ways = WAYS as u64;
+        let values_term = (max_u(value_size, cache_line) / min_u(value_size, cache_line)) * ways;
+        let counts_term = (cache_line * 8) / CLOCK_BITS as u64;
+        max_u(values_term, counts_term)
+    };
 }
 
 #[cfg(test)]
