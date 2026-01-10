@@ -176,7 +176,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         let within = index % uints_per_word;
         let shift = (within as usize) * BITS;
         let mask = Self::mask_value() << shift;
-        debug_assert!(word_index < self.words.len() as u64);
+        assert!(word_index < self.words.len() as u64);
         let w = &mut self.words[word_index as usize];
         *w = (*w & !mask) | ((value as u64) << shift);
     }
