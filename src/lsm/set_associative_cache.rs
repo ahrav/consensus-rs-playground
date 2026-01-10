@@ -202,6 +202,12 @@ pub struct AlignedBuf<T> {
 }
 
 impl<T> AlignedBuf<T> {
+    /// Allocates an uninitialized buffer with the specified length and alignment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len == 0`, `alignment < align_of::<T>()`, `alignment` is not a power of two,
+    /// `size_of::<T>()` is not a multiple of `alignment`, or allocation fails.
     pub fn new_uninit(len: usize, alignment: usize) -> Self {
         assert!(len > 0);
         assert!(alignment >= align_of::<T>());
@@ -212,6 +218,8 @@ impl<T> AlignedBuf<T> {
 
         let layout = AllocLayout::from_size_align(bytes, alignment).expect("bad layout");
 
+        // SAFETY: Layout is valid (size > 0, alignment is power of two, size fits in isize).
+        // We check for null below.
         let raw = unsafe { alloc(layout) } as *mut MaybeUninit<T>;
         let ptr = NonNull::new(raw).expect("oom");
 
@@ -223,53 +231,89 @@ impl<T> AlignedBuf<T> {
         }
     }
 
+    /// Returns the number of elements in the buffer.
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Returns a raw pointer to the buffer's first element.
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }
 
+    /// Returns a mutable raw pointer to the buffer's first element.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr.as_ptr() as *mut T
     }
 
+    /// Returns a mutable pointer to the element at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
     #[inline]
     pub fn get_ptr(&self, index: usize) -> *mut T {
         assert!(index < self.len);
         self.ptr.as_ptr().wrapping_add(index) as *mut T
     }
 
+    /// Returns a reference to the element at `index`.
+    ///
+    /// The caller must ensure the element has been initialized via [`write`](Self::write).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
     #[inline]
     pub fn get_ref(&self, index: usize) -> &T {
         assert!(index < self.len);
+        // SAFETY: Caller guarantees the slot is initialized. Pointer is valid and aligned.
         unsafe { (&*self.ptr.as_ptr().add(index)).assume_init_ref() }
     }
 
+    /// Reads a copy of the element at `index`.
+    ///
+    /// The caller must ensure the element has been initialized via [`write`](Self::write).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
     #[inline]
     pub fn read_copy(&self, index: usize) -> T
     where
         T: Copy,
     {
         assert!(index < self.len);
+        // SAFETY: Caller guarantees the slot is initialized. T: Copy prevents double-drop.
         unsafe { (&*self.ptr.as_ptr().add(index)).assume_init_read() }
     }
 
+    /// Writes a value to the slot at `index`, initializing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
     #[inline]
     pub fn write(&mut self, index: usize, value: T) {
         assert!(index < self.len);
+        // SAFETY: Index is bounds-checked. Pointer is valid and properly aligned.
         unsafe {
             self.ptr.as_ptr().add(index).write(MaybeUninit::new(value));
         }
     }
 
+    /// Marks the slot at `index` as uninitialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
     #[inline]
     pub fn write_uninit(&mut self, index: usize) {
         assert!(index < self.len);
+        // SAFETY: Index is bounds-checked. Pointer is valid and properly aligned.
         unsafe {
             self.ptr.as_ptr().add(index).write(MaybeUninit::uninit());
         }
@@ -278,6 +322,8 @@ impl<T> AlignedBuf<T> {
 
 impl<T> Drop for AlignedBuf<T> {
     fn drop(&mut self) {
+        // SAFETY: Layout matches the one used in new_uninit. Pointer is valid.
+        // Note: Element destructors are NOT run—this is intentional for Copy types.
         unsafe {
             dealloc(self.ptr.as_ptr() as *mut u8, self.layout);
         }
