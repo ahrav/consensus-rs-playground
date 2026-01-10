@@ -334,13 +334,19 @@ impl<T> Drop for AlignedBuf<T> {
     }
 }
 
+/// Configuration options for initializing a cache instance.
 pub struct Options<'a> {
+    /// Human-readable name used for diagnostics.
     pub name: &'a str,
 }
 
+/// Result of inserting or updating a cache entry.
 pub struct UpsertResult<V> {
+    /// Index of the slot written within the cache storage.
     pub index: usize,
+    /// Whether the operation replaced an existing entry or inserted a new one.
     pub updated: UpdateOrInsert,
+    /// The evicted value, if an insertion displaced an older entry.
     pub evicted: Option<V>,
 }
 
