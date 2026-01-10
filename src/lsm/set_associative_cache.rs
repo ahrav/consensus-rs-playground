@@ -1,6 +1,12 @@
 #![allow(dead_code)]
 
-use std::cell::Cell;
+use std::{
+    alloc::{Layout as AllocLayout, alloc, dealloc},
+    cell::Cell,
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr::NonNull,
+};
 
 /// Indicates whether an upsert operation updated an existing entry or inserted a new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,6 +185,102 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         assert!(word_index < self.words.len() as u64);
         let w = &mut self.words[word_index as usize];
         *w = (*w & !mask) | ((value as u64) << shift);
+    }
+}
+
+/// A heap-allocated buffer with custom alignment for cache-line-aligned storage.
+///
+/// Elements are stored as `MaybeUninit<T>`; callers must track initialization state.
+/// `Drop` deallocates memory but does NOT run element destructors—intended for `Copy` types.
+#[derive(Debug)]
+#[allow(clippy::len_without_is_empty)] // Buffer is never empty (len > 0 enforced at construction)
+pub struct AlignedBuf<T> {
+    ptr: NonNull<MaybeUninit<T>>,
+    len: usize,
+    layout: AllocLayout,
+    _marker: PhantomData<T>,
+}
+
+impl<T> AlignedBuf<T> {
+    pub fn new_uninit(len: usize, alignment: usize) -> Self {
+        assert!(len > 0);
+        assert!(alignment >= align_of::<T>());
+        assert!(alignment.is_power_of_two());
+        assert!(size_of::<T>().is_multiple_of(alignment));
+
+        let bytes = len.checked_mul(size_of::<T>()).expect("size overflow");
+
+        let layout = AllocLayout::from_size_align(bytes, alignment).expect("bad layout");
+
+        let raw = unsafe { alloc(layout) } as *mut MaybeUninit<T>;
+        let ptr = NonNull::new(raw).expect("oom");
+
+        Self {
+            ptr,
+            len,
+            layout,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr.as_ptr() as *const T
+    }
+
+    #[inline]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr.as_ptr() as *mut T
+    }
+
+    #[inline]
+    pub fn get_ptr(&self, index: usize) -> *mut T {
+        assert!(index < self.len);
+        self.ptr.as_ptr().wrapping_add(index) as *mut T
+    }
+
+    #[inline]
+    pub fn get_ref(&self, index: usize) -> &T {
+        assert!(index < self.len);
+        unsafe { (&*self.ptr.as_ptr().add(index)).assume_init_ref() }
+    }
+
+    #[inline]
+    pub fn read_copy(&self, index: usize) -> T
+    where
+        T: Copy,
+    {
+        assert!(index < self.len);
+        unsafe { (&*self.ptr.as_ptr().add(index)).assume_init_read() }
+    }
+
+    #[inline]
+    pub fn write(&mut self, index: usize, value: T) {
+        assert!(index < self.len);
+        unsafe {
+            self.ptr.as_ptr().add(index).write(MaybeUninit::new(value));
+        }
+    }
+
+    #[inline]
+    pub fn write_uninit(&mut self, index: usize) {
+        assert!(index < self.len);
+        unsafe {
+            self.ptr.as_ptr().add(index).write(MaybeUninit::uninit());
+        }
+    }
+}
+
+impl<T> Drop for AlignedBuf<T> {
+    fn drop(&mut self) {
+        unsafe {
+            dealloc(self.ptr.as_ptr() as *mut u8, self.layout);
+        }
     }
 }
 
