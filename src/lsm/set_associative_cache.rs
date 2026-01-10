@@ -656,6 +656,7 @@ where
 
     // ----- Internals -----
 
+    /// Computes the set metadata for `key` (tag, offset, and set-local pointers).
     #[inline]
     fn associate(&self, key: C::Key) -> Set<TagT, C::Value, WAYS> {
         let entropy = C::hash(key);
@@ -678,6 +679,34 @@ where
         }
     }
 
+    /// If the key is present in the set, returns the way index; otherwise `None`.
+    #[inline]
+    fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16>
+    where
+        TagT: core::simd::SimdElement,
+        core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
+        core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
+                Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
+            >,
+    {
+        let tags = unsafe { &*set.tags };
+        let ways_mask = Self::search_tags(tags, set.tag);
+        if ways_mask == 0 {
+            return None;
+        }
+
+        for way in 0..WAYS {
+            if ((ways_mask >> way) & 1) == 1 && self.counts_get(set.offset + way as u64) > 0 {
+                let v = unsafe { &(*set.values)[way] };
+                if C::key_from_value(v) == key {
+                    return Some(way as u16);
+                }
+            }
+        }
+        None
+    }
+
+    /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
     #[inline]
     fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16
     where
@@ -696,11 +725,13 @@ where
         mask.to_bitmask() as u16
     }
 
+    /// Reads the CLOCK count for a slot at `index`.
     #[inline]
     fn counts_get(&self, index: u64) -> u8 {
         unsafe { (*self.counts.get()).get(index) }
     }
 
+    /// Writes the CLOCK count for a slot at `index`.
     #[inline]
     fn counts_set(&self, index: u64, value: u8) {
         unsafe {
@@ -708,11 +739,13 @@ where
         }
     }
 
+    /// Reads the clock hand value for the set at `index`.
     #[inline]
     fn clocks_get(&self, index: u64) -> u8 {
         unsafe { (*self.clocks.get()).get(index) }
     }
 
+    /// Writes the clock hand value for the set at `index`.
     #[inline]
     fn clocks_set(&self, index: u64, value: u8) {
         unsafe {
