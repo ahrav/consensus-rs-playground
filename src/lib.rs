@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 pub mod constants;
 pub mod ewah;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
