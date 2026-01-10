@@ -427,6 +427,7 @@ pub struct SetAssociativeCache<
 }
 
 impl<
+    'a,
     C,
     TagT,
     const WAYS: usize,
@@ -436,7 +437,7 @@ impl<
     const CLOCK_HAND_BITS: usize,
 >
     SetAssociativeCache<
-        '_,
+        'a,
         C,
         TagT,
         WAYS,
@@ -465,6 +466,191 @@ where
         let counts_term = (cache_line * 8) / CLOCK_BITS as u64;
         max_u(values_term, counts_term)
     };
+
+    #[inline]
+    fn value_alignment() -> usize {
+        if VALUE_ALIGNMENT == 0 {
+            align_of::<C::Value>()
+        } else {
+            VALUE_ALIGNMENT
+        }
+    }
+
+    #[inline]
+    fn max_count() -> u8 {
+        debug_assert!(CLOCK_BITS <= 8);
+        ((1u16 << CLOCK_BITS) - 1) as u8
+    }
+
+    #[inline]
+    fn wrap_way(way: usize) -> usize {
+        way & (WAYS - 1)
+    }
+
+    #[inline]
+    fn metric_ref(&self) -> &Metrics {
+        unsafe { &*self.metrics.as_ref().get() }
+    }
+
+    #[inline]
+    fn metric_mut(&self) -> &mut Metrics {
+        unsafe { &mut *self.metrics.as_ref().get() }
+    }
+
+    #[inline]
+    fn index_usize(index: u64) -> usize {
+        let idx = index as usize;
+        debug_assert_eq!(idx as u64, index);
+        idx
+    }
+
+    /// Initializes a cache sized for `value_count_max` values.
+    ///
+    /// `value_count_max` must be a multiple of `WAYS` and `VALUE_COUNT_MAX_MULTIPLE` so that
+    /// tags, values, counts, and clocks stay cache-line aligned. This allocates the backing
+    /// arrays and zeroes the tag/count/clock state via `reset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any layout invariant is violated (ways/tag bits/clock bits, cache-line or value
+    /// alignment constraints) or if computed sizes overflow.
+    pub fn init(value_count_max: u64, options: Options<'a>) -> Self {
+        assert!(size_of::<C::Key>().is_power_of_two());
+        assert!(size_of::<C::Value>().is_power_of_two());
+
+        match WAYS {
+            2 | 4 | 16 => {}
+            _ => panic!("Invalid number of ways"),
+        }
+
+        match TagT::BITS {
+            8 | 16 => {}
+            _ => panic!("tag bits must be 8 or 16"),
+        }
+
+        match CLOCK_BITS {
+            1 | 2 | 4 => {}
+            _ => panic!("CLOCK_BITS must be 1, 2, or 4"),
+        }
+
+        let value_alignment = Self::value_alignment();
+        assert!(value_alignment >= align_of::<C::Value>());
+        assert!(size_of::<C::Value>().is_multiple_of(value_alignment));
+
+        assert!(WAYS.is_power_of_two());
+        assert!(TagT::BITS.is_power_of_two());
+        assert!(CLOCK_BITS.is_power_of_two());
+        assert!(CACHE_LINE_SIZE.is_power_of_two());
+
+        assert!(size_of::<C::Key>() <= size_of::<C::Value>());
+        assert!(size_of::<C::Key>() < CACHE_LINE_SIZE);
+        assert!(CACHE_LINE_SIZE.is_multiple_of(size_of::<C::Key>()));
+
+        if CACHE_LINE_SIZE > size_of::<C::Value>() {
+            assert!(CACHE_LINE_SIZE.is_multiple_of(size_of::<C::Value>()));
+        } else {
+            assert!(size_of::<C::Value>().is_multiple_of(CACHE_LINE_SIZE));
+        }
+
+        assert!(CLOCK_HAND_BITS.is_power_of_two());
+        assert_eq!((1usize << CLOCK_HAND_BITS), WAYS);
+
+        let ways_u64 = WAYS as u64;
+        let cache_line_u64 = CACHE_LINE_SIZE as u64;
+        let tag_bits_u64 = TagT::BITS as u64;
+        let clock_bits_u64 = CLOCK_BITS as u64;
+        let clock_hand_bits = CLOCK_HAND_BITS as u64;
+
+        let tags_divisor = ways_u64 * tag_bits_u64;
+        assert!(tags_divisor > 0);
+        assert_eq!((cache_line_u64 * 8) % tags_divisor, 0);
+        let _tags_per_line = (cache_line_u64 * 8) / tags_divisor;
+        assert!(_tags_per_line > 0);
+
+        let clock_divisor = ways_u64 * clock_bits_u64;
+        assert!(clock_divisor > 0);
+        assert_eq!((cache_line_u64 * 8) % clock_divisor, 0);
+        let _clocks_per_line = (cache_line_u64 * 8) / clock_divisor;
+        assert!(_clocks_per_line > 0);
+
+        assert_eq!((cache_line_u64 * 8) % clock_bits_u64, 0);
+        let _clock_hand_per_line = (cache_line_u64 * 8) / clock_hand_bits;
+        assert!(_clock_hand_per_line > 0);
+
+        assert!(value_count_max > 0);
+        assert!(value_count_max >= ways_u64);
+        assert_eq!(value_count_max % ways_u64, 0);
+
+        let sets = value_count_max / ways_u64;
+
+        let value_size = size_of::<C::Value>() as u64;
+        let values_size_max = value_count_max
+            .checked_mul(value_size)
+            .expect("values_size_max overflow");
+        assert!(values_size_max >= cache_line_u64);
+        assert_eq!(values_size_max % cache_line_u64, 0);
+
+        let counts_bits = value_count_max
+            .checked_mul(clock_bits_u64)
+            .expect("counts_bits overflow");
+        assert_eq!(counts_bits % 8, 0);
+        let counts_size = counts_bits / 8;
+        assert!(counts_size >= cache_line_u64);
+        assert_eq!(counts_size % cache_line_u64, 0);
+        assert_eq!(counts_size % 8, 0);
+        let counts_words_len = counts_size / 8;
+
+        let clocks_bits = sets
+            .checked_mul(clock_hand_bits)
+            .expect("clocks_bits overflow");
+        assert_eq!(clocks_bits % 8, 0);
+        let clocks_size = clocks_bits / 8;
+        let _ = clocks_size;
+        let clocks_words_len = clocks_bits.div_ceil(64);
+
+        assert_eq!(value_count_max % Self::VALUE_COUNT_MAX_MULTIPLE, 0);
+        assert!(value_count_max <= usize::MAX as u64);
+        let value_count_max_usize =
+            usize::try_from(value_count_max).expect("value_count_max overflow usize");
+        let counts_words_len_usize =
+            usize::try_from(counts_words_len).expect("counts_words_len overflow usize");
+        let clocks_words_len_usize =
+            usize::try_from(clocks_words_len).expect("clocks_words_len overflow usize");
+
+        let tags = vec![TagT::default(); value_count_max_usize];
+        let values = AlignedBuf::<C::Value>::new_uninit(value_count_max_usize, value_alignment);
+        let counts = PackedUnsignedIntegerArray::<CLOCK_BITS>::new_zeroed(counts_words_len_usize);
+        let clocks =
+            PackedUnsignedIntegerArray::<CLOCK_HAND_BITS>::new_zeroed(clocks_words_len_usize);
+
+        let mut sac = Self {
+            name: options.name,
+            sets,
+            metrics: Box::new(UnsafeCell::new(Metrics::default())),
+            tags,
+            values,
+            counts: UnsafeCell::new(counts),
+            clocks: UnsafeCell::new(clocks),
+            _marker: PhantomData,
+        };
+
+        sac.reset();
+        sac
+    }
+
+    pub fn deinit(mut self) {
+        assert!(self.sets > 0);
+        self.sets = 0;
+    }
+
+    pub fn reset(&mut self) {
+        self.tags.fill(TagT::default());
+        unsafe {
+            (*self.counts.get()).words_mut().fill(0);
+            (*self.clocks.get()).words_mut().fill(0);
+        }
+        self.metric_mut().reset();
+    }
 }
 
 #[cfg(test)]
