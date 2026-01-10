@@ -124,11 +124,11 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     #[inline]
     pub const fn words_for_len(len: usize) -> usize {
         let bits = len * BITS;
-        (bits + (Self::WORD_BITS - 1)) / Self::WORD_BITS
+        bits.div_ceil(Self::WORD_BITS)
     }
 
     pub fn new_zeroed(words_len: usize) -> Self {
-        assert!(cfg!(target_endian = "little"));
+        const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
         assert!(BITS.is_power_of_two());
         assert!(Self::WORD_BITS.is_multiple_of(BITS));
@@ -138,7 +138,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     }
 
     pub fn from_words(words: Vec<u64>) -> Self {
-        assert!(cfg!(target_endian = "little"));
+        const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
         assert!(BITS.is_power_of_two());
         assert!(Self::WORD_BITS.is_multiple_of(BITS));
@@ -192,7 +192,7 @@ mod tests {
         let mut array =
             PackedUnsignedIntegerArray::<2>::from_words(vec![0, 0b10110010, 0, 0, 0, 0, 0, 0]);
 
-        assert_eq!(0b10, array.get(32 + 0));
+        assert_eq!(0b10, array.get(32));
         assert_eq!(0b00, array.get(32 + 1));
         assert_eq!(0b11, array.get(32 + 2));
         assert_eq!(0b10, array.get(32 + 3));
