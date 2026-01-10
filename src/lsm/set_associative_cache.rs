@@ -120,4 +120,64 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     const fn mask_value() -> u64 {
         (1u64 << BITS) - 1
     }
+
+    #[inline]
+    pub const fn words_for_len(len: usize) -> usize {
+        let bits = len * BITS;
+        (bits + (Self::WORD_BITS - 1)) / Self::WORD_BITS
+    }
+
+    pub fn new_zeroed(words_len: usize) -> Self {
+        assert!(cfg!(target_endian = "little"));
+        assert!(BITS < 8);
+        assert!(BITS.is_power_of_two());
+        assert!(Self::WORD_BITS.is_multiple_of(BITS));
+        Self {
+            words: vec![0u64; words_len].into_boxed_slice(),
+        }
+    }
+
+    pub fn from_words(words: Vec<u64>) -> Self {
+        assert!(cfg!(target_endian = "little"));
+        assert!(BITS < 8);
+        assert!(BITS.is_power_of_two());
+        assert!(Self::WORD_BITS.is_multiple_of(BITS));
+        Self {
+            words: words.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
+
+    #[inline]
+    pub fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.words
+    }
+
+    #[inline]
+    pub fn get(&self, index: u64) -> u8 {
+        let uints_per_word = Self::uints_per_word() as u64;
+        let word_index = index / uints_per_word;
+        let within = index % uints_per_word;
+        let shift = (within as usize) * BITS;
+        debug_assert!(word_index < self.words.len() as u64);
+        let word = self.words[word_index as usize];
+        ((word >> shift) & Self::mask_value()) as u8
+    }
+
+    #[inline]
+    pub fn set(&mut self, index: u64, value: u8) {
+        debug_assert!((value as u64) <= Self::mask_value());
+        let uints_per_word = Self::uints_per_word() as u64;
+        let word_index = index / uints_per_word;
+        let within = index % uints_per_word;
+        let shift = (within as usize) * BITS;
+        let mask = Self::mask_value() << shift;
+        debug_assert!(word_index < self.words.len() as u64);
+        let w = &mut self.words[word_index as usize];
+        *w = (*w & !mask) | ((value as u64) << shift);
+    }
 }
