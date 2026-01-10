@@ -262,13 +262,15 @@ impl<T> AlignedBuf<T> {
 
     /// Returns a reference to the element at `index`.
     ///
-    /// The caller must ensure the element has been initialized via [`write`](Self::write).
+    /// # Safety
+    ///
+    /// The slot at `index` must have been initialized via [`write`](Self::write).
     ///
     /// # Panics
     ///
     /// Panics if `index >= len`.
     #[inline]
-    pub fn get_ref(&self, index: usize) -> &T {
+    pub unsafe fn get_ref(&self, index: usize) -> &T {
         assert!(index < self.len);
         // SAFETY: Caller guarantees the slot is initialized. Pointer is valid and aligned.
         unsafe { (&*self.ptr.as_ptr().add(index)).assume_init_ref() }
@@ -276,13 +278,15 @@ impl<T> AlignedBuf<T> {
 
     /// Reads a copy of the element at `index`.
     ///
-    /// The caller must ensure the element has been initialized via [`write`](Self::write).
+    /// # Safety
+    ///
+    /// The slot at `index` must have been initialized via [`write`](Self::write).
     ///
     /// # Panics
     ///
     /// Panics if `index >= len`.
     #[inline]
-    pub fn read_copy(&self, index: usize) -> T
+    pub unsafe fn read_copy(&self, index: usize) -> T
     where
         T: Copy,
     {
