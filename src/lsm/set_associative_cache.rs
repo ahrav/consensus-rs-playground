@@ -8,6 +8,8 @@ use std::{
     ptr::NonNull,
 };
 
+use crate::stdx::fastrange::fast_range;
+
 /// Indicates whether an upsert operation updated an existing entry or inserted a new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateOrInsert {
@@ -358,7 +360,7 @@ pub struct UpsertResult<V> {
 #[derive(Clone, Copy)]
 struct Set<TagT, ValueT, const WAYS: usize> {
     /// Tag derived from the lookup key's hash entropy.
-    tage: TagT,
+    tag: TagT,
     /// Base index for this set in the tag/value arrays.
     offset: u64,
     /// Tag storage for the `WAYS` slots in this set.
@@ -650,6 +652,72 @@ where
             (*self.clocks.get()).words_mut().fill(0);
         }
         self.metric_mut().reset();
+    }
+
+    // ----- Internals -----
+
+    #[inline]
+    fn associate(&self, key: C::Key) -> Set<TagT, C::Value, WAYS> {
+        let entropy = C::hash(key);
+        let tag = TagT::truncate(entropy);
+        let index = fast_range(entropy, self.sets);
+        let offset = index * WAYS as u64;
+
+        let offset_usize = Self::index_usize(offset);
+        debug_assert!(offset_usize + WAYS <= self.tags.len());
+        debug_assert!(offset_usize + WAYS <= self.values.len());
+
+        let tags = unsafe { self.tags.as_ptr().add(offset_usize) as *mut [TagT; WAYS] };
+        let values = unsafe { self.values.as_ptr().add(offset_usize) as *mut [C::Value; WAYS] };
+
+        Set {
+            tag,
+            offset,
+            tags,
+            values,
+        }
+    }
+
+    #[inline]
+    fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16
+    where
+        TagT: core::simd::SimdElement,
+        core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
+        core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
+                Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
+            >,
+    {
+        use core::simd::cmp::SimdPartialEq;
+        use core::simd::{Mask, Simd};
+
+        let x = Simd::<TagT, WAYS>::from_array(*tags);
+        let y = Simd::<TagT, WAYS>::splat(tag);
+        let mask: Mask<<TagT as core::simd::SimdElement>::Mask, WAYS> = x.simd_eq(y);
+        mask.to_bitmask() as u16
+    }
+
+    #[inline]
+    fn counts_get(&self, index: u64) -> u8 {
+        unsafe { (*self.counts.get()).get(index) }
+    }
+
+    #[inline]
+    fn counts_set(&self, index: u64, value: u8) {
+        unsafe {
+            (*self.counts.get()).set(index, value);
+        }
+    }
+
+    #[inline]
+    fn clocks_get(&self, index: u64) -> u8 {
+        unsafe { (*self.clocks.get()).get(index) }
+    }
+
+    #[inline]
+    fn clocks_set(&self, index: u64, value: u8) {
+        unsafe {
+            (*self.clocks.get()).set(index, value);
+        }
     }
 }
 
