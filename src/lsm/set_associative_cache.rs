@@ -681,6 +681,27 @@ where
         Some(self.values.get_ptr(index))
     }
 
+    pub fn remove(&mut self, key: C::Key) -> Option<C::Value> {
+        let set = self.associate(key);
+        let way = self.search(set, key)?;
+
+        let idx = set.offset + way as u64;
+        let idx_usize = Self::index_usize(idx);
+        let removed = unsafe { self.values.read_copy(idx_usize) };
+        self.counts_set(idx, 0);
+        self.values.write_uninit(idx_usize);
+        Some(removed)
+    }
+
+    pub fn demote(&mut self, key: C::Key) {
+        let set = self.associate(key);
+        let Some(way) = self.search(set, key) else {
+            return;
+        };
+        let idx = set.offset + way as u64;
+        self.counts_set(idx, 1);
+    }
+
     // ----- Internals -----
 
     /// Computes the set metadata for `key` (tag, offset, and set-local pointers).
