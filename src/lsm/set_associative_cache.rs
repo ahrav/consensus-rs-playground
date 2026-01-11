@@ -717,6 +717,77 @@ where
         self.counts_set(idx, 1);
     }
 
+    /// Inserts or updates `value`, evicting an older entry if needed.
+    ///
+    /// On update, the existing entry is replaced and its count is reset to 1. On
+    /// insert, the CLOCK Nth-Chance scan starts at the set's clock hand, walking
+    /// ways until a zero-count slot is found (or becomes zero after decrement).
+    /// The clock hand advances to the next way after insertion.
+    pub fn upsert(&mut self, value: &C::Value) -> UpsertResult<C::Value> {
+        let key = C::key_from_value(value);
+        let set = self.associate(key);
+        let offset_usize = Self::index_usize(set.offset);
+
+        if let Some(way) = self.search(set, key) {
+            let way_usize = way as usize;
+            let idx = set.offset + way as u64;
+            let idx_usize = offset_usize + way_usize;
+            self.counts_set(idx, 1);
+            let evicted = unsafe { self.values.read_copy(idx_usize) };
+            self.values.write(idx_usize, *value);
+            return UpsertResult {
+                index: idx_usize,
+                updated: UpdateOrInsert::Update,
+                evicted: Some(evicted),
+            };
+        }
+
+        let clock_index = set.offset / WAYS as u64;
+        let mut way = self.clocks_get(clock_index) as usize;
+        debug_assert!(way < WAYS);
+
+        let max_count = Self::max_count() as usize;
+        let clock_iterations_max = WAYS * (max_count.saturating_sub(1));
+
+        let mut evicted: Option<C::Value> = None;
+        let mut safety_count: usize = 0;
+
+        while safety_count <= clock_iterations_max {
+            let idx = set.offset + way as u64;
+            let idx_usize = offset_usize + way;
+            let mut count = self.counts_get(idx) as usize;
+            if count == 0 {
+                break;
+            }
+
+            count -= 1;
+            self.counts_set(idx, count as u8);
+            if count == 0 {
+                evicted = Some(unsafe { self.values.read_copy(idx_usize) });
+                break;
+            }
+
+            safety_count += 1;
+            way = Self::wrap_way(way + 1);
+        }
+        if safety_count > clock_iterations_max {
+            unreachable!("clock eviction exceeded maximum iterations");
+        }
+
+        assert_eq!(self.counts_get(set.offset + way as u64), 0);
+
+        self.tags[offset_usize + way] = set.tag;
+        self.values.write(offset_usize + way, *value);
+        self.counts_set(set.offset + way as u64, 1);
+        self.clocks_set(clock_index, Self::wrap_way(way + 1) as u8);
+
+        UpsertResult {
+            index: offset_usize + way,
+            updated: UpdateOrInsert::Insert,
+            evicted,
+        }
+    }
+
     // ----- Internals -----
 
     /// Computes the set metadata for `key` (tag, offset, and set-local pointers).
