@@ -506,11 +506,6 @@ where
     }
 
     #[inline]
-    fn metrics_mut(&self) -> &mut Metrics {
-        unsafe { &mut *self.metrics.as_ref().get() }
-    }
-
-    #[inline]
     fn index_usize(index: u64) -> usize {
         let idx = index as usize;
         debug_assert_eq!(idx as u64, index);
@@ -664,14 +659,14 @@ where
             (*self.counts.get()).words_mut().fill(0);
             (*self.clocks.get()).words_mut().fill(0);
         }
-        self.metrics_mut().reset();
+        self.metric_ref().reset();
     }
 
     /// Looks up `key` and returns its slot index, updating counters on hit/miss.
     pub fn get_index(&self, key: C::Key) -> Option<usize> {
         let set = self.associate(key);
         if let Some(way) = self.search(set, key) {
-            let metrics = self.metrics_mut();
+            let metrics = self.metric_ref();
             metrics.hits.set(metrics.hits.get() + 1);
 
             let idx = set.offset + way as u64;
@@ -680,7 +675,7 @@ where
             self.counts_set(idx, next);
             Some(Self::index_usize(idx))
         } else {
-            let metrics = self.metrics_mut();
+            let metrics = self.metric_ref();
             metrics.misses.set(metrics.misses.get() + 1);
             None
         }
