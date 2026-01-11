@@ -46,10 +46,10 @@ use core::{cmp::min, mem::MaybeUninit, ptr};
 use crate::{
     constants, container_of,
     message_pool::Message,
-    stdx::BitSet,
+    stdx::{BitSet, bounded_array::BoundedArray},
     util::{utils::AlignedSlice, zero},
     vsr::{
-        Checksum128, Command, Header, HeaderPrepare, HeaderPrepareRaw, Operation,
+        Checksum128, Command, Header, HeaderPrepare, HeaderPrepareRaw, Operation, ViewChangeSlice,
         command::PrepareCmd,
         iops::IOPSType,
         journal_primitives::{
@@ -659,14 +659,22 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
 #[allow(dead_code)]
 #[inline]
 fn recovery_case(
-    header: Option<&HeaderPrepare>,
-    prepare: Option<&HeaderPrepare>,
+    header: Option<HeaderPrepare>,
+    prepare: Option<HeaderPrepare>,
     op_max: u64,
     op_prepare_max: u64,
     solo: bool,
 ) -> &'static RecoveryCase {
     let is_header = header.is_some();
     let is_prepare = prepare.is_some();
+
+    if let Some(header) = header {
+        assert!(header.invalid().is_none());
+    }
+    if let Some(prepare) = prepare {
+        assert!(prepare.invalid().is_none());
+    }
+
     let parameters = [
         is_header,
         is_header && header.unwrap().operation == Operation::RESERVED,
@@ -710,13 +718,13 @@ fn header_ok(
     cluster: constants::ClusterId,
     slot: Slot,
     header: &HeaderPrepareRaw,
-) -> Option<&HeaderPrepare> {
+) -> Option<HeaderPrepare> {
     // Validate checksum before accessing fields.
     if !header.valid_checksum() {
         return None;
     }
 
-    if header.command_checked()? != Command::Prepare {
+    if header.command != Command::Prepare as u8 {
         return None;
     }
 
@@ -731,7 +739,19 @@ fn header_ok(
         return None;
     }
 
-    header.as_typed()
+    // SAFETY: command byte is validated above; HeaderPrepareRaw has identical layout.
+    Some(unsafe { *header.as_typed_unchecked() })
+}
+
+#[inline]
+fn header_prepare_as_raw(header: &HeaderPrepare) -> &HeaderPrepareRaw {
+    // SAFETY: HeaderPrepare and HeaderPrepareRaw have identical layout/alignment.
+    unsafe { &*(header as *const HeaderPrepare as *const HeaderPrepareRaw) }
+}
+
+#[inline]
+fn header_prepare_raw_from_typed(header: &HeaderPrepare) -> HeaderPrepareRaw {
+    *header_prepare_as_raw(header)
 }
 
 /// WAL journal implementing range-locked sector writes.
@@ -762,13 +782,9 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// is written to disk.
     ///
     /// This handles the case where a prepare is written before its header sector
-    /// is flushed, allowing recovery to detect and repair inconsistencies.
-    pub headers_redundant: AlignedSlice<HeaderPrepare>,
-
-    /// Recovery-time raw redundant headers loaded from disk.
-    ///
-    /// TODO: Centralize raw/typed redundant headers into a single representation.
-    pub headers_redundant_raw: AlignedSlice<HeaderPrepareRaw>,
+    /// is flushed, allowing recovery to detect and repair inconsistencies. We store
+    /// the redundant headers in raw form to safely load untrusted bytes during recovery.
+    pub headers_redundant: AlignedSlice<HeaderPrepareRaw>,
 
     /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
@@ -842,9 +858,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
         let headers_redundant = unsafe {
-            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
-        };
-        let headers_redundant_raw = unsafe {
             AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
         let write_headers_sectors = unsafe {
@@ -865,7 +878,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             replica,
             headers,
             headers_redundant,
-            headers_redundant_raw,
             write_headers_sectors,
             header_chunks_requested: HeaderChunks::empty(),
             header_chunks_recovered: HeaderChunks::empty(),
@@ -889,11 +901,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             ptr::write_bytes(
                 journal.headers_redundant.as_mut_ptr() as *mut u8,
                 0,
-                SLOT_COUNT * size_of::<HeaderPrepare>(),
-            );
-            ptr::write_bytes(
-                journal.headers_redundant_raw.as_mut_ptr() as *mut u8,
-                0,
                 SLOT_COUNT * size_of::<HeaderPrepareRaw>(),
             );
         }
@@ -907,7 +914,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         );
         assert!(
             journal
-                .headers_redundant_raw
+                .headers_redundant
                 .iter()
                 .all(|h| !h.valid_checksum())
         );
@@ -1125,6 +1132,22 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         max
     }
 
+    /// Returns the chunk descriptor for a specific chunk index.
+    #[inline]
+    pub fn header_chunk(&self, chunk_index: usize) -> HeaderChunk {
+        assert!(chunk_index < HEADER_CHUNK_COUNT);
+
+        let offset = Self::header_chunk_offset(chunk_index);
+        let len = Self::header_chunk_len_for_offset(offset);
+        let chunk = HeaderChunk {
+            index: chunk_index,
+            offset,
+            len,
+        };
+        chunk.assert_invariants();
+        chunk
+    }
+
     /// Returns the next chunk to read, marking it as requested.
     ///
     /// Returns `None` in two cases:
@@ -1204,7 +1227,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Panics if:
     /// - `chunk_bytes.len()` is not a positive multiple of `WAL_HEADER_SIZE`
-    /// - `chunk_bytes` is not properly aligned for `HeaderPrepare`
+    /// - `chunk_bytes` is not properly aligned for `HeaderPrepareRaw`
     #[inline]
     pub fn header_chunk_bytes_as_headers(chunk_bytes: &[u8]) -> &[HeaderPrepareRaw] {
         assert!(chunk_bytes.len() >= WAL_HEADER_SIZE);
@@ -1257,8 +1280,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             // Preserve the existing faulty state for reserved slots.
         } else {
             self.faulty.unset(slot.index());
-            self.headers_redundant[slot.index()] =
-                HeaderPrepare::reserve(header.cluster, slot.index() as u64);
+            let reserved = HeaderPrepare::reserve(header.cluster, slot.index() as u64);
+            self.headers_redundant[slot.index()] = header_prepare_raw_from_typed(&reserved);
         }
 
         self.headers[slot.index()] = *header;
@@ -1608,21 +1631,15 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// Recovery reads use `options.op` for chunk/slot identity and do not populate
     /// `options.checksum`.
     #[allow(dead_code)]
-    fn read_recovery_acquire(
-        &mut self,
-        op: u64,
-    ) -> Option<*mut Read<S, WRITE_OPS, WRITE_OPS_WORDS>> {
+    fn read_recovery_acquire(&mut self, op: u64) -> *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> {
         assert!(matches!(self.status, Status::Recovering { .. }));
-
-        if self.reads.available() == 0 {
-            return None;
-        }
+        assert!(self.reads.available() > 0);
 
         let replica_ptr = self.replica_ptr();
         let replica = unsafe { &mut *replica_ptr };
         let message = replica.message_pool.get::<PrepareCmd>();
 
-        let read = self.reads.acquire()?;
+        let read = self.reads.acquire().expect("recovery read unavailable");
 
         let options = ReadOptions {
             op,
@@ -1637,7 +1654,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             ptr::addr_of_mut!((*read).message).write(MaybeUninit::new(message));
         }
 
-        Some(read)
+        read
     }
 
     /// Debug hook for read-path notices; intentionally a no-op in production builds.
@@ -1774,7 +1791,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             assert!(journal.faulty.is_set(slot.index()));
         }
 
-        journal.headers_redundant[slot.index()] = *header;
+        journal.headers_redundant[slot.index()] = header_prepare_raw_from_typed(header);
 
         let sector_index = slot.index() / HEADERS_PER_SECTOR;
         let buffer = journal.header_sector(sector_index, write);
@@ -1828,9 +1845,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let sector_slot = Slot::new(sector_index * HEADERS_PER_SECTOR);
 
         let sector_bytes = &mut self.write_headers_sectors[write_index];
-        let sector_headers: &mut [HeaderPrepare] = unsafe {
+        let sector_headers: &mut [HeaderPrepareRaw] = unsafe {
             core::slice::from_raw_parts_mut(
-                sector_bytes.as_mut_ptr() as *mut HeaderPrepare,
+                sector_bytes.as_mut_ptr() as *mut HeaderPrepareRaw,
                 HEADERS_PER_SECTOR,
             )
         };

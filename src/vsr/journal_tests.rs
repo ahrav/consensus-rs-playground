@@ -2,6 +2,7 @@ use super::*;
 use crate::message_pool::MessagePool;
 use crate::storage::AlignedBuf;
 use crate::vsr::Release;
+use crate::vsr::checksum;
 use crate::vsr::superblock;
 use core::cell::RefCell;
 use std::collections::HashMap;
@@ -1068,13 +1069,7 @@ fn recovery_cases_match_expected_decisions() {
         decision_multiple: RecoveryDecision,
         decision_single: RecoveryDecision,
     ) {
-        let case = recovery_case(
-            header.as_ref(),
-            prepare.as_ref(),
-            op_max,
-            op_prepare_max,
-            false,
-        );
+        let case = recovery_case(header, prepare, op_max, op_prepare_max, false);
         assert_eq!(case.label, label);
         assert_eq!(case.decision(false), decision_multiple);
         assert_eq!(case.decision(true), decision_single);
@@ -1655,7 +1650,7 @@ fn set_header_as_dirty_updates_reserved_slot() {
 
     assert_eq!(journal.headers[slot], header);
     assert!(journal.dirty.is_set(slot));
-    assert_eq!(journal.headers_redundant[slot], redundant_before);
+    assert!(journal.headers_redundant[slot] == redundant_before);
     assert!(!journal.faulty.is_set(slot));
 }
 
@@ -1672,7 +1667,8 @@ fn set_header_as_dirty_overwrite_clears_faulty_and_resets_redundant() {
     let existing = make_header(op, Operation::REGISTER);
     journal.headers[slot] = existing;
     journal.faulty.set(slot);
-    journal.headers_redundant[slot] = make_header(op + 1, Operation::ROOT);
+    journal.headers_redundant[slot] =
+        header_prepare_raw_from_typed(&make_header(op + 1, Operation::ROOT));
 
     let mut header = make_header(op, Operation::RECONFIGURE);
     header.cluster = 7u128;
@@ -1683,9 +1679,9 @@ fn set_header_as_dirty_overwrite_clears_faulty_and_resets_redundant() {
     assert_eq!(journal.headers[slot], header);
     assert!(journal.dirty.is_set(slot));
     assert!(!journal.faulty.is_set(slot));
-    assert_eq!(
-        journal.headers_redundant[slot],
-        HeaderPrepare::reserve(header.cluster, slot as u64)
+    assert!(
+        journal.headers_redundant[slot]
+            == header_prepare_raw_from_typed(&HeaderPrepare::reserve(header.cluster, slot as u64))
     );
 }
 
@@ -1703,7 +1699,7 @@ fn set_header_as_dirty_noop_when_header_exists() {
     journal.headers[slot] = header;
     journal.dirty.set(slot);
     journal.faulty.set(slot);
-    let redundant = make_header(op + 1, Operation::NOOP);
+    let redundant = header_prepare_raw_from_typed(&make_header(op + 1, Operation::NOOP));
     journal.headers_redundant[slot] = redundant;
 
     journal.set_header_as_dirty(&header);
@@ -1711,7 +1707,7 @@ fn set_header_as_dirty_noop_when_header_exists() {
     assert_eq!(journal.headers[slot], header);
     assert!(journal.dirty.is_set(slot));
     assert!(journal.faulty.is_set(slot));
-    assert_eq!(journal.headers_redundant[slot], redundant);
+    assert!(journal.headers_redundant[slot] == redundant);
 }
 
 #[test]
@@ -2522,7 +2518,7 @@ fn write_prepare_skips_clean_slot() {
     let header = make_prepare_header_with_size(op, Operation::REGISTER, constants::SECTOR_SIZE);
 
     journal.headers[slot] = header;
-    journal.headers_redundant[slot] = header;
+    journal.headers_redundant[slot] = header_prepare_raw_from_typed(&header);
     journal.prepare_inhabited[slot] = true;
     journal.prepare_checksums[slot] = header.checksum;
     journal.dirty.unset(slot);
@@ -2539,7 +2535,7 @@ fn write_prepare_skips_clean_slot() {
     assert!(!journal.faulty.is_set(slot));
     assert!(journal.prepare_inhabited[slot]);
     assert_eq!(journal.prepare_checksums[slot], header.checksum);
-    assert_eq!(journal.headers_redundant[slot], header);
+    assert!(journal.headers_redundant[slot] == header_prepare_raw_from_typed(&header));
 }
 
 #[test]
@@ -2609,7 +2605,7 @@ fn write_prepare_happy_path_updates_state_and_writes() {
 
     assert!(!journal.dirty.is_set(slot));
     assert!(!journal.faulty.is_set(slot));
-    assert_eq!(journal.headers_redundant[slot], header);
+    assert!(journal.headers_redundant[slot] == header_prepare_raw_from_typed(&header));
     assert!(journal.prepare_inhabited[slot]);
     assert_eq!(journal.prepare_checksums[slot], header.checksum);
     assert_eq!(take_prepare_callbacks(), vec![Some(message_ptr)]);
@@ -3149,11 +3145,6 @@ fn journal_new_initializes_all_fields_correctly() {
         "headers_redundant should have SLOT_COUNT entries"
     );
     assert_eq!(
-        journal.headers_redundant_raw.len(),
-        SLOT_COUNT,
-        "headers_redundant_raw should have SLOT_COUNT entries"
-    );
-    assert_eq!(
         journal.write_headers_sectors.len(),
         constants::JOURNAL_IOPS_WRITE_MAX as usize,
         "write_headers_sectors should have JOURNAL_IOPS_WRITE_MAX entries"
@@ -3193,13 +3184,6 @@ fn journal_new_headers_have_invalid_checksums() {
             .iter()
             .all(|h| !h.valid_checksum()),
         "all redundant headers should have invalid checksums after initialization"
-    );
-    assert!(
-        journal
-            .headers_redundant_raw
-            .iter()
-            .all(|h| !h.valid_checksum()),
-        "all raw redundant headers should have invalid checksums after initialization"
     );
 }
 
@@ -3303,11 +3287,12 @@ fn make_header(op: u64, operation: Operation) -> HeaderPrepare {
 /// Creates a reserved header for the given slot index.
 /// Reserved headers have operation = RESERVED and op = slot_index.
 fn make_reserved_header(slot_index: usize) -> HeaderPrepare {
-    let mut header = HeaderPrepare::zeroed();
+    let mut header = HeaderPrepare::new();
     header.command = Command::Prepare;
     header.operation = Operation::RESERVED;
     header.op = slot_index as u64;
     header.size = HeaderPrepare::SIZE as u32;
+    header.set_checksum_body(&[]);
     header.set_checksum();
     header
 }
@@ -3318,6 +3303,24 @@ fn make_recovery_header(op: u64, view: u32, checksum: u128, operation: Operation
     header.operation = operation;
     header.op = op;
     header.view = view;
+    if operation != Operation::ROOT && operation != Operation::RESERVED {
+        header.release = Release(1);
+        header.parent = 1;
+        header.commit = op.saturating_sub(1);
+        header.timestamp = 1;
+
+        if operation == Operation::PULSE || operation == Operation::UPGRADE {
+            header.client = 0;
+            header.request = 0;
+        } else if operation == Operation::REGISTER {
+            header.client = 1;
+            header.request = 0;
+        } else {
+            header.client = 1;
+            header.request = 1;
+        }
+    }
+    header.checksum_body = checksum::checksum(&[]);
     header.checksum = checksum;
     header
 }
