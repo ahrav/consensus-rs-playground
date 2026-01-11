@@ -3303,6 +3303,24 @@ fn make_recovery_header(op: u64, view: u32, checksum: u128, operation: Operation
     header.operation = operation;
     header.op = op;
     header.view = view;
+    if operation != Operation::ROOT && operation != Operation::RESERVED {
+        header.release = Release(1);
+        header.parent = 1;
+        header.commit = op.saturating_sub(1);
+        header.timestamp = 1;
+
+        if operation == Operation::PULSE || operation == Operation::UPGRADE {
+            header.client = 0;
+            header.request = 0;
+        } else if operation == Operation::REGISTER {
+            header.client = 1;
+            header.request = 0;
+        } else {
+            header.client = 1;
+            header.request = 1;
+        }
+    }
+    header.checksum_body = checksum::checksum(&[]);
     header.checksum = checksum;
     header
 }
