@@ -2,11 +2,13 @@
 
 use std::{
     alloc::{Layout as AllocLayout, alloc, dealloc},
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     marker::PhantomData,
     mem::MaybeUninit,
     ptr::NonNull,
 };
+
+use crate::stdx::fastrange::fast_range;
 
 /// Indicates whether an upsert operation updated an existing entry or inserted a new one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -127,12 +129,14 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         (1u64 << BITS) - 1
     }
 
+    /// Returns the number of 64-bit words needed to store `len` values.
     #[inline]
     pub const fn words_for_len(len: usize) -> usize {
         let bits = len * BITS;
         bits.div_ceil(Self::WORD_BITS)
     }
 
+    /// Allocates a zeroed array with `words_len` 64-bit words.
     pub fn new_zeroed(words_len: usize) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -143,6 +147,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         }
     }
 
+    /// Wraps an existing word buffer without copying.
     pub fn from_words(words: Vec<u64>) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -153,16 +158,19 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         }
     }
 
+    /// Returns the backing storage as 64-bit words.
     #[inline]
     pub fn words(&self) -> &[u64] {
         &self.words
     }
 
+    /// Returns the backing storage as mutable 64-bit words.
     #[inline]
     pub fn words_mut(&mut self) -> &mut [u64] {
         &mut self.words
     }
 
+    /// Returns the packed unsigned integer at `index`.
     #[inline]
     pub fn get(&self, index: u64) -> u8 {
         let uints_per_word = Self::uints_per_word() as u64;
@@ -174,6 +182,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         ((word >> shift) & Self::mask_value()) as u8
     }
 
+    /// Sets the packed unsigned integer at `index` to `value`.
     #[inline]
     pub fn set(&mut self, index: u64, value: u8) {
         debug_assert!((value as u64) <= Self::mask_value());
@@ -330,6 +339,526 @@ impl<T> Drop for AlignedBuf<T> {
         // Note: Element destructors are NOT run—this is intentional for Copy types.
         unsafe {
             dealloc(self.ptr.as_ptr() as *mut u8, self.layout);
+        }
+    }
+}
+
+/// Configuration options for initializing a cache instance.
+pub struct Options<'a> {
+    /// Human-readable name used for diagnostics.
+    pub name: &'a str,
+}
+
+/// Result of inserting or updating a cache entry.
+pub struct UpsertResult<V> {
+    /// Index of the slot written within the cache storage.
+    pub index: usize,
+    /// Whether the operation replaced an existing entry or inserted a new one.
+    pub updated: UpdateOrInsert,
+    /// The evicted value, if an insertion displaced an older entry.
+    pub evicted: Option<V>,
+}
+
+/// Per-set view used during lookups and insertions.
+///
+/// Each key maps to a set of `WAYS` consecutive slots; this bundles the derived
+/// tag and pointers into the backing tag/value arrays for that set. The
+/// `offset` is the base index used to address the set's ways.
+#[derive(Clone, Copy)]
+struct Set<TagT, ValueT, const WAYS: usize> {
+    /// Tag derived from the lookup key's hash entropy.
+    tag: TagT,
+    /// Base index for this set in the tag/value arrays.
+    offset: u64,
+    /// Tag storage for the `WAYS` slots in this set.
+    tags: *mut [TagT; WAYS],
+    /// Value storage for the `WAYS` slots in this set.
+    values: *mut [ValueT; WAYS],
+}
+
+/// N-way set-associative cache with CLOCK Nth-Chance eviction.
+///
+/// Each key maps to one set of `WAYS` consecutive slots that may contain its
+/// value. Tags provide a compact hash prefix to avoid full key comparisons on
+/// most misses, while counts/clocks drive the replacement policy.
+pub struct SetAssociativeCache<
+    'a,
+    C,
+    TagT,
+    const WAYS: usize,
+    const CLOCK_BITS: usize,
+    const CACHE_LINE_SIZE: usize,
+    const VALUE_ALIGNMENT: usize,
+    const CLOCK_HAND_BITS: usize,
+> where
+    C: SetAssociativeCacheContext,
+    TagT: Tag,
+{
+    /// Human-readable cache name for diagnostics.
+    name: &'a str,
+    /// Number of sets in the cache.
+    sets: u64,
+
+    /// Hit/miss counters stored behind interior mutability.
+    metrics: Box<UnsafeCell<Metrics>>,
+
+    /// Short, partial hashes of keys stored alongside cached values.
+    ///
+    /// Because the tag is small, collisions are possible: `tag(k1) == tag(k2)`
+    /// does not imply `k1 == k2`. However, most of the time, where the tag
+    /// differs, a full key comparison can be avoided. Since tags are 16-32x
+    /// smaller than keys, they can also be kept hot in cache.
+    tags: Vec<TagT>,
+
+    /// Cache values; a slot is present when its count is non-zero.
+    values: AlignedBuf<C::Value>,
+
+    /// Per-slot access counts, tracking recent reads.
+    ///
+    /// * A count is incremented when a value is accessed by `get`.
+    /// * A count is decremented when a cache write to the value's set misses.
+    /// * A value is evicted when its count reaches zero.
+    counts: UnsafeCell<PackedUnsignedIntegerArray<CLOCK_BITS>>,
+
+    /// Per-set clock hand that rotates across ways to find eviction candidates.
+    ///
+    /// On cache write, entries are checked for occupancy (or eviction) beginning
+    /// from the clock's position, wrapping around. The algorithm implemented is
+    /// CLOCK Nth-Chance, where each way has more than one bit to give entries
+    /// multiple chances before eviction. A similar algorithm called "RRIParoo"
+    /// is described in "Kangaroo: Caching Billions of Tiny Objects on Flash".
+    /// For general background, see:
+    /// https://en.wikipedia.org/wiki/Page_replacement_algorithm.
+    clocks: UnsafeCell<PackedUnsignedIntegerArray<CLOCK_HAND_BITS>>,
+
+    /// Marker for the cache context's key/value types.
+    _marker: PhantomData<C>,
+}
+
+impl<
+    'a,
+    C,
+    TagT,
+    const WAYS: usize,
+    const CLOCK_BITS: usize,
+    const CACHE_LINE_SIZE: usize,
+    const VALUE_ALIGNMENT: usize,
+    const CLOCK_HAND_BITS: usize,
+>
+    SetAssociativeCache<
+        'a,
+        C,
+        TagT,
+        WAYS,
+        CLOCK_BITS,
+        CACHE_LINE_SIZE,
+        VALUE_ALIGNMENT,
+        CLOCK_HAND_BITS,
+    >
+where
+    C: SetAssociativeCacheContext,
+    TagT: Tag + core::simd::SimdElement,
+    core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
+    core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
+            Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
+        >,
+{
+    pub const VALUE_COUNT_MAX_MULTIPLE: u64 = {
+        const fn max_u(a: u64, b: u64) -> u64 {
+            if a > b { a } else { b }
+        }
+
+        const fn min_u(a: u64, b: u64) -> u64 {
+            if a < b { a } else { b }
+        }
+
+        let value_size = size_of::<C::Value>() as u64;
+        let cache_line = CACHE_LINE_SIZE as u64;
+        let ways = WAYS as u64;
+        let values_term = (max_u(value_size, cache_line) / min_u(value_size, cache_line)) * ways;
+        let counts_term = (cache_line * 8) / CLOCK_BITS as u64;
+        max_u(values_term, counts_term)
+    };
+
+    #[inline]
+    fn value_alignment() -> usize {
+        if VALUE_ALIGNMENT == 0 {
+            align_of::<C::Value>()
+        } else {
+            VALUE_ALIGNMENT
+        }
+    }
+
+    #[inline]
+    fn max_count() -> u8 {
+        debug_assert!(CLOCK_BITS <= 8);
+        ((1u16 << CLOCK_BITS) - 1) as u8
+    }
+
+    #[inline]
+    fn wrap_way(way: usize) -> usize {
+        way & (WAYS - 1)
+    }
+
+    #[inline]
+    fn metric_ref(&self) -> &Metrics {
+        unsafe { &*self.metrics.as_ref().get() }
+    }
+
+    #[inline]
+    fn index_usize(index: u64) -> usize {
+        let idx = index as usize;
+        debug_assert_eq!(idx as u64, index);
+        idx
+    }
+
+    /// Initializes a cache sized for `value_count_max` values.
+    ///
+    /// `value_count_max` must be a multiple of `WAYS` and `VALUE_COUNT_MAX_MULTIPLE` so that
+    /// tags, values, counts, and clocks stay cache-line aligned. This allocates the backing
+    /// arrays and zeroes the tag/count/clock state via `reset`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any layout invariant is violated (ways/tag bits/clock bits, cache-line or value
+    /// alignment constraints) or if computed sizes overflow.
+    pub fn init(value_count_max: u64, options: Options<'a>) -> Self {
+        assert!(size_of::<C::Key>().is_power_of_two());
+        assert!(size_of::<C::Value>().is_power_of_two());
+
+        match WAYS {
+            2 | 4 | 16 => {}
+            _ => panic!("Invalid number of ways"),
+        }
+
+        match TagT::BITS {
+            8 | 16 => {}
+            _ => panic!("tag bits must be 8 or 16"),
+        }
+
+        match CLOCK_BITS {
+            1 | 2 | 4 => {}
+            _ => panic!("CLOCK_BITS must be 1, 2, or 4"),
+        }
+
+        let value_alignment = Self::value_alignment();
+        assert!(value_alignment >= align_of::<C::Value>());
+        assert!(size_of::<C::Value>().is_multiple_of(value_alignment));
+
+        assert!(WAYS.is_power_of_two());
+        assert!(TagT::BITS.is_power_of_two());
+        assert!(CLOCK_BITS.is_power_of_two());
+        assert!(CACHE_LINE_SIZE.is_power_of_two());
+
+        assert!(size_of::<C::Key>() <= size_of::<C::Value>());
+        assert!(size_of::<C::Key>() < CACHE_LINE_SIZE);
+        assert!(CACHE_LINE_SIZE.is_multiple_of(size_of::<C::Key>()));
+
+        if CACHE_LINE_SIZE > size_of::<C::Value>() {
+            assert!(CACHE_LINE_SIZE.is_multiple_of(size_of::<C::Value>()));
+        } else {
+            assert!(size_of::<C::Value>().is_multiple_of(CACHE_LINE_SIZE));
+        }
+
+        assert!(CLOCK_HAND_BITS.is_power_of_two());
+        assert_eq!((1usize << CLOCK_HAND_BITS), WAYS);
+
+        let ways_u64 = WAYS as u64;
+        let cache_line_u64 = CACHE_LINE_SIZE as u64;
+        let tag_bits_u64 = TagT::BITS as u64;
+        let clock_bits_u64 = CLOCK_BITS as u64;
+        let clock_hand_bits = CLOCK_HAND_BITS as u64;
+
+        let tags_divisor = ways_u64 * tag_bits_u64;
+        assert!(tags_divisor > 0);
+        assert_eq!((cache_line_u64 * 8) % tags_divisor, 0);
+        let _tags_per_line = (cache_line_u64 * 8) / tags_divisor;
+        assert!(_tags_per_line > 0);
+
+        let clock_divisor = ways_u64 * clock_bits_u64;
+        assert!(clock_divisor > 0);
+        assert_eq!((cache_line_u64 * 8) % clock_divisor, 0);
+        let _clocks_per_line = (cache_line_u64 * 8) / clock_divisor;
+        assert!(_clocks_per_line > 0);
+
+        assert_eq!((cache_line_u64 * 8) % clock_bits_u64, 0);
+        let _clock_hand_per_line = (cache_line_u64 * 8) / clock_hand_bits;
+        assert!(_clock_hand_per_line > 0);
+
+        assert!(value_count_max > 0);
+        assert!(value_count_max >= ways_u64);
+        assert_eq!(value_count_max % ways_u64, 0);
+
+        let sets = value_count_max / ways_u64;
+
+        let value_size = size_of::<C::Value>() as u64;
+        let values_size_max = value_count_max
+            .checked_mul(value_size)
+            .expect("values_size_max overflow");
+        assert!(values_size_max >= cache_line_u64);
+        assert_eq!(values_size_max % cache_line_u64, 0);
+
+        let counts_bits = value_count_max
+            .checked_mul(clock_bits_u64)
+            .expect("counts_bits overflow");
+        assert_eq!(counts_bits % 8, 0);
+        let counts_size = counts_bits / 8;
+        assert!(counts_size >= cache_line_u64);
+        assert_eq!(counts_size % cache_line_u64, 0);
+        assert_eq!(counts_size % 8, 0);
+        let counts_words_len = counts_size / 8;
+
+        let clocks_bits = sets
+            .checked_mul(clock_hand_bits)
+            .expect("clocks_bits overflow");
+        assert_eq!(clocks_bits % 8, 0);
+        let clocks_size = clocks_bits / 8;
+        let _ = clocks_size;
+        let clocks_words_len = clocks_bits.div_ceil(64);
+
+        assert_eq!(value_count_max % Self::VALUE_COUNT_MAX_MULTIPLE, 0);
+        assert!(value_count_max <= usize::MAX as u64);
+        let value_count_max_usize =
+            usize::try_from(value_count_max).expect("value_count_max overflow usize");
+        let counts_words_len_usize =
+            usize::try_from(counts_words_len).expect("counts_words_len overflow usize");
+        let clocks_words_len_usize =
+            usize::try_from(clocks_words_len).expect("clocks_words_len overflow usize");
+
+        let tags = vec![TagT::default(); value_count_max_usize];
+        let values = AlignedBuf::<C::Value>::new_uninit(value_count_max_usize, value_alignment);
+        let counts = PackedUnsignedIntegerArray::<CLOCK_BITS>::new_zeroed(counts_words_len_usize);
+        let clocks =
+            PackedUnsignedIntegerArray::<CLOCK_HAND_BITS>::new_zeroed(clocks_words_len_usize);
+
+        let mut sac = Self {
+            name: options.name,
+            sets,
+            metrics: Box::new(UnsafeCell::new(Metrics::default())),
+            tags,
+            values,
+            counts: UnsafeCell::new(counts),
+            clocks: UnsafeCell::new(clocks),
+            _marker: PhantomData,
+        };
+
+        sac.reset();
+        sac
+    }
+
+    /// Clears tags, counts, clocks, and metrics.
+    pub fn reset(&mut self) {
+        self.tags.fill(TagT::default());
+        unsafe {
+            (*self.counts.get()).words_mut().fill(0);
+            (*self.clocks.get()).words_mut().fill(0);
+        }
+        self.metric_ref().reset();
+    }
+
+    /// Looks up `key` and returns its slot index, updating counters on hit/miss.
+    pub fn get_index(&self, key: C::Key) -> Option<usize> {
+        let set = self.associate(key);
+        if let Some(way) = self.search(set, key) {
+            let metrics = self.metric_ref();
+            metrics.hits.set(metrics.hits.get() + 1);
+
+            let idx = set.offset + way as u64;
+            let count = self.counts_get(idx);
+            let next = count.saturating_add(1).min(Self::max_count());
+            self.counts_set(idx, next);
+            Some(Self::index_usize(idx))
+        } else {
+            let metrics = self.metric_ref();
+            metrics.misses.set(metrics.misses.get() + 1);
+            None
+        }
+    }
+
+    /// Looks up `key` and returns a pointer to the cached value, if present.
+    ///
+    /// The returned pointer is valid until the entry is evicted or the cache is reset.
+    pub fn get(&self, key: C::Key) -> Option<*mut C::Value> {
+        let index = self.get_index(key)?;
+        Some(self.values.get_ptr(index))
+    }
+
+    /// Removes `key` from the cache if present, returning the removed value.
+    pub fn remove(&mut self, key: C::Key) -> Option<C::Value> {
+        let set = self.associate(key);
+        let way = self.search(set, key)?;
+
+        let idx = set.offset + way as u64;
+        let idx_usize = Self::index_usize(idx);
+        let removed = unsafe { self.values.read_copy(idx_usize) };
+        self.counts_set(idx, 0);
+        self.values.write_uninit(idx_usize);
+        Some(removed)
+    }
+
+    /// Hints that `key` is less likely to be accessed without removing it.
+    pub fn demote(&mut self, key: C::Key) {
+        let set = self.associate(key);
+        let Some(way) = self.search(set, key) else {
+            return;
+        };
+        let idx = set.offset + way as u64;
+        self.counts_set(idx, 1);
+    }
+
+    /// Inserts or updates `value`, evicting an older entry if needed.
+    ///
+    /// On update, the existing entry is replaced and its count is reset to 1. On
+    /// insert, the CLOCK Nth-Chance scan starts at the set's clock hand, walking
+    /// ways until a zero-count slot is found (or becomes zero after decrement).
+    /// The clock hand advances to the next way after insertion.
+    pub fn upsert(&mut self, value: &C::Value) -> UpsertResult<C::Value> {
+        let key = C::key_from_value(value);
+        let set = self.associate(key);
+        let offset_usize = Self::index_usize(set.offset);
+
+        if let Some(way) = self.search(set, key) {
+            let way_usize = way as usize;
+            let idx = set.offset + way as u64;
+            let idx_usize = offset_usize + way_usize;
+            self.counts_set(idx, 1);
+            let evicted = unsafe { self.values.read_copy(idx_usize) };
+            self.values.write(idx_usize, *value);
+            return UpsertResult {
+                index: idx_usize,
+                updated: UpdateOrInsert::Update,
+                evicted: Some(evicted),
+            };
+        }
+
+        let clock_index = set.offset / WAYS as u64;
+        let mut way = self.clocks_get(clock_index) as usize;
+        debug_assert!(way < WAYS);
+
+        let max_count = Self::max_count() as usize;
+        let clock_iterations_max = WAYS * (max_count.saturating_sub(1));
+
+        let mut evicted: Option<C::Value> = None;
+        let mut safety_count: usize = 0;
+
+        while safety_count <= clock_iterations_max {
+            let idx = set.offset + way as u64;
+            let idx_usize = offset_usize + way;
+            let mut count = self.counts_get(idx) as usize;
+            if count == 0 {
+                break;
+            }
+
+            count -= 1;
+            self.counts_set(idx, count as u8);
+            if count == 0 {
+                evicted = Some(unsafe { self.values.read_copy(idx_usize) });
+                break;
+            }
+
+            safety_count += 1;
+            way = Self::wrap_way(way + 1);
+        }
+        if safety_count > clock_iterations_max {
+            unreachable!("clock eviction exceeded maximum iterations");
+        }
+
+        assert_eq!(self.counts_get(set.offset + way as u64), 0);
+
+        self.tags[offset_usize + way] = set.tag;
+        self.values.write(offset_usize + way, *value);
+        self.counts_set(set.offset + way as u64, 1);
+        self.clocks_set(clock_index, Self::wrap_way(way + 1) as u8);
+
+        UpsertResult {
+            index: offset_usize + way,
+            updated: UpdateOrInsert::Insert,
+            evicted,
+        }
+    }
+
+    // ----- Internals -----
+
+    /// Computes the set metadata for `key` (tag, offset, and set-local pointers).
+    #[inline]
+    fn associate(&self, key: C::Key) -> Set<TagT, C::Value, WAYS> {
+        let entropy = C::hash(key);
+        let tag = TagT::truncate(entropy);
+        let index = fast_range(entropy, self.sets);
+        let offset = index * WAYS as u64;
+
+        let offset_usize = Self::index_usize(offset);
+        debug_assert!(offset_usize + WAYS <= self.tags.len());
+        debug_assert!(offset_usize + WAYS <= self.values.len());
+
+        let tags = unsafe { self.tags.as_ptr().add(offset_usize) as *mut [TagT; WAYS] };
+        let values = unsafe { self.values.as_ptr().add(offset_usize) as *mut [C::Value; WAYS] };
+
+        Set {
+            tag,
+            offset,
+            tags,
+            values,
+        }
+    }
+
+    /// If the key is present in the set, returns the way index; otherwise `None`.
+    #[inline]
+    fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16> {
+        let tags = unsafe { &*set.tags };
+        let ways_mask = Self::search_tags(tags, set.tag);
+        if ways_mask == 0 {
+            return None;
+        }
+
+        for way in 0..WAYS {
+            if ((ways_mask >> way) & 1) == 1 && self.counts_get(set.offset + way as u64) > 0 {
+                let v = unsafe { &(*set.values)[way] };
+                if C::key_from_value(v) == key {
+                    return Some(way as u16);
+                }
+            }
+        }
+        None
+    }
+
+    /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
+    #[inline]
+    fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        use core::simd::cmp::SimdPartialEq;
+        use core::simd::{Mask, Simd};
+
+        let x = Simd::<TagT, WAYS>::from_array(*tags);
+        let y = Simd::<TagT, WAYS>::splat(tag);
+        let mask: Mask<<TagT as core::simd::SimdElement>::Mask, WAYS> = x.simd_eq(y);
+        mask.to_bitmask() as u16
+    }
+
+    /// Reads the CLOCK count for a slot at `index`.
+    #[inline]
+    fn counts_get(&self, index: u64) -> u8 {
+        unsafe { (*self.counts.get()).get(index) }
+    }
+
+    /// Writes the CLOCK count for a slot at `index`.
+    #[inline]
+    fn counts_set(&self, index: u64, value: u8) {
+        unsafe {
+            (*self.counts.get()).set(index, value);
+        }
+    }
+
+    /// Reads the clock hand value for the set at `index`.
+    #[inline]
+    fn clocks_get(&self, index: u64) -> u8 {
+        unsafe { (*self.clocks.get()).get(index) }
+    }
+
+    /// Writes the clock hand value for the set at `index`.
+    #[inline]
+    fn clocks_set(&self, index: u64, value: u8) {
+        unsafe {
+            (*self.clocks.get()).set(index, value);
         }
     }
 }
