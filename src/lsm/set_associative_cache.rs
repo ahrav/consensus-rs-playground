@@ -671,7 +671,7 @@ where
 
             let idx = set.offset + way as u64;
             let count = self.counts_get(idx);
-            let next = count.saturating_add(1);
+            let next = count.saturating_add(1).min(Self::max_count());
             self.counts_set(idx, next);
             Some(Self::index_usize(idx))
         } else {
