@@ -450,7 +450,11 @@ impl<
     >
 where
     C: SetAssociativeCacheContext,
-    TagT: Tag,
+    TagT: Tag + core::simd::SimdElement,
+    core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
+    core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
+            Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
+        >,
 {
     pub const VALUE_COUNT_MAX_MULTIPLE: u64 = {
         const fn max_u(a: u64, b: u64) -> u64 {
@@ -495,7 +499,7 @@ where
     }
 
     #[inline]
-    fn metric_mut(&self) -> &mut Metrics {
+    fn metrics_mut(&self) -> &mut Metrics {
         unsafe { &mut *self.metrics.as_ref().get() }
     }
 
@@ -651,7 +655,30 @@ where
             (*self.counts.get()).words_mut().fill(0);
             (*self.clocks.get()).words_mut().fill(0);
         }
-        self.metric_mut().reset();
+        self.metrics_mut().reset();
+    }
+
+    pub fn get_index(&self, key: C::Key) -> Option<usize> {
+        let set = self.associate(key);
+        if let Some(way) = self.search(set, key) {
+            let metrics = self.metrics_mut();
+            metrics.hits.set(metrics.hits.get() + 1);
+
+            let idx = set.offset + way as u64;
+            let count = self.counts_get(idx);
+            let next = count.saturating_add(1);
+            self.counts_set(idx, next);
+            Some(Self::index_usize(idx))
+        } else {
+            let metrics = self.metrics_mut();
+            metrics.misses.set(metrics.misses.get() + 1);
+            None
+        }
+    }
+
+    pub fn get(&self, key: C::Key) -> Option<*mut C::Value> {
+        let index = self.get_index(key)?;
+        Some(self.values.get_ptr(index))
     }
 
     // ----- Internals -----
@@ -681,14 +708,7 @@ where
 
     /// If the key is present in the set, returns the way index; otherwise `None`.
     #[inline]
-    fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16>
-    where
-        TagT: core::simd::SimdElement,
-        core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
-        core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
-                Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
-            >,
-    {
+    fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16> {
         let tags = unsafe { &*set.tags };
         let ways_mask = Self::search_tags(tags, set.tag);
         if ways_mask == 0 {
@@ -708,14 +728,7 @@ where
 
     /// Bitmask of ways whose tag matches `tag` (bit i corresponds to way i).
     #[inline]
-    fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16
-    where
-        TagT: core::simd::SimdElement,
-        core::simd::LaneCount<WAYS>: core::simd::SupportedLaneCount,
-        core::simd::Simd<TagT, WAYS>: core::simd::cmp::SimdPartialEq<
-                Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
-            >,
-    {
+    fn search_tags(tags: &[TagT; WAYS], tag: TagT) -> u16 {
         use core::simd::cmp::SimdPartialEq;
         use core::simd::{Mask, Simd};
 
