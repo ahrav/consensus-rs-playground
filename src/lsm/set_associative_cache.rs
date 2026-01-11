@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     alloc::{Layout as AllocLayout, alloc, dealloc},
     cell::{Cell, UnsafeCell},
@@ -656,6 +654,11 @@ where
         self.metric_ref().reset();
     }
 
+    /// Returns the cache name for diagnostics.
+    pub fn name(&self) -> &str {
+        self.name
+    }
+
     /// Looks up `key` and returns its slot index, updating counters on hit/miss.
     pub fn get_index(&self, key: C::Key) -> Option<usize> {
         let set = self.associate(key);
@@ -865,7 +868,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::PackedUnsignedIntegerArray;
+    use super::{
+        Options, PackedUnsignedIntegerArray, SetAssociativeCache, SetAssociativeCacheContext, Tag,
+    };
     use proptest::prelude::*;
 
     #[test]
@@ -948,6 +953,302 @@ mod tests {
         #[test]
         fn packed_unsigned_integer_array_prop_u4(ops in packed_unsigned_integer_array_ops::<4>()) {
             packed_unsigned_integer_array_case::<4>(&ops);
+        }
+    }
+
+    fn packed_unsigned_integer_array_ops_fuzz<const BITS: usize>()
+    -> impl Strategy<Value = Vec<(usize, u8)>> {
+        let mask = ((1u16 << BITS) - 1) as u8;
+        prop::collection::vec((0usize..LEN, 0u8..=mask), 10_000)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1))]
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_fuzz_u1(
+            ops in packed_unsigned_integer_array_ops_fuzz::<1>()
+        ) {
+            packed_unsigned_integer_array_case::<1>(&ops);
+        }
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_fuzz_u2(
+            ops in packed_unsigned_integer_array_ops_fuzz::<2>()
+        ) {
+            packed_unsigned_integer_array_case::<2>(&ops);
+        }
+
+        #[test]
+        fn packed_unsigned_integer_array_prop_fuzz_u4(
+            ops in packed_unsigned_integer_array_ops_fuzz::<4>()
+        ) {
+            packed_unsigned_integer_array_case::<4>(&ops);
+        }
+    }
+
+    struct IdentityContext;
+
+    impl SetAssociativeCacheContext for IdentityContext {
+        type Key = u64;
+        type Value = u64;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            *value
+        }
+
+        fn hash(key: Self::Key) -> u64 {
+            key
+        }
+    }
+
+    struct CollisionContext;
+
+    impl SetAssociativeCacheContext for CollisionContext {
+        type Key = u64;
+        type Value = u64;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            *value
+        }
+
+        fn hash(_: Self::Key) -> u64 {
+            0
+        }
+    }
+
+    type EvictionCache<C> = SetAssociativeCache<'static, C, u8, 16, 2, 64, 0, 4>;
+    type SearchTagsCache<TagT, const WAYS: usize, const CLOCK_HAND_BITS: usize> =
+        SetAssociativeCache<'static, IdentityContext, TagT, WAYS, 2, 64, 0, CLOCK_HAND_BITS>;
+
+    fn assert_cache_zeroed<C>(sac: &EvictionCache<C>)
+    where
+        C: SetAssociativeCacheContext,
+    {
+        for &tag in sac.tags.iter() {
+            assert_eq!(0, tag);
+        }
+        unsafe {
+            for &word in (*sac.counts.get()).words().iter() {
+                assert_eq!(0, word);
+            }
+            for &word in (*sac.clocks.get()).words().iter() {
+                assert_eq!(0, word);
+            }
+        }
+    }
+
+    fn run_set_associative_cache_test<C>()
+    where
+        C: SetAssociativeCacheContext<Key = u64, Value = u64>,
+    {
+        const WAYS: usize = 16;
+        const CLOCK_BITS: usize = 2;
+        let mut sac = EvictionCache::<C>::init(16 * 16 * 8, Options { name: "test" });
+
+        assert_cache_zeroed(&sac);
+
+        for i in 0..WAYS {
+            assert_eq!(i as u8, sac.clocks_get(0));
+
+            let key = (i as u64) * sac.sets;
+            let _ = sac.upsert(&key);
+            assert_eq!(1, sac.counts_get(i as u64));
+            let value = unsafe { *sac.get(key).unwrap() };
+            assert_eq!(key, value);
+            assert_eq!(2, sac.counts_get(i as u64));
+        }
+        assert_eq!(0, sac.clocks_get(0));
+
+        {
+            let key = (WAYS as u64) * sac.sets;
+            let _ = sac.upsert(&key);
+            assert_eq!(1, sac.counts_get(0));
+            let value = unsafe { *sac.get(key).unwrap() };
+            assert_eq!(key, value);
+            assert_eq!(2, sac.counts_get(0));
+
+            assert!(sac.get(0).is_none());
+
+            for i in 1..WAYS {
+                assert_eq!(1, sac.counts_get(i as u64));
+            }
+        }
+
+        {
+            let key = 5u64 * sac.sets;
+            let value = unsafe { *sac.get(key).unwrap() };
+            assert_eq!(key, value);
+            assert_eq!(2, sac.counts_get(5));
+
+            assert_eq!(Some(key), sac.remove(key));
+            assert!(sac.get(key).is_none());
+            assert_eq!(0, sac.counts_get(5));
+        }
+
+        sac.reset();
+        assert_cache_zeroed(&sac);
+
+        let max_count = ((1u16 << CLOCK_BITS) - 1) as u8;
+        for i in 0..WAYS {
+            assert_eq!(i as u8, sac.clocks_get(0));
+
+            let key = (i as u64) * sac.sets;
+            let _ = sac.upsert(&key);
+            assert_eq!(1, sac.counts_get(i as u64));
+            for expected in 2u8..=max_count {
+                let value = unsafe { *sac.get(key).unwrap() };
+                assert_eq!(key, value);
+                assert_eq!(expected, sac.counts_get(i as u64));
+            }
+            let value = unsafe { *sac.get(key).unwrap() };
+            assert_eq!(key, value);
+            assert_eq!(max_count, sac.counts_get(i as u64));
+        }
+        assert_eq!(0, sac.clocks_get(0));
+
+        {
+            let key = (WAYS as u64) * sac.sets;
+            let _ = sac.upsert(&key);
+            assert_eq!(1, sac.counts_get(0));
+            let value = unsafe { *sac.get(key).unwrap() };
+            assert_eq!(key, value);
+            assert_eq!(2, sac.counts_get(0));
+
+            assert!(sac.get(0).is_none());
+
+            for i in 1..WAYS {
+                assert_eq!(1, sac.counts_get(i as u64));
+            }
+        }
+    }
+
+    #[test]
+    fn set_associative_cache_eviction() {
+        run_set_associative_cache_test::<IdentityContext>();
+    }
+
+    #[test]
+    fn set_associative_cache_hash_collision() {
+        run_set_associative_cache_test::<CollisionContext>();
+    }
+
+    fn search_tags_expected<TagT: Tag, const WAYS: usize>(tags: &[TagT; WAYS], tag: TagT) -> u16 {
+        let mut bits = 0u16;
+        let mut count = 0usize;
+        for (i, &t) in tags.iter().enumerate() {
+            if t == tag {
+                bits |= 1u16 << i;
+                count += 1;
+            }
+        }
+        assert_eq!(count, bits.count_ones() as usize);
+        bits
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn set_associative_cache_search_tags_u8_2(
+            mut tags in prop::array::uniform::<_, 2>(any::<u8>()),
+            tag in any::<u8>(),
+            mask in prop::array::uniform::<_, 2>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u8, 2>(&tags, tag);
+            let actual = SearchTagsCache::<u8, 2, 1>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn set_associative_cache_search_tags_u8_4(
+            mut tags in prop::array::uniform::<_, 4>(any::<u8>()),
+            tag in any::<u8>(),
+            mask in prop::array::uniform::<_, 4>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u8, 4>(&tags, tag);
+            let actual = SearchTagsCache::<u8, 4, 2>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn set_associative_cache_search_tags_u8_16(
+            mut tags in prop::array::uniform::<_, 16>(any::<u8>()),
+            tag in any::<u8>(),
+            mask in prop::array::uniform::<_, 16>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u8, 16>(&tags, tag);
+            let actual = SearchTagsCache::<u8, 16, 4>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn set_associative_cache_search_tags_u16_2(
+            mut tags in prop::array::uniform::<_, 2>(any::<u16>()),
+            tag in any::<u16>(),
+            mask in prop::array::uniform::<_, 2>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u16, 2>(&tags, tag);
+            let actual = SearchTagsCache::<u16, 2, 1>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn set_associative_cache_search_tags_u16_4(
+            mut tags in prop::array::uniform::<_, 4>(any::<u16>()),
+            tag in any::<u16>(),
+            mask in prop::array::uniform::<_, 4>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u16, 4>(&tags, tag);
+            let actual = SearchTagsCache::<u16, 4, 2>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
+        }
+
+        #[test]
+        fn set_associative_cache_search_tags_u16_16(
+            mut tags in prop::array::uniform::<_, 16>(any::<u16>()),
+            tag in any::<u16>(),
+            mask in prop::array::uniform::<_, 16>(any::<bool>()),
+        ) {
+            for (slot, match_tag) in tags.iter_mut().zip(mask.into_iter()) {
+                if match_tag {
+                    *slot = tag;
+                }
+            }
+
+            let expected = search_tags_expected::<u16, 16>(&tags, tag);
+            let actual = SearchTagsCache::<u16, 16, 4>::search_tags(&tags, tag);
+            prop_assert_eq!(expected, actual);
         }
     }
 }
