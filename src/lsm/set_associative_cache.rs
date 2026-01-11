@@ -646,12 +646,6 @@ where
         sac
     }
 
-    /// Marks the cache as deinitialized and drops its backing storage.
-    pub fn deinit(mut self) {
-        assert!(self.sets > 0);
-        self.sets = 0;
-    }
-
     /// Clears tags, counts, clocks, and metrics.
     pub fn reset(&mut self) {
         self.tags.fill(TagT::default());
