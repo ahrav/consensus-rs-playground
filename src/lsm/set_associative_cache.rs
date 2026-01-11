@@ -129,12 +129,14 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         (1u64 << BITS) - 1
     }
 
+    /// Returns the number of 64-bit words needed to store `len` values.
     #[inline]
     pub const fn words_for_len(len: usize) -> usize {
         let bits = len * BITS;
         bits.div_ceil(Self::WORD_BITS)
     }
 
+    /// Allocates a zeroed array with `words_len` 64-bit words.
     pub fn new_zeroed(words_len: usize) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -145,6 +147,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         }
     }
 
+    /// Wraps an existing word buffer without copying.
     pub fn from_words(words: Vec<u64>) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -155,16 +158,19 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         }
     }
 
+    /// Returns the backing storage as 64-bit words.
     #[inline]
     pub fn words(&self) -> &[u64] {
         &self.words
     }
 
+    /// Returns the backing storage as mutable 64-bit words.
     #[inline]
     pub fn words_mut(&mut self) -> &mut [u64] {
         &mut self.words
     }
 
+    /// Returns the packed unsigned integer at `index`.
     #[inline]
     pub fn get(&self, index: u64) -> u8 {
         let uints_per_word = Self::uints_per_word() as u64;
@@ -176,6 +182,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         ((word >> shift) & Self::mask_value()) as u8
     }
 
+    /// Sets the packed unsigned integer at `index` to `value`.
     #[inline]
     pub fn set(&mut self, index: u64, value: u8) {
         debug_assert!((value as u64) <= Self::mask_value());
@@ -644,11 +651,13 @@ where
         sac
     }
 
+    /// Marks the cache as deinitialized and drops its backing storage.
     pub fn deinit(mut self) {
         assert!(self.sets > 0);
         self.sets = 0;
     }
 
+    /// Clears tags, counts, clocks, and metrics.
     pub fn reset(&mut self) {
         self.tags.fill(TagT::default());
         unsafe {
@@ -658,6 +667,7 @@ where
         self.metrics_mut().reset();
     }
 
+    /// Looks up `key` and returns its slot index, updating counters on hit/miss.
     pub fn get_index(&self, key: C::Key) -> Option<usize> {
         let set = self.associate(key);
         if let Some(way) = self.search(set, key) {
@@ -676,11 +686,15 @@ where
         }
     }
 
+    /// Looks up `key` and returns a pointer to the cached value, if present.
+    ///
+    /// The returned pointer is valid until the entry is evicted or the cache is reset.
     pub fn get(&self, key: C::Key) -> Option<*mut C::Value> {
         let index = self.get_index(key)?;
         Some(self.values.get_ptr(index))
     }
 
+    /// Removes `key` from the cache if present, returning the removed value.
     pub fn remove(&mut self, key: C::Key) -> Option<C::Value> {
         let set = self.associate(key);
         let way = self.search(set, key)?;
@@ -693,6 +707,7 @@ where
         Some(removed)
     }
 
+    /// Hints that `key` is less likely to be accessed without removing it.
     pub fn demote(&mut self, key: C::Key) {
         let set = self.associate(key);
         let Some(way) = self.search(set, key) else {
