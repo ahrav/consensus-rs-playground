@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::{marker::PhantomData, ptr::NonNull};
+use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
 
 use crate::lsm::{
     binary_search::{Config, binary_search_keys},
@@ -309,6 +309,26 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         Cursor {
             node,
             relative_index: rel,
+        }
+    }
+
+    #[inline]
+    unsafe fn node_buf_from_ptr<'a>(ptr: NonNull<u8>) -> &'a [MaybeUninit<T>] {
+        unsafe {
+            slice::from_raw_parts(
+                ptr.as_ptr() as *const MaybeUninit<T>,
+                Self::NODE_CAPACITY as usize,
+            )
+        }
+    }
+
+    #[inline]
+    unsafe fn node_buf_from_ptr_mut<'a>(ptr: NonNull<u8>) -> &'a mut [MaybeUninit<T>] {
+        unsafe {
+            slice::from_raw_parts_mut(
+                ptr.as_ptr() as *mut MaybeUninit<T>,
+                Self::NODE_CAPACITY as usize,
+            )
         }
     }
 
