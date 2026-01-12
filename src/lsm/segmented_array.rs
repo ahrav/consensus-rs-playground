@@ -169,7 +169,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
             .for_each(|ptr| pool.release(ptr));
 
         self.node_count = 0;
-        self.nodes.iter_mut().map(|s| *s = None);
+        self.nodes.fill(None);
         self.indexes[0] = 0;
 
         if VERIFY {
@@ -179,7 +179,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
     pub fn reset(mut self) {
         self.node_count = 0;
-        self.nodes.iter_mut().map(|s| *s = None);
+        self.nodes.fill(None);
         self.indexes.fill(0);
 
         if VERIFY {
