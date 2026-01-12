@@ -21,6 +21,7 @@ pub enum Direction {
 
 impl Direction {
     #[inline]
+    /// Returns the opposite direction.
     pub fn reverse(self) -> Self {
         match self {
             Direction::Ascending => Direction::Descending,
@@ -130,6 +131,10 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     };
 
+    /// Creates an empty segmented array with no nodes allocated yet.
+    ///
+    /// The backing vectors are sized to the maximum node count to avoid
+    /// dynamic growth during insertions.
     pub fn new() -> Self {
         assert!(size_of::<T>() > 0);
         assert!(Self::NODE_CAPACITY >= 2);
@@ -155,6 +160,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         array
     }
 
+    /// Releases all allocated nodes back to the pool and consumes `self`.
     pub fn deinit(mut self, pool: &mut P) {
         if VERIFY {
             self.verify();
@@ -166,6 +172,10 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
             .for_each(|ptr| pool.release(ptr));
     }
 
+    /// Releases nodes back to the pool and resets bookkeeping to the empty state.
+    ///
+    /// Consumes `self`; intended for teardown paths where `VERIFY` should see an
+    /// empty structure before the value is dropped.
     pub fn clear(mut self, pool: &mut P) {
         if VERIFY {
             self.verify();
@@ -185,6 +195,10 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Resets bookkeeping without returning nodes to the pool.
+    ///
+    /// Use only when the pool is reset separately (e.g. bulk teardown), otherwise
+    /// unreleased nodes will be treated as leaks by the pool.
     pub fn reset(mut self) {
         self.node_count = 0;
         self.nodes.fill(None);
@@ -195,6 +209,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Asserts internal invariants (node counts, indexes, and fill levels).
     pub fn verify(&self) {
         assert!(self.node_count <= Self::NODE_COUNT_MAX);
 
@@ -216,7 +231,15 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
-    fn insert_elements(&mut self, pool: &mut P, absolute_index: u32, elements: &[T]) {
+    /// Inserts `elements` starting at `absolute_index`, allocating/splitting nodes as needed.
+    ///
+    /// This is the public bulk-insert entry point: it delegates to the batching logic
+    /// and double-checks the length change (and optional invariants) around the insert.
+    ///
+    /// # Panics
+    /// - if `elements` is empty.
+    /// - if `absolute_index + elements.len()` exceeds `ELEMENT_COUNT_MAX`.
+    pub fn insert_elements(&mut self, pool: &mut P, absolute_index: u32, elements: &[T]) {
         if VERIFY {
             self.verify();
         }
@@ -533,6 +556,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Returns the initialized elements slice for `node`.
+    ///
+    /// Panics if `node` is out of bounds.
     pub fn node_elements(&self, node: u32) -> &[T] {
         assert!(node < self.node_count);
         let ptr = self.nodes[node as usize].as_ref().expect("node missing");
@@ -544,18 +570,25 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         unsafe { &*(init as *const [MaybeUninit<T>] as *const [T]) }
     }
 
+    /// Returns the last element in `node`.
+    ///
+    /// Panics if the node is empty or out of bounds.
     pub fn node_last_element(&self, node: u32) -> T {
         let elems = self.node_elements(node);
         assert!(!elems.is_empty());
         elems[elems.len() - 1]
     }
 
+    /// Returns the element at `cursor`.
+    ///
+    /// Panics if the cursor is out of bounds.
     pub fn element_at_cursor(&self, cursor: Cursor) -> T {
         let elems = self.node_elements(cursor.node);
         elems[cursor.relative_index as usize]
     }
 
     #[inline]
+    /// Returns a cursor to the first element (or the start when empty).
     pub fn first(&self) -> Cursor {
         Cursor {
             node: 0,
@@ -563,6 +596,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Returns a cursor to the last element (or `first()` when empty).
     pub fn last(&self) -> Cursor {
         if self.node_count == 0 {
             return self.first();
@@ -578,12 +612,16 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     }
 
     #[inline]
+    /// Returns the total number of elements across all nodes.
     pub fn len(&self) -> u32 {
         let result = self.indexes[self.node_count as usize];
         assert!(result <= ELEMENT_COUNT_MAX);
         result
     }
 
+    /// Converts a cursor into its absolute index in the logical array.
+    ///
+    /// Panics if the cursor does not point into the current structure.
     pub fn absolute_index_for_cursor(&self, cursor: Cursor) -> u32 {
         if self.node_count == 0 {
             assert_eq!(cursor.node, 0);
