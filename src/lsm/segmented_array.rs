@@ -382,4 +382,21 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         assert!(result <= ELEMENT_COUNT_MAX);
         result
     }
+
+    pub fn absolute_index_for_cursor(&self, cursor: Cursor) -> u32 {
+        if self.node_count == 0 {
+            assert_eq!(cursor.node, 0);
+            assert_eq!(cursor.relative_index, 0);
+            return 0;
+        }
+
+        let count = self.count(cursor.node);
+        if cursor.node == self.node_count - 1 {
+            assert!(cursor.relative_index <= count);
+        } else {
+            assert!(cursor.relative_index < count);
+        }
+
+        self.indexes[cursor.node as usize] + cursor.relative_index
+    }
 }
