@@ -208,6 +208,26 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    fn insert_empty_node_at(&mut self, pool: &mut P, node: u32) {
+        assert!(node <= self.node_count);
+        assert!(self.node_count + 1 <= Self::NODE_COUNT_MAX);
+
+        let node = node as usize;
+        let node_count = self.node_count as usize;
+
+        // Shift nodes right: [node..node_count] -> [node+1..node_count+1]
+        self.nodes.copy_within(node..node_count, node + 1);
+
+        // Shift indexes right: [node..node_count] -> [node+1..node_count+1]
+        self.indexes.copy_within(node..(node_count + 1), node + 1);
+
+        self.node_count += 1;
+
+        let ptr = pool.acquire();
+        self.nodes[node] = Some(ptr);
+        assert_eq!(self.indexes[node], self.indexes[node + 1]);
+    }
+
     #[inline]
     fn count(&self, node: u32) -> u32 {
         let n = node as usize;
