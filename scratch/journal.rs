@@ -46,7 +46,7 @@ use core::{cmp::min, mem::MaybeUninit, ptr};
 use crate::{
     constants, container_of,
     message_pool::Message,
-    stdx::BitSet,
+    stdx::{BitSet, bounded_array::BoundedArray},
     util::{utils::AlignedSlice, zero},
     vsr::{
         Checksum128, Command, Header, HeaderPrepare, HeaderPrepareRaw, Operation,
@@ -57,6 +57,7 @@ use crate::{
             SLOT_COUNT, SLOT_COUNT_WORDS, Slot, WAL_HEADER_SIZE,
         },
         storage::{Storage, Synchronicity},
+        ViewChangeSlice,
     },
 };
 
@@ -476,6 +477,25 @@ struct RecoveryCase {
     pattern: [Matcher; 11],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DvcHeaderType {
+    Blank,
+    Valid,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewRange {
+    min: u32,
+    max: u32,
+}
+
+impl ViewRange {
+    #[inline]
+    fn contains(self, view: u32) -> bool {
+        self.min <= view && view <= self.max
+    }
+}
+
 #[allow(dead_code)]
 impl RecoveryCase {
     #[inline]
@@ -659,14 +679,22 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
 #[allow(dead_code)]
 #[inline]
 fn recovery_case(
-    header: Option<&HeaderPrepare>,
-    prepare: Option<&HeaderPrepare>,
+    header: Option<HeaderPrepare>,
+    prepare: Option<HeaderPrepare>,
     op_max: u64,
     op_prepare_max: u64,
     solo: bool,
 ) -> &'static RecoveryCase {
     let is_header = header.is_some();
     let is_prepare = prepare.is_some();
+
+    if let Some(header) = header {
+        assert!(header.invalid().is_none());
+    }
+    if let Some(prepare) = prepare {
+        assert!(prepare.invalid().is_none());
+    }
+
     let parameters = [
         is_header,
         is_header && header.unwrap().operation == Operation::RESERVED,
@@ -710,13 +738,13 @@ fn header_ok(
     cluster: constants::ClusterId,
     slot: Slot,
     header: &HeaderPrepareRaw,
-) -> Option<&HeaderPrepare> {
+) -> Option<HeaderPrepare> {
     // Validate checksum before accessing fields.
     if !header.valid_checksum() {
         return None;
     }
 
-    if header.command_checked()? != Command::Prepare {
+    if header.command != Command::Prepare as u8 {
         return None;
     }
 
@@ -731,7 +759,105 @@ fn header_ok(
         return None;
     }
 
-    header.as_typed()
+    // SAFETY: command byte is validated above; HeaderPrepareRaw has identical layout.
+    Some(unsafe { *header.as_typed_unchecked() })
+}
+
+#[inline]
+fn header_prepare_as_raw(header: &HeaderPrepare) -> &HeaderPrepareRaw {
+    // SAFETY: HeaderPrepare and HeaderPrepareRaw have identical layout/alignment.
+    unsafe { &*(header as *const HeaderPrepare as *const HeaderPrepareRaw) }
+}
+
+#[inline]
+fn header_prepare_raw_from_typed(header: &HeaderPrepare) -> HeaderPrepareRaw {
+    *header_prepare_as_raw(header)
+}
+
+#[inline]
+fn dvc_blank(op: u64) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = Operation::RESERVED;
+    header.op = op;
+    header
+}
+
+#[inline]
+fn dvc_header_type(header: &HeaderPrepare) -> DvcHeaderType {
+    if *header == dvc_blank(header.op) {
+        return DvcHeaderType::Blank;
+    }
+
+    assert!(header.valid_checksum());
+    assert!(header.command == Command::Prepare);
+    assert!(header.operation != Operation::RESERVED);
+    assert!(header.invalid().is_none());
+
+    DvcHeaderType::Valid
+}
+
+fn view_for_op(headers: ViewChangeSlice<'_>, op: u64, log_view: u32) -> ViewRange {
+    let slice = headers.slice();
+    assert!(!slice.is_empty());
+
+    let header_newest = &slice[0];
+    let mut oldest_index = None;
+    for (index, header) in slice.iter().enumerate() {
+        match dvc_header_type(header) {
+            DvcHeaderType::Blank => {
+                assert!(index > 0);
+            }
+            DvcHeaderType::Valid => {
+                oldest_index = Some(index);
+            }
+        }
+    }
+
+    let header_oldest = &slice[oldest_index.expect("view_headers missing valid header")];
+    assert!(header_newest.view <= log_view);
+    assert!(header_newest.view >= header_oldest.view);
+    assert!(header_newest.op >= header_oldest.op);
+
+    if op < header_oldest.op {
+        return ViewRange {
+            min: 0,
+            max: header_oldest.view,
+        };
+    }
+
+    if op > header_newest.op {
+        return ViewRange {
+            min: log_view,
+            max: log_view,
+        };
+    }
+
+    for header in slice {
+        if dvc_header_type(header) == DvcHeaderType::Valid && header.op == op {
+            return ViewRange {
+                min: header.view,
+                max: header.view,
+            };
+        }
+    }
+
+    let mut header_next = &slice[0];
+    assert!(dvc_header_type(header_next) == DvcHeaderType::Valid);
+
+    for header_prev in &slice[1..] {
+        if dvc_header_type(header_prev) == DvcHeaderType::Valid {
+            if header_prev.op < op && op < header_next.op {
+                return ViewRange {
+                    min: header_prev.view,
+                    max: header_next.view,
+                };
+            }
+            header_next = header_prev;
+        }
+    }
+
+    panic!("view_for_op: no enclosing headers for op {}", op);
 }
 
 /// WAL journal implementing range-locked sector writes.
@@ -762,13 +888,9 @@ pub struct Journal<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: us
     /// is written to disk.
     ///
     /// This handles the case where a prepare is written before its header sector
-    /// is flushed, allowing recovery to detect and repair inconsistencies.
-    pub headers_redundant: AlignedSlice<HeaderPrepare>,
-
-    /// Recovery-time raw redundant headers loaded from disk.
-    ///
-    /// TODO: Centralize raw/typed redundant headers into a single representation.
-    pub headers_redundant_raw: AlignedSlice<HeaderPrepareRaw>,
+    /// is flushed, allowing recovery to detect and repair inconsistencies. We store
+    /// the redundant headers in raw form to safely load untrusted bytes during recovery.
+    pub headers_redundant: AlignedSlice<HeaderPrepareRaw>,
 
     /// Staging buffers for writing header sectors to disk.
     pub write_headers_sectors: AlignedSlice<[u8; constants::SECTOR_SIZE]>,
@@ -842,10 +964,10 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
         };
         let headers_redundant = unsafe {
-            AlignedSlice::<HeaderPrepare>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
-        };
-        let headers_redundant_raw = unsafe {
-            AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(SLOT_COUNT, constants::SECTOR_SIZE)
+            AlignedSlice::<HeaderPrepareRaw>::new_zeroed_aligned(
+                SLOT_COUNT,
+                constants::SECTOR_SIZE,
+            )
         };
         let write_headers_sectors = unsafe {
             AlignedSlice::<[u8; constants::SECTOR_SIZE]>::new_zeroed_aligned(
@@ -865,7 +987,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             replica,
             headers,
             headers_redundant,
-            headers_redundant_raw,
             write_headers_sectors,
             header_chunks_requested: HeaderChunks::empty(),
             header_chunks_recovered: HeaderChunks::empty(),
@@ -905,12 +1026,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 .iter()
                 .all(|h| !h.valid_checksum())
         );
-        assert!(
-            journal
-                .headers_redundant_raw
-                .iter()
-                .all(|h| !h.valid_checksum())
-        );
+        assert!(journal.headers_redundant.iter().all(|h| !h.valid_checksum()));
 
         journal.prepare_checksums.fill(0);
         journal.prepare_inhabited.fill(false);
@@ -1067,16 +1183,25 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// Enters recovery and stores the completion callback on `status`.
     pub fn recover(&mut self, callback: RecoverCallback<S, WRITE_OPS, WRITE_OPS_WORDS>) {
         assert!(matches!(self.status, Status::Init));
+        assert!(self.dirty.is_full());
+        assert!(self.faulty.is_full());
         assert!(self.header_chunks_recovered.is_empty());
         assert!(self.header_chunks_requested.is_empty());
-        assert!(self.reads.available() == READ_OPS);
-        assert!(self.writes.available() == WRITE_OPS);
+        assert!(self.reads.executing() == 0);
+        assert!(self.writes.executing() == 0);
 
         self.status = Status::Recovering { callback };
 
         // Recovery pipeline (journal.zig):
         // recover_headers → recover_prepares → recover_slots → recover_fix → recover_done.
-        self.recover_headers();
+        let mut available = self.reads.available();
+        while available > 0 {
+            self.recover_headers();
+            available -= 1;
+        }
+
+        assert!(self.header_chunks_recovered.is_empty());
+        assert!(self.header_chunks_requested.count() == self.reads.executing() as usize);
     }
 
     // ---------------------------------------------------------------------
@@ -1084,6 +1209,10 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
     fn recover_headers(&mut self) {
         assert!(matches!(self.status, Status::Recovering { .. }));
+        assert!(self.reads.available() > 0);
+        assert!(
+            self.header_chunks_recovered.count() <= self.header_chunks_requested.count()
+        );
 
         // Once all header chunks are recovered we can move on to reading prepares.
         if self.header_chunks_recovered.is_full() {
@@ -1091,42 +1220,26 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             return;
         }
 
+        let Some(chunk) = self.header_chunk_next_to_request() else {
+            return; // all chunks requested
+        };
+
         let storage = unsafe { &mut *self.storage };
+        let read = self.read_recovery_acquire(chunk.index as u64);
+        let message: &mut MessagePrepare = unsafe { &mut *(*read).message.as_mut_ptr() };
 
-        while self.reads.available() > 0 {
-            let Some(chunk) = self.header_chunk_next_to_request() else {
-                break; // all chunks requested
-            };
+        let buffer_full = message.buffer_mut();
+        let buffer = &mut buffer_full[..chunk.len];
 
-            let read = self.read_recovery_acquire(chunk.index as u64);
-            let message: &mut MessagePrepare = unsafe { &mut *(*read).message.as_mut_ptr() };
+        let completion: &mut S::Read = unsafe { &mut *(*read).completion.as_mut_ptr() };
 
-            let buffer_full = message.buffer_mut();
-            let buffer = &mut buffer_full[..chunk.len];
-
-            let completion: &mut S::Read = unsafe { &mut *(*read).completion.as_mut_ptr() };
-
-            storage.read_sectors(
-                Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_headers_on_read,
-                completion,
-                buffer,
-                S::WAL_HEADERS_ZONE,
-                chunk.offset,
-            );
-
-            // In synchronous mode, reads complete inline, so keep looping until all chunks are done.
-            if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-                continue;
-            }
-
-            if self.header_chunks_recovered.is_full() {
-                break;
-            }
-        }
-
-        if self.header_chunks_recovered.is_full() {
-            self.recover_prepares();
-        }
+        storage.read_sectors(
+            Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_headers_on_read,
+            completion,
+            buffer,
+            S::WAL_HEADERS_ZONE,
+            chunk.offset,
+        );
     }
 
     fn recover_headers_on_read(completion: &mut S::Read) {
@@ -1135,9 +1248,11 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let journal: &mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS> = unsafe { &mut *(*read).journal };
 
         assert!(matches!(journal.status, Status::Recovering { .. }));
-        assert!(completion.result.is_ok());
 
         let chunk_index = unsafe { (*read).options.op as usize };
+        assert!(unsafe { (*read).options.destination_replica }.is_none());
+        assert!(journal.header_chunks_requested.is_set(chunk_index));
+        assert!(!journal.header_chunks_recovered.is_set(chunk_index));
         let chunk = journal.header_chunk(chunk_index);
 
         let mut message = unsafe { (*read).message.assume_init_read() };
@@ -1147,12 +1262,10 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let chunk_headers =
             Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::header_chunk_bytes_as_headers(chunk_bytes);
 
-        let header_start = (chunk.offset as usize) / constants::WAL_HEADER_SIZE;
+        let header_start = (chunk.offset as usize) / WAL_HEADER_SIZE;
         let header_end = header_start + chunk_headers.len();
-        journal.headers_redundant_raw[header_start..header_end].copy_from_slice(chunk_headers);
+        journal.headers_redundant[header_start..header_end].copy_from_slice(chunk_headers);
 
-        journal.header_chunk_mark_recovered(chunk_index);
-        journal.reads.release(read);
         drop(message);
 
         // In async mode, continue the recovery pipeline from the callback.
@@ -1164,8 +1277,28 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     fn recover_prepares(&mut self) {
         assert!(matches!(self.status, Status::Recovering { .. }));
         assert!(self.header_chunks_recovered.is_full());
+        assert!(self.dirty.count() == SLOT_COUNT);
+        assert!(self.faulty.count() == SLOT_COUNT);
+        assert!(self.reads.executing() == 0);
+        assert!(self.writes.executing() == 0);
 
-        // Are all outstanding prepare reads complete?
+        let mut available = self.reads.available();
+        while available > 0 {
+            self.recover_prepare();
+            available -= 1;
+        }
+
+        assert!(self.writes.executing() == 0);
+        assert!(self.reads.executing() > 0);
+        assert!(self.reads.executing() as usize + self.dirty.count() == SLOT_COUNT);
+        assert!(self.faulty.count() == SLOT_COUNT);
+    }
+
+    fn recover_prepare(&mut self) {
+        assert!(matches!(self.status, Status::Recovering { .. }));
+        assert!(self.reads.available() > 0);
+        assert!(self.dirty.count() <= self.faulty.count());
+
         if self.faulty.count() == 0 {
             // Reuse the dirty/faulty bitsets for the slot recovery stage.
             self.dirty.set_all();
@@ -1174,49 +1307,27 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             return;
         }
 
+        let Some(slot_index) = self.dirty.first_set() else {
+            return; // all reads requested
+        };
+
+        let slot = Slot::new(slot_index);
+        let read = self.read_recovery_acquire(slot.index() as u64);
+
+        let message: &mut MessagePrepare = unsafe { &mut *(*read).message.as_mut_ptr() };
+        let buffer = message.buffer_mut();
+        let completion: &mut S::Read = unsafe { &mut *(*read).completion.as_mut_ptr() };
+
+        self.dirty.unset(slot_index);
+
         let storage = unsafe { &mut *self.storage };
-
-        while self.reads.available() > 0 {
-            // Find the next slot that still needs to be read (tracked via `dirty` during this stage).
-            let mut slot_index: Option<usize> = None;
-            for i in 0..SLOT_COUNT {
-                if self.dirty.is_set(i) {
-                    slot_index = Some(i);
-                    break;
-                }
-            }
-            let Some(slot_index) = slot_index else {
-                break; // all reads requested
-            };
-
-            self.dirty.unset(slot_index);
-
-            let slot = Slot::new(slot_index);
-            let read = self.read_recovery_acquire(slot.index() as u64);
-
-            let message: &mut MessagePrepare = unsafe { &mut *(*read).message.as_mut_ptr() };
-            let buffer = message.buffer_mut();
-            let completion: &mut S::Read = unsafe { &mut *(*read).completion.as_mut_ptr() };
-
-            storage.read_sectors(
-                Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_prepare_on_read,
-                completion,
-                buffer,
-                S::WAL_PREPARES_ZONE,
-                Ring::Prepares.offset(slot),
-            );
-
-            if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-                continue;
-            }
-        }
-
-        // In synchronous mode we may have completed all reads inline during the loop above.
-        if self.faulty.count() == 0 {
-            self.dirty.set_all();
-            self.faulty.set_all();
-            self.recover_slots();
-        }
+        storage.read_sectors(
+            Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_prepare_on_read,
+            completion,
+            buffer,
+            S::WAL_PREPARES_ZONE,
+            Ring::Prepares.offset(slot),
+        );
     }
 
     fn recover_prepare_on_read(completion: &mut S::Read) {
@@ -1225,54 +1336,41 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let journal: &mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS> = unsafe { &mut *(*read).journal };
 
         assert!(matches!(journal.status, Status::Recovering { .. }));
-        assert!(completion.result.is_ok());
+        assert!(journal.dirty.count() <= journal.faulty.count());
+        assert!(unsafe { (*read).options.destination_replica }.is_none());
 
         let slot_index = unsafe { (*read).options.op as usize };
         assert!(slot_index < SLOT_COUNT);
+        assert!(!journal.dirty.is_set(slot_index));
+        assert!(journal.faulty.is_set(slot_index));
 
         let mut message = unsafe { (*read).message.assume_init_read() };
         let buffer = message.buffer_mut();
 
         // Validate only by checksum + zero padding, mirroring journal.zig's recovery read behavior.
         let header_raw = unsafe { &*(buffer.as_ptr() as *const HeaderPrepareRaw) };
+        if header_raw.valid_checksum() {
+            let size = header_raw.size as usize;
+            let body_used = &buffer[WAL_HEADER_SIZE..size];
 
-        let mut valid = header_raw.valid_checksum();
-
-        let size = header_raw.size as usize;
-        if valid && (size < constants::WAL_HEADER_SIZE || size > constants::MESSAGE_SIZE_MAX) {
-            valid = false;
-        }
-
-        if valid {
-            let body_used = &buffer[constants::WAL_HEADER_SIZE..size];
-            if HeaderPrepare::calculate_checksum_body(body_used) != header_raw.checksum_body {
-                valid = false;
-            }
-
-            let padding = &buffer[size..];
-            if !padding.iter().all(|&b| b == 0) {
-                valid = false;
+            // SAFETY: Mirrors Zig behavior; checksum-valid headers are assumed to have
+            // valid discriminants for command/operation.
+            let header_typed = unsafe { header_raw.as_typed_unchecked() };
+            if header_typed.valid_checksum_body(body_used) {
+                let padding = &buffer[size..constants::sector_ceil(size)];
+                if zero::is_all_zeros(padding) {
+                    journal.headers[slot_index] = *header_typed;
+                }
             }
         }
 
-        if valid {
-            if let Some(header_typed) = header_raw.as_typed() {
-                journal.headers[slot_index] = *header_typed;
-            } else {
-                valid = false;
-            }
-        }
+        drop(message);
+        journal.reads.release(read);
 
         // Mark the I/O complete (even if invalid).
         journal.faulty.unset(slot_index);
 
-        journal.reads.release(read);
-        drop(message);
-
-        // In async mode, continue from the callback.
-        if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-            journal.recover_prepares();
-        }
+        journal.recover_prepare();
     }
 
     fn op_maximum_headers_untrusted_raw(cluster: u128, headers: &[HeaderPrepareRaw]) -> u64 {
@@ -1294,10 +1392,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let mut op_max: u64 = 0;
 
         for (index, header) in self.headers.iter().enumerate() {
-            // SAFETY: HeaderPrepare and HeaderPrepareRaw have identical layout.
-            let header_raw: &HeaderPrepareRaw =
-                unsafe { &*(header as *const HeaderPrepare as *const HeaderPrepareRaw) };
-
+            let header_raw = header_prepare_as_raw(header);
             let slot = Slot::new(index);
             if let Some(header_ok) = header_ok(cluster, slot, header_raw) {
                 if header_ok.operation != Operation::RESERVED {
@@ -1317,25 +1412,37 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         op_prepare_max: u64,
         op_checkpoint: u64,
         solo: bool,
-    ) -> Vec<Slot> {
-        let mut torn_slots: Vec<Slot> = Vec::new();
+    ) -> BoundedArray<Slot, WRITE_OPS> {
+        let mut torn_slots: BoundedArray<Slot, WRITE_OPS> = BoundedArray::new();
+
+        if op_max < op_checkpoint {
+            return BoundedArray::new();
+        }
+
+        if op_max >= op_prepare_max {
+            return BoundedArray::new();
+        }
+
+        let op_prepare_max_slot = self.slot_for_op(op_prepare_max);
+        let op_checkpoint_slot = self.slot_for_op(op_checkpoint);
+
+        assert!(op_max < op_prepare_max);
 
         let op_head = op_max + 1;
         let op_head_slot = self.slot_for_op(op_head);
-        let op_prepare_max_slot = self.slot_for_op(op_prepare_max);
-
-        // If the checkpoint is zero, then op_max must be within the same wrap as op_head.
-        if op_checkpoint == 0 {
-            assert!(op_head_slot.index() != self.slot_for_op(op_max).index());
-        }
 
         let tail = if op_checkpoint > 0 && op_max == op_checkpoint {
+            assert!(op_prepare_max_slot.index() == op_checkpoint_slot.index());
+            assert!(op_prepare_max > 0);
             self.slot_for_op(op_prepare_max - 1)
         } else {
             op_prepare_max_slot
         };
 
-        let slot_range = SlotRange { head: op_head_slot, tail };
+        let slot_range = SlotRange {
+            head: op_head_slot,
+            tail,
+        };
         let range_empty = slot_range.head.index() == slot_range.tail.index();
 
         for (index, case) in cases.iter().enumerate() {
@@ -1354,22 +1461,22 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             if !within_range {
                 // A VSR repair outside the head range means we cannot safely truncate torn prepares.
-                return Vec::new();
+                return BoundedArray::new();
             }
 
             // Eligibility checks (mirrors journal.zig torn_prepares()).
             let header_prepare_untrusted = &self.headers[index];
             if header_prepare_untrusted.valid_checksum() {
-                return Vec::new();
+                return BoundedArray::new();
             }
 
-            let header_redundant_ok = header_ok(cluster, slot, &self.headers_redundant_raw[index]);
+            let header_redundant_ok = header_ok(cluster, slot, &self.headers_redundant[index]);
             let Some(header_redundant_ok) = header_redundant_ok else {
-                return Vec::new();
+                return BoundedArray::new();
             };
 
             if header_redundant_ok.operation == Operation::RESERVED {
-                return Vec::new();
+                return BoundedArray::new();
             }
 
             // Header is valid and from previous wrap.
@@ -1378,10 +1485,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
             assert!(!self.prepare_inhabited[index]);
 
-            if torn_slots.len() < WRITE_OPS {
-                torn_slots.push(slot);
-            } else {
-                return Vec::new();
+            if torn_slots.try_push(slot).is_err() {
+                return BoundedArray::new();
             }
         }
 
@@ -1391,11 +1496,17 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     fn recover_slots(&mut self) {
         assert!(matches!(self.status, Status::Recovering { .. }));
         assert!(self.header_chunks_recovered.is_full());
+        assert!(self.reads.executing() == 0);
+        assert!(self.writes.executing() == 0);
+        assert!(self.dirty.count() == SLOT_COUNT);
+        assert!(self.faulty.count() == SLOT_COUNT);
 
         let replica =
             unsafe { &*Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::replica_from_journal(self) };
         let cluster = replica.cluster;
         let solo = replica.solo();
+        let log_view = replica.superblock.working.vsr_state.log_view;
+        let view_headers = replica.superblock.working.view_headers();
         let op_prepare_max = replica.op_prepare_max();
         let op_checkpoint = replica.op_checkpoint();
 
@@ -1403,22 +1514,19 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let op_max_headers =
             Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::op_maximum_headers_untrusted_raw(
                 cluster,
-                &self.headers_redundant_raw,
+                &self.headers_redundant,
             );
         let op_max_prepares = self.op_maximum_headers_untrusted_prepares(cluster);
         let op_max = op_max_headers.max(op_max_prepares);
 
-        let mut cases: Vec<&'static RecoveryCase> = Vec::with_capacity(SLOT_COUNT);
+        let mut cases = [&RECOVERY_CASES[0]; SLOT_COUNT];
 
         for index in 0..SLOT_COUNT {
             let slot = Slot::new(index);
 
-            let header = header_ok(cluster, slot, &self.headers_redundant_raw[index]);
+            let header = header_ok(cluster, slot, &self.headers_redundant[index]);
 
-            // SAFETY: HeaderPrepare and HeaderPrepareRaw have identical layout.
-            let prepare_raw: &HeaderPrepareRaw = unsafe {
-                &*(self.headers[index].as_bytes().as_ptr() as *const HeaderPrepareRaw)
-            };
+            let prepare_raw = header_prepare_as_raw(&self.headers[index]);
             let prepare = header_ok(cluster, slot, prepare_raw);
 
             let case = recovery_case(header, prepare, op_max, op_prepare_max, solo);
@@ -1437,9 +1545,12 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             }
         }
 
+        assert!(self.headers.len() == cases.len());
+
         // Detect if we can safely truncate "torn" prepares at the head.
         let torn = self.torn_prepares(&cases, cluster, op_max, op_prepare_max, op_checkpoint, solo);
-        for slot in torn {
+        for slot in torn.const_slice() {
+            assert!(cases[slot.index()].decision(solo) == RecoveryDecision::Vsr);
             cases[slot.index()] = &CASE_CUT_TORN;
         }
 
@@ -1447,6 +1558,31 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             let slot = Slot::new(index);
             let case = cases[index];
             self.recover_slot(slot, case, cluster, op_prepare_max, op_checkpoint, solo);
+        }
+        assert!(cases.len() == SLOT_COUNT);
+
+        for (index, header) in self.headers.iter().enumerate() {
+            self.headers_redundant[index] = header_prepare_raw_from_typed(header);
+        }
+
+        for index in 0..SLOT_COUNT {
+            let slot = Slot::new(index);
+
+            let (header_op, header_view, header_operation) = {
+                let header_raw = header_prepare_as_raw(&self.headers[index]);
+                let Some(header) = header_ok(cluster, slot, header_raw) else {
+                    continue;
+                };
+
+                (header.op, header.view, header.operation)
+            };
+
+            let view_range = view_for_op(view_headers, header_op, log_view);
+            assert!(view_range.max <= log_view);
+
+            if header_operation != Operation::RESERVED && !view_range.contains(header_view) {
+                self.remove_entry(slot, cluster);
+            }
         }
 
         self.recover_fix();
@@ -1456,7 +1592,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         // Identical to journal.zig remove_entry(): remove the entry from the in-memory headers ring
         // and clear dirty/faulty (this is truncation, not a fault).
         self.headers[slot.index()] = HeaderPrepare::reserve(cluster, slot.index() as u64);
-        self.headers_redundant[slot.index()] = self.headers[slot.index()];
+        self.headers_redundant[slot.index()] =
+            header_prepare_raw_from_typed(&self.headers[slot.index()]);
         self.dirty.unset(slot.index());
         self.faulty.unset(slot.index());
     }
@@ -1470,13 +1607,14 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         op_checkpoint: u64,
         solo: bool,
     ) {
-        // Recompute header/prepare views (untrusted).
-        let header = header_ok(cluster, slot, &self.headers_redundant_raw[slot.index()]);
+        assert!(matches!(self.status, Status::Recovering { .. }));
+        assert!(self.dirty.is_set(slot.index()));
+        assert!(self.faulty.is_set(slot.index()));
 
-        // SAFETY: HeaderPrepare and HeaderPrepareRaw have identical layout.
-        let prepare_raw: &HeaderPrepareRaw = unsafe {
-            &*(self.headers[slot.index()].as_bytes().as_ptr() as *const HeaderPrepareRaw)
-        };
+        // Recompute header/prepare views (untrusted).
+        let header = header_ok(cluster, slot, &self.headers_redundant[slot.index()]);
+
+        let prepare_raw = header_prepare_as_raw(&self.headers[slot.index()]);
         let prepare = header_ok(cluster, slot, prepare_raw);
 
         let decision = case.decision(solo);
@@ -1486,12 +1624,16 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 let header = header.expect("EQL requires a valid redundant header");
                 let prepare = prepare.expect("EQL requires a valid prepare");
 
+                assert!(header.command == Command::Prepare);
+                assert!(prepare.command == Command::Prepare);
                 assert!(header.checksum == prepare.checksum);
                 assert!(header.operation != Operation::RESERVED);
                 assert!(prepare.operation != Operation::RESERVED);
+                assert!(self.prepare_inhabited[slot.index()]);
+                assert!(self.prepare_checksums[slot.index()] == prepare.checksum);
 
-                self.headers[slot.index()] = *header;
-                self.headers_redundant[slot.index()] = *header;
+                self.headers[slot.index()] = header;
+                self.headers_redundant[slot.index()] = header_prepare_raw_from_typed(header);
                 self.dirty.unset(slot.index());
                 self.faulty.unset(slot.index());
             }
@@ -1499,31 +1641,46 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 let header = header.expect("NIL requires a valid redundant header");
                 let prepare = prepare.expect("NIL requires a valid prepare");
 
+                assert!(header.command == Command::Prepare);
+                assert!(prepare.command == Command::Prepare);
                 assert!(header.operation == Operation::RESERVED);
                 assert!(prepare.operation == Operation::RESERVED);
+                assert!(header.checksum == prepare.checksum);
+                assert!(
+                    header.checksum
+                        == HeaderPrepare::reserve(cluster, slot.index() as u64).checksum
+                );
+                assert!(!self.prepare_inhabited[slot.index()]);
+                assert!(self.prepare_checksums[slot.index()] == 0);
 
-                self.headers[slot.index()] = *header;
-                self.headers_redundant[slot.index()] = *header;
+                self.headers[slot.index()] = header;
+                self.headers_redundant[slot.index()] = header_prepare_raw_from_typed(header);
                 self.dirty.unset(slot.index());
                 self.faulty.unset(slot.index());
             }
             RecoveryDecision::Fix => {
                 let prepare = prepare.expect("FIX requires a valid prepare");
-                assert!(prepare.operation != Operation::RESERVED);
-                assert!(prepare.op <= op_prepare_max);
+                assert!(prepare.command == Command::Prepare);
 
                 // Canonical header becomes the prepare header; redundant header will be rewritten by recover_fix().
-                self.headers[slot.index()] = *prepare;
-                self.headers_redundant[slot.index()] = *prepare;
+                self.headers[slot.index()] = prepare;
+                self.headers_redundant[slot.index()] = header_prepare_raw_from_typed(prepare);
                 self.faulty.unset(slot.index());
-                // Keep dirty set.
+                assert!(self.dirty.is_set(slot.index()));
+                if !solo {
+                    assert!(prepare.operation != Operation::RESERVED);
+                    assert!(self.prepare_inhabited[slot.index()]);
+                    assert!(self.prepare_checksums[slot.index()] == prepare.checksum);
+                }
             }
             RecoveryDecision::Vsr => {
                 // This slot requires repair via VSR; preserve the fault by keeping it dirty+faulty and
                 // invalidating the redundant header checksum.
                 self.headers[slot.index()] = HeaderPrepare::reserve(cluster, slot.index() as u64);
-                self.headers_redundant[slot.index()] = self.headers[slot.index()];
-                // Keep dirty+faulty set.
+                self.headers_redundant[slot.index()] =
+                    header_prepare_raw_from_typed(&self.headers[slot.index()]);
+                assert!(self.dirty.is_set(slot.index()));
+                assert!(self.faulty.is_set(slot.index()));
             }
             RecoveryDecision::CutTorn => {
                 // Truncate a torn prepare at the head (safe only under torn_prepares()).
@@ -1531,16 +1688,23 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
                 assert!(header.operation != Operation::RESERVED);
                 assert!(header.op <= op_checkpoint);
                 assert!(prepare.is_none());
+                assert!(!self.prepare_inhabited[slot.index()]);
+                assert!(self.prepare_checksums[slot.index()] == 0);
 
                 self.remove_entry(slot, cluster);
             }
             RecoveryDecision::Cut => {
                 // Truncate entries beyond op_prepare_max.
-                if let Some(prepare) = prepare {
-                    assert!(prepare.op > op_prepare_max);
-                }
-                if let Some(header) = header {
-                    assert!(header.op > op_prepare_max || header.operation == Operation::RESERVED);
+                let prepare = prepare.expect("CUT requires a valid prepare");
+
+                if prepare.op <= op_prepare_max {
+                    let header = header.expect("CUT requires a redundant header");
+                    assert!(header.operation != Operation::RESERVED);
+                    assert!(header.op > op_prepare_max);
+                } else {
+                    assert!(prepare.operation != Operation::RESERVED);
+                    assert!(self.prepare_inhabited[slot.index()]);
+                    assert!(self.prepare_checksums[slot.index()] == prepare.checksum);
                 }
 
                 self.remove_entry(slot, cluster);
@@ -1552,83 +1716,92 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
 
         // Finalize redundant headers: if the slot is faulty, persist it by zeroing the checksum in
         // the redundant header.
-        self.headers_redundant[slot.index()] = self.headers[slot.index()];
+        self.headers_redundant[slot.index()] =
+            header_prepare_raw_from_typed(&self.headers[slot.index()]);
         if self.faulty.is_set(slot.index()) {
             self.headers_redundant[slot.index()].checksum = 0;
         }
+        assert!(
+            self.faulty.is_set(slot.index())
+                != self.headers_redundant[slot.index()].valid_checksum()
+        );
     }
 
     fn recover_fix(&mut self) {
         assert!(matches!(self.status, Status::Recovering { .. }));
+        assert!(self.writes.executing() == 0);
+        assert!(self.dirty.count() >= self.faulty.count());
+        assert!(self.dirty.count() <= SLOT_COUNT);
 
-        loop {
-            // Find the next sector that contains at least one dirty-but-not-faulty slot.
-            let mut fix_sector: Option<usize> = None;
-            for i in 0..SLOT_COUNT {
-                if self.dirty.is_set(i) && !self.faulty.is_set(i) {
-                    fix_sector = Some(i / HEADERS_PER_SECTOR);
+        let replica =
+            unsafe { &*Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::replica_from_journal(self) };
+        let mut fix_sector: Option<usize> = None;
+        for dirty_slot in self.dirty.iter() {
+            if self.faulty.is_set(dirty_slot) {
+                continue;
+            }
+
+            if self.prepare_inhabited[dirty_slot] {
+                assert!(self.prepare_checksums[dirty_slot] == self.headers[dirty_slot].checksum);
+                assert!(
+                    self.prepare_checksums[dirty_slot] == self.headers_redundant[dirty_slot].checksum
+                );
+            } else {
+                // Case @D for R=1.
+                assert!(replica.solo());
+            }
+
+            let dirty_slot_sector = dirty_slot / HEADERS_PER_SECTOR;
+            if let Some(sector) = fix_sector {
+                if sector != dirty_slot_sector {
                     break;
                 }
+            } else {
+                fix_sector = Some(dirty_slot_sector);
             }
 
-            let Some(sector) = fix_sector else {
-                self.recover_done();
-                return;
-            };
+            self.dirty.unset(dirty_slot);
+        }
 
-            let slot_start = sector * HEADERS_PER_SECTOR;
-            let slot_end = slot_start + HEADERS_PER_SECTOR;
+        let Some(sector) = fix_sector else {
+            self.recover_done();
+            return;
+        };
 
-            // Clear dirty bits for the fixed slots in this sector (faulty slots remain dirty).
-            for i in slot_start..slot_end {
-                if self.dirty.is_set(i) && !self.faulty.is_set(i) {
-                    if self.prepare_inhabited[i] {
-                        assert!(self.prepare_checksums[i] == self.headers[i].checksum);
-                    }
-                    self.dirty.unset(i);
-                }
-            }
+        let write = self
+            .writes
+            .acquire()
+            .expect("recover_fix write unavailable");
 
-            let write = match self.writes.acquire() {
-                Some(w) => w,
-                None => return, // wait for outstanding writes to complete
-            };
+        // Initialize only what write_sectors()/header_sector() will rely on.
+        unsafe {
+            ptr::addr_of_mut!((*write).journal).write(self);
+            ptr::addr_of_mut!((*write).prepare_callback).write(None);
+            ptr::addr_of_mut!((*write).message).write(ptr::null_mut());
+            ptr::addr_of_mut!((*write).op).write(0);
+            ptr::addr_of_mut!((*write).checksum).write(0);
+        }
 
-            // Initialize only what write_sectors()/header_sector() will rely on.
-            unsafe {
-                ptr::addr_of_mut!((*write).journal).write(self);
-                ptr::addr_of_mut!((*write).prepare_callback).write(None);
-                ptr::addr_of_mut!((*write).message).write(ptr::null_mut());
-                ptr::addr_of_mut!((*write).op).write(0);
-                ptr::addr_of_mut!((*write).checksum).write(0);
-            }
+        let buffer = self.header_sector(sector, write);
 
-            let buffer = self.header_sector(sector, write);
-
+        unsafe {
             self.write_sectors(
-                Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_fix_on_write,
                 write,
+                Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::recover_fix_on_write,
                 buffer,
                 Ring::Headers,
-                Ring::Headers.offset(Slot::new(slot_start)),
+                Ring::Headers.offset(Slot::new(sector * HEADERS_PER_SECTOR)),
             );
-
-            // In async mode, issue one write at a time to keep control flow simple.
-            if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-                return;
-            }
         }
     }
 
     fn recover_fix_on_write(write: *mut Write<S, WRITE_OPS, WRITE_OPS_WORDS>) {
-        let journal: &mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS> = unsafe { &mut *(*write).journal };
+        let journal: &mut Journal<S, WRITE_OPS, WRITE_OPS_WORDS> =
+            unsafe { &mut *(*write).journal };
         assert!(matches!(journal.status, Status::Recovering { .. }));
 
         journal.writes.release(write);
-
-        if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-            journal.recover_fix();
-        }
+        journal.recover_fix();
     }
 
     fn recover_done(&mut self) {
@@ -1637,10 +1810,38 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             _ => panic!("recover_done called when not recovering"),
         };
 
-        // At this point, only faulty slots may remain dirty.
+        assert!(self.reads.executing() == 0);
+        assert!(self.writes.executing() == 0);
+        assert!(self.dirty.count() <= SLOT_COUNT);
+        assert!(self.faulty.count() <= SLOT_COUNT);
         assert!(self.dirty.count() == self.faulty.count());
+        assert!(self.header_chunks_requested.is_full());
+        assert!(self.header_chunks_recovered.is_full());
 
+        let replica =
+            unsafe { &*Journal::<S, WRITE_OPS, WRITE_OPS_WORDS>::replica_from_journal(self) };
         self.status = Status::Recovered;
+
+        if self.headers[0].op == 0 && self.headers[0].operation != Operation::RESERVED {
+            assert!(self.headers[0].checksum == HeaderPrepare::root(replica.cluster).checksum);
+            assert!(!self.faulty.is_set(0));
+        }
+
+        for (index, header) in self.headers.iter().enumerate() {
+            assert!(header.valid_checksum());
+            assert!(header.cluster == replica.cluster);
+            assert!(header.command == Command::Prepare);
+            assert!(self.headers_redundant[index] == header_prepare_raw_from_typed(header));
+
+            if header.operation == Operation::RESERVED {
+                assert!(header.op == index as u64);
+            } else {
+                assert!(header.op % SLOT_COUNT as u64 == index as u64);
+                assert!(self.prepare_inhabited[index]);
+                assert!(self.prepare_checksums[index] == header.checksum);
+            }
+        }
+
         callback(self as *mut _);
     }
 
@@ -1692,6 +1893,22 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         assert!(max.is_multiple_of(WAL_HEADER_SIZE));
 
         max
+    }
+
+    /// Returns the chunk descriptor for a specific chunk index.
+    #[inline]
+    pub fn header_chunk(&self, chunk_index: usize) -> HeaderChunk {
+        assert!(chunk_index < HEADER_CHUNK_COUNT);
+
+        let offset = Self::header_chunk_offset(chunk_index);
+        let len = Self::header_chunk_len_for_offset(offset);
+        let chunk = HeaderChunk {
+            index: chunk_index,
+            offset,
+            len,
+        };
+        chunk.assert_invariants();
+        chunk
     }
 
     /// Returns the next chunk to read, marking it as requested.
@@ -1773,7 +1990,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Panics if:
     /// - `chunk_bytes.len()` is not a positive multiple of `WAL_HEADER_SIZE`
-    /// - `chunk_bytes` is not properly aligned for `HeaderPrepare`
+    /// - `chunk_bytes` is not properly aligned for `HeaderPrepareRaw`
     #[inline]
     pub fn header_chunk_bytes_as_headers(chunk_bytes: &[u8]) -> &[HeaderPrepareRaw] {
         assert!(chunk_bytes.len() >= WAL_HEADER_SIZE);
@@ -1826,8 +2043,8 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             // Preserve the existing faulty state for reserved slots.
         } else {
             self.faulty.unset(slot.index());
-            self.headers_redundant[slot.index()] =
-                HeaderPrepare::reserve(header.cluster, slot.index() as u64);
+            let reserved = HeaderPrepare::reserve(header.cluster, slot.index() as u64);
+            self.headers_redundant[slot.index()] = header_prepare_raw_from_typed(&reserved);
         }
 
         self.headers[slot.index()] = *header;
@@ -2177,21 +2394,18 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// Recovery reads use `options.op` for chunk/slot identity and do not populate
     /// `options.checksum`.
     #[allow(dead_code)]
-    fn read_recovery_acquire(
-        &mut self,
-        op: u64,
-    ) -> Option<*mut Read<S, WRITE_OPS, WRITE_OPS_WORDS>> {
+    fn read_recovery_acquire(&mut self, op: u64) -> *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> {
         assert!(matches!(self.status, Status::Recovering { .. }));
-
-        if self.reads.available() == 0 {
-            return None;
-        }
+        assert!(self.reads.available() > 0);
 
         let replica_ptr = self.replica_ptr();
         let replica = unsafe { &mut *replica_ptr };
         let message = replica.message_pool.get::<PrepareCmd>();
 
-        let read = self.reads.acquire()?;
+        let read = self
+            .reads
+            .acquire()
+            .expect("recovery read unavailable");
 
         let options = ReadOptions {
             op,
@@ -2206,7 +2420,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             ptr::addr_of_mut!((*read).message).write(MaybeUninit::new(message));
         }
 
-        Some(read)
+        read
     }
 
     /// Debug hook for read-path notices; intentionally a no-op in production builds.
@@ -2343,7 +2557,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             assert!(journal.faulty.is_set(slot.index()));
         }
 
-        journal.headers_redundant[slot.index()] = *header;
+        journal.headers_redundant[slot.index()] = header_prepare_raw_from_typed(header);
 
         let sector_index = slot.index() / HEADERS_PER_SECTOR;
         let buffer = journal.header_sector(sector_index, write);
@@ -2397,9 +2611,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         let sector_slot = Slot::new(sector_index * HEADERS_PER_SECTOR);
 
         let sector_bytes = &mut self.write_headers_sectors[write_index];
-        let sector_headers: &mut [HeaderPrepare] = unsafe {
+        let sector_headers: &mut [HeaderPrepareRaw] = unsafe {
             core::slice::from_raw_parts_mut(
-                sector_bytes.as_mut_ptr() as *mut HeaderPrepare,
+                sector_bytes.as_mut_ptr() as *mut HeaderPrepareRaw,
                 HEADERS_PER_SECTOR,
             )
         };
