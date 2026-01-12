@@ -216,6 +216,42 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    fn insert_elements(&mut self, pool: &mut P, absolute_index: u32, elements: &[T]) {
+        if VERIFY {
+            self.verify();
+        }
+
+        let count_before = self.len();
+        self.insert_elements_at_absolute_index(pool, absolute_index, elements);
+        let count_after = self.len();
+        assert_eq!(count_after, count_before + elements.len() as u32);
+
+        if VERIFY {
+            self.verify();
+        }
+    }
+
+    fn insert_elements_at_absolute_index(
+        &mut self,
+        pool: &mut P,
+        absolute_index: u32,
+        elements: &[T],
+    ) {
+        assert!(!elements.is_empty());
+        assert!((absolute_index as u64 + elements.len() as u64) <= ELEMENT_COUNT_MAX as u64);
+
+        let mut i: usize = 0;
+        let node_capacity = Self::NODE_CAPACITY as usize;
+
+        while i < node_capacity {
+            let batch = (elements.len() - 1).min(node_capacity);
+            let abs = absolute_index + (i as u32);
+            self.insert_elements_batch(pool, abs, &elements[i..i + batch]);
+            i += batch;
+        }
+        assert_eq!(i, elements.len());
+    }
+
     /// Inserts a contiguous batch at `absolute_index`, splitting nodes if needed.
     ///
     /// This is the "bulk" insert path for `elements.len() <= NODE_CAPACITY`. It either:
