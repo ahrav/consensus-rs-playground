@@ -1,31 +1,8 @@
-//! Fixed-size node pool for LSM tree memory management.
+//! Pre-allocated fixed-size node pool for LSM tree structures.
 //!
-//! This module provides a memory pool that pre-allocates a contiguous buffer of
-//! fixed-size nodes and manages their allocation state via a bitset. This design
-//! eliminates per-node allocation overhead and provides O(1) acquire/release
-//! operations with predictable memory usage.
-//!
-//! # Design Rationale
-//!
-//! LSM trees require frequent allocation and deallocation of fixed-size nodes
-//! (e.g., for memtables, manifest entries). Using the global allocator for each
-//! node would incur significant overhead and memory fragmentation. The node pool:
-//!
-//! - Pre-allocates all memory upfront, enabling memory budgeting
-//! - Uses a bitset to track free slots, providing O(1) allocation
-//! - Guarantees proper alignment for all nodes
-//! - Validates all nodes are released before destruction (leak detection)
-//!
-//! # Memory Layout
-//!
-//! The pool allocates a single contiguous buffer:
-//!
-//! ```text
-//! +----------+----------+----------+-----+----------+
-//! |  Node 0  |  Node 1  |  Node 2  | ... |  Node N  |
-//! +----------+----------+----------+-----+----------+
-//! |<-------- NODE_SIZE * node_count --------------->|
-//! ```
+//! Avoids per-node allocation overhead by pre-allocating a contiguous buffer and
+//! tracking free slots via bitset. This gives O(1) acquire/release and enables
+//! memory budgeting upfront. Panics on drop if nodes are leaked to catch bugs early.
 
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
@@ -34,120 +11,38 @@ use std::{
 
 use crate::stdx::DynamicBitSet;
 
-/// Trait for fixed-size node memory pools.
+/// Fixed-size node memory pool.
 ///
-/// Implementors provide a pool of pre-allocated, uniformly-sized memory nodes
-/// that can be acquired and released without invoking the global allocator.
-///
-/// # Contract
-///
-/// - [`acquire`](NodePool::acquire) returns a pointer to an unused node of exactly
-///   [`NODE_SIZE`](NodePool::NODE_SIZE) bytes with [`NODE_ALIGNMENT`](NodePool::NODE_ALIGNMENT)
-///   alignment.
-/// - Each acquired node must be released exactly once via [`release`](NodePool::release).
-/// - Releasing a node that was not acquired from this pool is undefined behavior.
-/// - The returned pointer is valid until the node is released or the pool is dropped.
-///
-/// # Implementor Requirements
-///
-/// Implementations must ensure:
-/// - All returned pointers are properly aligned to `NODE_ALIGNMENT`
-/// - Acquired nodes do not overlap
-/// - Released nodes can be reacquired
+/// Acquired nodes must be released exactly once. Panics on exhaustion or double-free
+/// rather than returning errors - memory issues in LSM structures are fatal.
 pub trait NodePool {
-    /// The size in bytes of each node in the pool.
-    ///
-    /// Must be a power of two and a multiple of [`NODE_ALIGNMENT`](NodePool::NODE_ALIGNMENT).
+    /// Node size in bytes. Must be power of two and multiple of `NODE_ALIGNMENT`.
     const NODE_SIZE: usize;
-
-    /// The alignment in bytes for each node in the pool.
-    ///
-    /// Must be a power of two and at most 4096.
+    /// Node alignment in bytes. Must be power of two and <= 4096.
     const NODE_ALIGNMENT: usize;
 
-    /// Acquires an unused node from the pool.
-    ///
-    /// Returns a non-null pointer to a node of [`NODE_SIZE`](NodePool::NODE_SIZE) bytes
-    /// with [`NODE_ALIGNMENT`](NodePool::NODE_ALIGNMENT) alignment. The memory contents
-    /// are uninitialized.
-    ///
-    /// # Panics
-    ///
-    /// Panics if no free nodes are available in the pool.
     fn acquire(&mut self) -> NonNull<u8>;
-
-    /// Releases a previously acquired node back to the pool.
-    ///
-    /// After release, the node may be returned by future [`acquire`](NodePool::acquire) calls.
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// - `node` was not acquired from this pool
-    /// - `node` is not properly aligned to [`NODE_SIZE`](NodePool::NODE_SIZE) boundaries
-    /// - `node` has already been released (double-free)
     fn release(&mut self, node: NonNull<u8>);
 }
 
-/// A fixed-size memory pool backed by a contiguous buffer and bitset allocator.
+/// Pre-allocated node pool backed by contiguous buffer and bitset.
 ///
-/// `NodePoolType` pre-allocates a buffer capable of holding `node_count` nodes,
-/// each of size `NODE_SIZE` bytes with `NODE_ALIGNMENT` alignment. Node allocation
-/// is tracked via a [`DynamicBitSet`] where set bits indicate free nodes.
-///
-/// # Type Parameters
-///
-/// * `NODE_SIZE` - Size in bytes of each node. Must be a power of two and a
-///   multiple of `NODE_ALIGNMENT`.
-/// * `NODE_ALIGNMENT` - Alignment in bytes for each node. Must be a power of two
-///   and at most 4096.
-///
-/// # Invariants
-///
-/// - `buffer` points to a valid allocation of `len` bytes (or is dangling if `len == 0`)
-/// - `len` equals `NODE_SIZE * node_count` from initialization
-/// - `free.bit_length()` equals `node_count`
-/// - A bit is set in `free` if and only if that node slot is available for acquisition
-///
-/// # Memory Management
-///
-/// The pool owns its backing buffer and deallocates it on drop. The [`Drop`]
-/// implementation asserts that all nodes have been released, panicking on memory
-/// leaks to catch bugs early.
+/// Uses a bitset where set bits indicate free nodes, enabling O(1) first-fit allocation.
+/// Panics on drop if any nodes weren't released - intentional leak detection.
 pub struct NodePoolType<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> {
-    /// Pointer to the base of the allocated buffer.
     buffer: NonNull<u8>,
-    /// Total size of the buffer in bytes (`NODE_SIZE * node_count`).
     len: usize,
-    /// Bitset tracking free nodes. A set bit indicates the node is available.
     free: DynamicBitSet,
 }
 
 impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE, NODE_ALIGNMENT> {
-    /// The size in bytes of each node in the pool.
     pub const NODE_SIZE: usize = NODE_SIZE;
-
-    /// The alignment in bytes for each node in the pool.
     pub const NODE_ALIGNMENT: usize = NODE_ALIGNMENT;
 
-    /// Creates a new node pool with the specified capacity.
+    /// Creates pool with capacity for `node_count` nodes.
     ///
-    /// Allocates a contiguous buffer capable of holding `node_count` nodes and
-    /// initializes all nodes as free.
-    ///
-    /// # Arguments
-    ///
-    /// * `node_count` - The number of nodes to allocate. Must be greater than zero.
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// - `node_count` is zero
-    /// - `NODE_SIZE` is zero or not a power of two
-    /// - `NODE_ALIGNMENT` is zero, not a power of two, or greater than 4096
-    /// - `NODE_SIZE` is not a multiple of `NODE_ALIGNMENT`
-    /// - `NODE_SIZE * node_count` overflows `usize`
-    /// - Memory allocation fails
+    /// All memory is allocated upfront to enable budgeting and avoid runtime allocation
+    /// failures during critical operations.
     pub fn init(node_count: u32) -> Self {
         assert!(node_count > 0);
         Self::assert_layout();
@@ -158,9 +53,7 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         let layout = Layout::from_size_align(size, NODE_ALIGNMENT)
             .unwrap_or_else(|_| panic!("invalid layout size"));
 
-        // SAFETY: `layout` was validated by `Layout::from_size_align` which ensures
-        // non-zero size and valid alignment. The returned pointer is checked for null
-        // via `NonNull::new`, and allocation failure is handled by `handle_alloc_error`.
+        // SAFETY: Layout validated above; null checked via NonNull::new.
         let raw = unsafe { alloc(layout) };
         let buffer = NonNull::new(raw).unwrap_or_else(|| handle_alloc_error(layout));
 
@@ -174,46 +67,24 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         }
     }
 
-    /// Explicitly deallocates the pool's backing buffer.
+    /// Explicitly deallocates the pool. Idempotent.
     ///
-    /// This method performs the same cleanup as [`Drop`], but can be called
-    /// explicitly when you need to control deallocation timing.
-    ///
-    /// After calling `deinit`, the pool is in an empty state and cannot be used.
-    /// Calling `deinit` multiple times is safe (subsequent calls are no-ops).
-    ///
-    /// # Panics
-    ///
-    /// Panics if any nodes have not been released. This is intentional leak
-    /// detection to catch bugs during development.
+    /// Panics if nodes weren't released - this catches leaks during development.
     pub fn deinit(&mut self) {
         self.deinit_internal(true);
     }
 
-    /// Resets the pool, marking all nodes as free without deallocation.
+    /// Marks all nodes as free without deallocating the buffer.
     ///
-    /// This is a fast operation that simply sets all bits in the free bitset.
-    /// It does **not** zero or reinitialize the node memory contents.
-    ///
-    /// # Safety Considerations
-    ///
-    /// Calling `reset` while holding pointers to acquired nodes creates dangling
-    /// pointers. The caller must ensure no references to acquired nodes exist
-    /// before calling this method.
+    /// Useful for bulk reset scenarios. Invalidates all outstanding node pointers.
     pub fn reset(&mut self) {
         Self::set_all(&mut self.free);
     }
 
-    /// Acquires an unused node from the pool.
+    /// Returns pointer to an uninitialized node.
     ///
-    /// Returns a non-null pointer to an uninitialized node of [`NODE_SIZE`](Self::NODE_SIZE)
-    /// bytes with [`NODE_ALIGNMENT`](Self::NODE_ALIGNMENT) alignment. The caller is responsible
-    /// for initializing the memory before use and releasing it via [`release`](Self::release)
-    /// when done.
-    ///
-    /// # Panics
-    ///
-    /// Panics with a descriptive message if no free nodes are available.
+    /// Panics on exhaustion rather than returning an error - running out of nodes
+    /// indicates a configuration issue that should fail fast.
     pub fn acquire(&mut self) -> NonNull<u8> {
         let node_index = Self::find_first_set(&self.free).unwrap_or_else(|| {
             panic!(
@@ -226,25 +97,14 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         let offset = node_index * NODE_SIZE;
         assert!(offset + NODE_SIZE <= self.len);
 
-        // SAFETY: The offset is within bounds because:
-        // 1. `node_index` was obtained from `find_first_set` on our bitset, so it's < node_count
-        // 2. `offset = node_index * NODE_SIZE` is thus < self.len
-        // 3. The assertion above verifies this explicitly
-        // The pointer is non-null because `self.buffer` is non-null and offset doesn't wrap.
+        // SAFETY: Offset bounds verified by assertion above.
         unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offset)) }
     }
 
-    /// Releases a previously acquired node back to the pool.
+    /// Returns a node to the pool.
     ///
-    /// After release, the node's slot becomes available for future [`acquire`](Self::acquire)
-    /// calls. The memory contents are not cleared.
-    ///
-    /// # Panics
-    ///
-    /// Panics if:
-    /// - `node` points outside this pool's buffer
-    /// - `node` is not aligned to a `NODE_SIZE` boundary within the buffer
-    /// - `node` was already released (double-free detection)
+    /// Validates the pointer came from this pool and wasn't already released.
+    /// These checks catch use-after-free and double-free bugs immediately.
     pub fn release(&mut self, node: NonNull<u8>) {
         let base = self.buffer.as_ptr() as usize;
         let ptr = node.as_ptr() as usize;
@@ -260,7 +120,6 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         self.free.set(node_index);
     }
 
-    /// Validates type parameter constraints at runtime.
     fn assert_layout() {
         assert!(NODE_SIZE > 0);
         assert!(NODE_ALIGNMENT > 0);
@@ -270,7 +129,6 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         assert!(NODE_SIZE.is_multiple_of(NODE_ALIGNMENT));
     }
 
-    /// Internal deallocation with optional leak checking.
     fn deinit_internal(&mut self, verify_free: bool) {
         if self.len == 0 {
             return;
@@ -283,10 +141,7 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         let layout = Layout::from_size_align(self.len, NODE_ALIGNMENT)
             .unwrap_or_else(|_| panic!("invalid layout"));
 
-        // SAFETY: `self.buffer` was allocated with the same layout (size = self.len,
-        // alignment = NODE_ALIGNMENT) via `alloc` in `init`. The buffer has not been
-        // deallocated yet (we check `self.len != 0` at function entry, and set it to 0
-        // after deallocation to prevent double-free).
+        // SAFETY: Same layout as alloc; len != 0 check prevents double-free.
         unsafe {
             dealloc(self.buffer.as_ptr(), layout);
         }
@@ -296,13 +151,11 @@ impl<const NODE_SIZE: usize, const NODE_ALIGNMENT: usize> NodePoolType<NODE_SIZE
         self.free = DynamicBitSet::empty(0);
     }
 
-    /// Sets all bits in the bitset to mark all nodes as free.
     fn set_all(bits: &mut DynamicBitSet) {
         bits.clear();
         bits.toggle_all();
     }
 
-    /// Returns the index of the first set bit, or `None` if all bits are clear.
     fn find_first_set(bits: &DynamicBitSet) -> Option<usize> {
         bits.iter_set().next()
     }
