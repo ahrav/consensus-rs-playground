@@ -27,8 +27,6 @@
 //! |<-------- NODE_SIZE * node_count --------------->|
 //! ```
 
-#![allow(dead_code)]
-
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     ptr::NonNull,
