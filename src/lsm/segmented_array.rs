@@ -1,6 +1,11 @@
 #![allow(dead_code)]
 
-use std::{marker::PhantomData, mem::MaybeUninit, ptr::NonNull, slice};
+use std::{
+    marker::PhantomData,
+    mem::MaybeUninit,
+    ptr::{self, NonNull},
+    slice,
+};
 
 use crate::lsm::{
     binary_search::{Config, binary_search_keys},
@@ -208,6 +213,166 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
             if node < self.node_count.saturating_sub(1) {
                 assert!(count >= half);
             }
+        }
+    }
+
+    /// Inserts a contiguous batch at `absolute_index`, splitting nodes if needed.
+    ///
+    /// This is the "bulk" insert path for `elements.len() <= NODE_CAPACITY`. It either:
+    /// - shifts within a single node when everything fits, or
+    /// - splits the current node `a` into `[a|b]` and rebalance both halves, then
+    ///   stitches `elements` into the correct gap across the two buffers.
+    ///
+    /// The split path is careful about overlap: we treat `a` and `b` as one logical
+    /// buffer and use `copy_backwards_raw` to move tails without clobbering source
+    /// elements when the source and destination overlap within `a`.
+    fn insert_elements_batch(&mut self, pool: &mut P, absolute_index: u32, elements: &[T]) {
+        assert!(!elements.is_empty());
+        assert!(elements.len() <= Self::NODE_CAPACITY as usize);
+        assert!((absolute_index as u64 + elements.len() as u64) <= ELEMENT_COUNT_MAX as u64);
+
+        if self.node_count == 0 {
+            assert_eq!(absolute_index, 0);
+            self.insert_empty_node_at(pool, 0);
+            assert_eq!(self.node_count, 1);
+            assert!(self.nodes[0].is_some());
+            assert_eq!(self.indexes[0], 0);
+            assert_eq!(self.indexes[1], 0);
+        }
+
+        let cursor = self.cursor_for_absolute_index(absolute_index);
+        assert!(cursor.node < self.node_count);
+        let a = cursor.node;
+
+        let a_count = self.count(a);
+        assert!(cursor.relative_index <= a_count);
+
+        let total = (a_count as u64) + (elements.len() as u64);
+        let node_capacity = Self::NODE_CAPACITY as u64;
+
+        if total <= node_capacity {
+            // Simple in-node insert, all elements fit nicely :)
+            let a_ptr = self.nodes[a as usize].expect("node missing");
+            let buf = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+
+            let rel = cursor.relative_index as usize;
+            let count = a_count as usize;
+            let n = elements.len();
+
+            let src = unsafe { buf.as_ptr().add(rel) };
+            let dst = unsafe { buf.as_mut_ptr().add(rel + n) };
+            let len_to_move = count - rel;
+            unsafe { ptr::copy(src, dst, len_to_move) };
+
+            let dst_elems = unsafe { buf.as_mut_ptr().add(rel) };
+            let src_elems = elements.as_ptr() as *const MaybeUninit<T>;
+            unsafe { ptr::copy_nonoverlapping(src_elems, dst_elems, n) };
+            self.increment_indexes_after(a, elements.len() as u32);
+            return;
+        }
+
+        let b = a + 1;
+        self.insert_empty_node_at(pool, b);
+
+        let a_ptr = self.nodes[a as usize].expect("node missing");
+        let b_ptr = self.nodes[b as usize].expect("node missing");
+
+        let total_u32 = total as u32;
+        // Split total count as evenly as possible so both nodes stay >= half full.
+        let a_half = total_u32.div_ceil(2);
+        let b_half = total_u32 - a_half;
+
+        let a_buf = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+        let b_buf = unsafe { Self::node_buf_from_ptr_mut(b_ptr) };
+
+        let rel = cursor.relative_index as usize;
+        let count = a_count as usize;
+        let a_half_usize = a_half as usize;
+        let b_half_usize = b_half as usize;
+
+        // Step 1: Copy source_tail (a_buf[rel..count]) to position rel + elements.len()
+        // across a_buf[..a_half] and b_buf[..b_half].
+        // Use raw pointers since source and destination regions may overlap within a_buf.
+        Self::copy_backwards_raw(
+            a_buf.as_mut_ptr(),
+            a_half_usize,
+            b_buf.as_mut_ptr(),
+            b_half_usize,
+            rel + elements.len(),
+            unsafe { a_buf.as_ptr().add(rel) },
+            count - rel,
+        );
+
+        // Step 2: If the split point falls before the insert gap, move the "middle"
+        // range from the tail of a into the front of b.
+        if a_half_usize < rel {
+            let mid_len = rel - a_half_usize;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    a_buf.as_ptr().add(a_half_usize),
+                    b_buf.as_mut_ptr(),
+                    mid_len,
+                )
+            };
+        }
+
+        // Step 3: Copy elements into the gap, spanning a and b if needed.
+        Self::copy_backwards_raw(
+            a_buf.as_mut_ptr(),
+            a_half_usize,
+            b_buf.as_mut_ptr(),
+            b_half_usize,
+            rel,
+            elements.as_ptr() as *const MaybeUninit<T>,
+            elements.len(),
+        );
+
+        self.indexes[b as usize] = self.indexes[a as usize] + a_half;
+        self.increment_indexes_after(b, elements.len() as u32);
+    }
+
+    /// Copies `source_len` elements from `source_ptr` into a logical destination
+    /// spanning two buffers: `a[0..a_len]` followed by `b[0..b_len]`.
+    /// The copy starts at logical index `target` within this combined span.
+    ///
+    /// "Backwards" here means the destination may straddle `a` and `b`, so we
+    /// materialize the tail in `b` first, then the head in `a`. This allows
+    /// safe use with overlapping regions inside `a` (via `ptr::copy`) while
+    /// still supporting a logical buffer that crosses the node boundary.
+    fn copy_backwards_raw(
+        a_ptr: *mut MaybeUninit<T>,
+        a_len: usize,
+        b_ptr: *mut MaybeUninit<T>,
+        b_len: usize,
+        target: usize,
+        source_ptr: *const MaybeUninit<T>,
+        source_len: usize,
+    ) {
+        assert!(target + source_len <= a_len + b_len);
+
+        let target_a_start = target.min(a_len);
+        let target_a_end = (target + source_len).min(a_len);
+        let target_a_len = target_a_end - target_a_start;
+
+        let target_b_start = target.saturating_sub(a_len);
+        let target_b_end = (target + source_len).saturating_sub(a_len);
+        let target_b_len = target_b_end - target_b_start;
+
+        assert_eq!(target_a_len + target_b_len, source_len);
+
+        // Copy to b first (backwards order), then to a
+        if target_b_len > 0 {
+            unsafe {
+                ptr::copy(
+                    source_ptr.add(target_a_len),
+                    b_ptr.add(target_b_start),
+                    target_b_len,
+                )
+            };
+        }
+
+        if target_a_len > 0 {
+            unsafe { ptr::copy(source_ptr, a_ptr.add(target_a_start), target_a_len) };
         }
     }
 
