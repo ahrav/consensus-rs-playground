@@ -2,7 +2,10 @@
 
 use std::{marker::PhantomData, ptr::NonNull};
 
-use crate::lsm::node_pool::NodePool;
+use crate::lsm::{
+    binary_search::{Config, binary_search_keys},
+    node_pool::NodePool,
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
@@ -228,11 +231,91 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         assert_eq!(self.indexes[node], self.indexes[node + 1]);
     }
 
+    fn remove_empty_node_at(&mut self, pool: &mut P, node: u32) {
+        assert!(self.node_count > 0);
+        assert!(node < self.node_count);
+        assert_eq!(self.count(node), 0);
+
+        let node = node as usize;
+        let node_count = self.node_count as usize;
+
+        let ptr = self.nodes[node].take().expect("node missing");
+        pool.release(ptr);
+
+        // Shift nodes left: [node+1..node_count+1] -> [node..node_count]
+        self.nodes.copy_within(node + 1..node_count + 1, node);
+
+        // Shift indexes left: [node+1..node_count+1] -> [node..node_count]
+        self.indexes.copy_within(node + 1..node_count + 1, node);
+
+        self.node_count -= 1;
+
+        let new_count = self.node_count as usize;
+        self.nodes[new_count] = None;
+    }
+
     #[inline]
     fn count(&self, node: u32) -> u32 {
         let n = node as usize;
         let result = self.indexes[n + 1] - self.indexes[n];
         assert!(result <= Self::NODE_CAPACITY);
+        result
+    }
+
+    #[inline]
+    fn increment_indexs_after(&mut self, node: u32, delta: u32) {
+        let start = (node as usize) + 1;
+        let end = (self.node_count as usize) + 1;
+        self.indexes[start..end]
+            .iter_mut()
+            .for_each(|index| *index += delta);
+    }
+
+    #[inline]
+    fn decrement_indexs_after(&mut self, node: u32, delta: u32) {
+        let start = (node as usize) + 1;
+        let end = (self.node_count as usize) + 1;
+        self.indexes[start..end]
+            .iter_mut()
+            .for_each(|index| *index -= delta);
+    }
+
+    fn cursor_for_absolute_index(&self, absolute_index: u32) -> Cursor {
+        assert!(absolute_index < ELEMENT_COUNT_MAX);
+        assert!(absolute_index <= self.len());
+        assert!(self.node_count > 0);
+
+        let keys = &self.indexes[..(self.node_count as usize)];
+        let result = binary_search_keys(keys, absolute_index, Config::default());
+
+        if result.exact {
+            return Cursor {
+                node: result.index,
+                relative_index: 0,
+            };
+        }
+
+        let node = result.index - 1;
+        let rel = absolute_index - self.indexes[node as usize];
+
+        // Only the last node allows insertion at one-past-the-end.
+        let count = self.count(node);
+        if node == self.node_count - 1 {
+            assert!(rel <= count);
+        } else {
+            assert!(rel < count);
+        }
+
+        Cursor {
+            node,
+            relative_index: rel,
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> u32 {
+        let result = self.indexes[self.node_count as usize];
+        assert!(result <= ELEMENT_COUNT_MAX);
         result
     }
 }
