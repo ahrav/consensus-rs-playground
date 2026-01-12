@@ -263,7 +263,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     }
 
     #[inline]
-    fn increment_indexs_after(&mut self, node: u32, delta: u32) {
+    fn increment_indexes_after(&mut self, node: u32, delta: u32) {
         let start = (node as usize) + 1;
         let end = (self.node_count as usize) + 1;
         self.indexes[start..end]
@@ -272,7 +272,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     }
 
     #[inline]
-    fn decrement_indexs_after(&mut self, node: u32, delta: u32) {
+    fn decrement_indexes_after(&mut self, node: u32, delta: u32) {
         let start = (node as usize) + 1;
         let end = (self.node_count as usize) + 1;
         self.indexes[start..end]
@@ -329,6 +329,50 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
                 ptr.as_ptr() as *mut MaybeUninit<T>,
                 Self::NODE_CAPACITY as usize,
             )
+        }
+    }
+
+    pub fn node_elements(&self, node: u32) -> &[T] {
+        assert!(node < self.node_count);
+        let ptr = self.nodes[node as usize].as_ref().expect("node missing");
+        let count = self.count(node) as usize;
+
+        let buf = unsafe { Self::node_buf_from_ptr(*ptr) };
+        let init = &buf[..count];
+        // SAFETY: The first `count` elements are initialized (tracked by indexes array).
+        unsafe { &*(init as *const [MaybeUninit<T>] as *const [T]) }
+    }
+
+    pub fn node_last_element(&self, node: u32) -> T {
+        let elems = self.node_elements(node);
+        assert!(!elems.is_empty());
+        elems[elems.len() - 1]
+    }
+
+    pub fn element_at_cursor(&self, cursor: Cursor) -> T {
+        let elems = self.node_elements(cursor.node);
+        elems[cursor.relative_index as usize]
+    }
+
+    #[inline]
+    pub fn first(&self) -> Cursor {
+        Cursor {
+            node: 0,
+            relative_index: 0,
+        }
+    }
+
+    pub fn last(&self) -> Cursor {
+        if self.node_count == 0 {
+            return self.first();
+        }
+
+        let node = self.node_count - 1;
+        let rel = self.count(node) - 1;
+
+        Cursor {
+            node,
+            relative_index: rel,
         }
     }
 
