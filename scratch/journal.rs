@@ -1010,11 +1010,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             ptr::write_bytes(
                 journal.headers_redundant.as_mut_ptr() as *mut u8,
                 0,
-                SLOT_COUNT * size_of::<HeaderPrepare>(),
-            );
-            ptr::write_bytes(
-                journal.headers_redundant_raw.as_mut_ptr() as *mut u8,
-                0,
                 SLOT_COUNT * size_of::<HeaderPrepareRaw>(),
             );
         }
@@ -1267,11 +1262,9 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         journal.headers_redundant[header_start..header_end].copy_from_slice(chunk_headers);
 
         drop(message);
-
-        // In async mode, continue the recovery pipeline from the callback.
-        if matches!(S::SYNCHRONICITY, Synchronicity::AlwaysAsynchronous) {
-            journal.recover_headers();
-        }
+        journal.reads.release(read);
+        journal.header_chunk_mark_recovered(chunk_index);
+        journal.recover_headers();
     }
 
     fn recover_prepares(&mut self) {
@@ -1530,7 +1523,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
             let prepare = header_ok(cluster, slot, prepare_raw);
 
             let case = recovery_case(header, prepare, op_max, op_prepare_max, solo);
-            cases.push(case);
+            cases[index] = case;
 
             // Populate prepare_inhabited/prepare_checksums for valid, non-reserved prepares.
             if let Some(prepare_ok) = prepare {
