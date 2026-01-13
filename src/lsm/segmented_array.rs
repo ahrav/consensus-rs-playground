@@ -736,8 +736,8 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         let ptr = self.nodes[node].take().expect("node missing");
         pool.release(ptr);
 
-        // Shift nodes left: [node+1..node_count+1] -> [node..node_count]
-        self.nodes.copy_within(node + 1..node_count + 1, node);
+        // Shift nodes left: [node+1..node_count] -> [node..node_count-1]
+        self.nodes.copy_within(node + 1..node_count, node);
 
         // Shift indexes left: [node+1..node_count+1] -> [node..node_count]
         self.indexes.copy_within(node + 1..node_count + 1, node);
