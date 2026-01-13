@@ -1148,7 +1148,7 @@ mod tests {
                 }
             }
 
-            if array.len() == 0 {
+            if array.is_empty() {
                 assert_eq!(array.node_count, 0);
             }
 
