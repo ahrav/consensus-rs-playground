@@ -925,6 +925,16 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         self.indexes[cursor.node as usize] + cursor.relative_index
     }
 
+    /// Creates an iterator starting at `cursor` and walking in `direction`.
+    ///
+    /// This is meant for callers that already have a [`Cursor`], such as a sorted
+    /// wrapper that performed a search and wants to scan forward/backward from an
+    /// insertion point. A cursor that is one-past-the-end is only valid for the
+    /// last node; in that case an ascending iterator is immediately done, while a
+    /// descending iterator starts at the last element.
+    ///
+    /// # Panics
+    /// Panics if `cursor` does not refer to the current structure.
     pub fn iterator_from_cursor<'a>(
         &'a self,
         mut cursor: Cursor,
@@ -980,6 +990,14 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Creates an iterator starting at the element with `absolute_index`.
+    ///
+    /// This is a convenience for search APIs that operate on absolute indexes
+    /// (e.g. binary search in a sorted wrapper) and then need to scan in either
+    /// direction without converting back to a cursor manually.
+    ///
+    /// # Panics
+    /// Panics if `absolute_index` is out of bounds.
     pub fn iterator_from_index<'a>(
         &'a self,
         absolute_index: u32,
