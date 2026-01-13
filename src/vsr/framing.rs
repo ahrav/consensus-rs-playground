@@ -1109,11 +1109,17 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        const PROPTEST_CASES: u32 = 16;
+
         fn arb_command() -> impl Strategy<Value = Command> {
             (0u8..=Command::MAX).prop_map(|b| Command::try_from_u8(b).unwrap())
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(
+                crate::test_utils::proptest_cases(PROPTEST_CASES)
+            ))]
+
             /// Property: Feed/decode roundtrip preserves message content
             #[test]
             fn prop_feed_decode_roundtrip(

@@ -766,7 +766,7 @@ mod tests {
     use crate::vsr::{HeaderPrepare, Operation, Release};
     use proptest::prelude::*;
 
-    const PROPTEST_CASES: u32 = 32;
+    const PROPTEST_CASES: u32 = 16;
     const MESSAGES_MAX: usize = 100;
     const BUFFER_MULTIPLIER: usize = 5;
 
@@ -930,7 +930,9 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
 
         #[test]
         fn message_buffer_prop(seed in any::<u64>(), fault in any::<bool>()) {

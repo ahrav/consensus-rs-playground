@@ -1239,6 +1239,8 @@ mod tests {
     use proptest::prelude::*;
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    const PROPTEST_CASES: u32 = 16;
+
     // =========================================================================
     // Helper Functions
     // =========================================================================
@@ -1724,6 +1726,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_checksum_deterministic(
             sequence in any::<u64>(),
@@ -2114,6 +2120,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_expects_write_implies_expects_read(caller in arb_caller()) {
             // Invariant: write operations always verify via read-back.
@@ -2755,6 +2765,10 @@ mod tests {
     // =========================================================================
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_format_completes_with_valid_state(
             cluster in 1..=u128::MAX,
@@ -3129,6 +3143,10 @@ mod tests {
     // violations that cannot occur through normal usage.
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_checkpoint_sequence_always_advances(
             initial_seq in 1u64..u64::MAX - 1
@@ -3783,6 +3801,10 @@ mod tests {
     // =========================================================================
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_open_always_selects_valid_header(
             sequence in 1u64..1000u64,

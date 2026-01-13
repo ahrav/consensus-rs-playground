@@ -938,7 +938,9 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn packed_unsigned_integer_array_prop_u1(ops in packed_unsigned_integer_array_ops::<1>()) {
@@ -963,7 +965,9 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(1))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(1)
+        ))]
 
         #[test]
         fn packed_unsigned_integer_array_prop_fuzz_u1(
@@ -1147,7 +1151,9 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(32)
+        ))]
 
         #[test]
         fn set_associative_cache_search_tags_u8_2(

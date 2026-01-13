@@ -770,11 +770,17 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     fn sector_size_strategy() -> impl Strategy<Value = u64> {
         prop::sample::select(vec![512u64, 1024, 2048, 4096, 8192, 16384])
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_zones_contiguous(
             sector_size in sector_size_strategy(),

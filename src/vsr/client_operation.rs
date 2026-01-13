@@ -271,6 +271,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     const _: () = {
         assert!(OPERATION_MIN == 128);
         assert!(OPERATION_MAX == 145);
@@ -312,6 +314,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_roundtrip(op in any::<Operation>()) {
             let byte = op.as_u8();

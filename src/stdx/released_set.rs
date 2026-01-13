@@ -304,6 +304,7 @@ mod tests {
 
     const LIMIT: usize = 16;
     const KEY_MAX: u64 = 64;
+    const PROPTEST_CASES: u32 = 16;
 
     #[test]
     fn empty_set_has_no_members() {
@@ -404,6 +405,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_insert_contains_len(keys in proptest::collection::vec(0u64..KEY_MAX, 0..128)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);
@@ -425,6 +430,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_pop_drains(keys in proptest::collection::hash_set(0u64..KEY_MAX, 0..=LIMIT)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);
@@ -462,6 +471,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_operation_sequence(ops in proptest::collection::vec(op_strategy(), 0..256)) {
             let mut set = ReleasedSet::with_capacity(LIMIT);

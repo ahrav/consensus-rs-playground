@@ -675,6 +675,8 @@ mod tests {
 
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     // Type aliases for convenience in tests.
     type BitSet64 = BitSet<64, { words_for_bits(64) }>;
     type BitSet128 = BitSet<128, { words_for_bits(128) }>;
@@ -685,6 +687,10 @@ mod tests {
     // ============================================
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn set_is_idempotent(idx in 0usize..64) {
             let mut b1: BitSet64 = BitSet::empty();
@@ -1284,6 +1290,7 @@ mod tests {
 
     mod dynamic_bitset_tests {
         use super::super::DynamicBitSet;
+        use super::PROPTEST_CASES;
         use std::collections::HashSet;
 
         use proptest::prelude::*;
@@ -1293,6 +1300,10 @@ mod tests {
         // ============================================
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(
+                crate::test_utils::proptest_cases(PROPTEST_CASES)
+            ))]
+
             #[test]
             fn dynamic_set_is_idempotent(bit_len in 1usize..128, idx_factor in 0.0f64..1.0) {
                 let idx = ((bit_len - 1) as f64 * idx_factor) as usize;

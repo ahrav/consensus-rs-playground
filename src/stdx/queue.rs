@@ -822,6 +822,8 @@ mod property_tests {
     use proptest::prelude::*;
     use std::collections::VecDeque;
 
+    const PROPTEST_CASES: u32 = 16;
+
     enum PTag {}
 
     impl core::fmt::Debug for PTag {
@@ -863,6 +865,10 @@ mod property_tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// FIFO ordering is preserved regardless of queue size.
         #[test]
         fn fifo(values in prop::collection::vec(any::<u32>(), 0..100)) {

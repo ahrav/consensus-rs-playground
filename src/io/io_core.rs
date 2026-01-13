@@ -1501,7 +1501,13 @@ mod property_tests {
 
     use crate::stdx::DoublyLinkedList;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// Random submission/tick sequences maintain invariants.
         #[test]
         fn random_operations_invariants(

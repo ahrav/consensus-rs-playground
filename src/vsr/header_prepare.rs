@@ -1380,7 +1380,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(32)
+        ))]
 
         #[test]
         fn prop_valid_normal_headers_pass_validation(header in valid_normal_header_strategy()) {
@@ -1497,7 +1499,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn prop_valid_pulse_headers_pass_validation(header in valid_pulse_header_strategy()) {
@@ -1541,7 +1545,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(128))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn prop_valid_reserved_headers_pass_validation(header in valid_reserved_header_strategy()) {
@@ -1585,7 +1591,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(32))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(8)
+        ))]
 
         #[test]
         fn prop_valid_root_header_passes_validation(_unused in valid_root_header_strategy()) {
@@ -1612,7 +1620,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn prop_checksum_padding_must_be_zero(

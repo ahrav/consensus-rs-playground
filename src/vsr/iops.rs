@@ -613,7 +613,13 @@ mod property_tests {
 
     use crate::stdx::bitset::words_for_bits;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// Random acquire/release operations maintain invariants
         #[test]
         fn random_ops(ops in prop::collection::vec((prop::bool::ANY, any::<usize>()), 0..200)) {

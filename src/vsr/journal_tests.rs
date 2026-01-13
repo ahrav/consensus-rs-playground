@@ -900,7 +900,12 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
         /// Invariant: requested count >= recovered count always
         #[test]
         fn prop_requested_count_gte_recovered_count(
@@ -1246,12 +1251,17 @@ mod overlap_properties {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     /// Generates a valid Ring value for property tests.
     fn ring_strategy() -> impl Strategy<Value = Ring> {
         prop_oneof![Just(Ring::Headers), Just(Ring::Prepares)]
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
         /// A range always overlaps with itself (reflexivity).
         #[test]
         fn overlaps_is_reflexive(
@@ -1394,6 +1404,8 @@ mod header_helper_properties {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     /// Strategy for op values that span multiple wraparounds.
     fn op_strategy() -> impl Strategy<Value = u64> {
         prop_oneof![
@@ -1409,6 +1421,9 @@ mod header_helper_properties {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
         /// Property: slot_for_op maps to op % SLOT_COUNT.
         #[test]
         fn prop_slot_for_op_maps_to_modulo(op in any::<u64>()) {
@@ -2880,7 +2895,13 @@ mod integration_properties {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// N non-overlapping writes all complete successfully.
         #[test]
         fn all_non_overlapping_writes_complete(

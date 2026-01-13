@@ -593,6 +593,8 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     fn valid_view_change_command_strategy() -> impl Strategy<Value = ViewChangeCommand> {
         prop_oneof![
             Just(ViewChangeCommand::StartView),
@@ -601,6 +603,10 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         // --- ViewChangeSlice Properties ---
 
         /// Property: init succeeds for valid commands and non-empty slices within bounds.

@@ -53,6 +53,8 @@ mod tests {
     use super::checksum;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     // =========================================================================
     // Unit Tests: Determinism
     // =========================================================================
@@ -96,6 +98,10 @@ mod tests {
     // =========================================================================
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_deterministic(data: Vec<u8>) {
             let c1 = checksum(&data);

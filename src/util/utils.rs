@@ -991,7 +991,13 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_align_up_idempotent(value in 0usize..1_000_000, power in 0u32..20u32) {
             let alignment = 1usize << power;

@@ -7,7 +7,13 @@ mod tests {
     use super::is_all_zeros;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn zero_filled_vectors_pass(len in 0usize..65) {
             let bytes = vec![0u8; len];

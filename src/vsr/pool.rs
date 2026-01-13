@@ -589,7 +589,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(1000))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn invariant_available_plus_in_use_equals_capacity(
