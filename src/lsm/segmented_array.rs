@@ -1942,7 +1942,7 @@ mod tests {
 
             {
                 let max_key = <T as SortedTestElement>::Key::max_value();
-                let mut it = self
+                let it = self
                     .array_ref()
                     .iterator_from_cursor(self.array_ref().search(max_key), Direction::Ascending);
                 for ptr in it {
