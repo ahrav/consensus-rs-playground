@@ -63,6 +63,14 @@ pub struct SegmentedArray<
     _marker: PhantomData<(T, P)>,
 }
 
+impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool> Default
+    for SegmentedArray<T, P, ELEMENT_COUNT_MAX, VERIFY>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     SegmentedArray<T, P, ELEMENT_COUNT_MAX, VERIFY>
 {
@@ -139,7 +147,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         assert!(size_of::<T>() > 0);
         assert!(Self::NODE_CAPACITY >= 2);
         assert!(Self::NODE_CAPACITY.is_multiple_of(2));
-        assert!((P::NODE_ALIGNMENT as usize) >= align_of::<T>());
+        assert!(P::NODE_ALIGNMENT >= align_of::<T>());
         assert!(ELEMENT_COUNT_MAX > Self::NODE_CAPACITY);
 
         let nodes = vec![None; Self::NODE_COUNT_MAX as usize];
@@ -585,9 +593,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
     /// Attempts to merge or rebalance `node` with its right neighbor.
     ///
-    /// Returns early if `node` is empty (caller handles removal separately). The
-    /// next node's elements are sliced from its backing buffer and forwarded to
-    /// `maybe_merge_nodes`. Caller must ensure `node + 1` is in-bounds.
+    /// Removes `node` when it becomes empty, otherwise returns early if it is the last node.
+    /// The next node's elements are sliced from its backing buffer and forwarded to
+    /// `maybe_merge_nodes`.
     fn maybe_remove_or_merge_node_with_next(&mut self, pool: &mut P, node: u32) {
         assert!(node < self.node_count);
 
@@ -699,7 +707,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
     fn insert_empty_node_at(&mut self, pool: &mut P, node: u32) {
         assert!(node <= self.node_count);
-        assert!(self.node_count + 1 <= Self::NODE_COUNT_MAX);
+        assert!(self.node_count < Self::NODE_COUNT_MAX);
 
         let node = node as usize;
         let node_count = self.node_count as usize;
@@ -874,6 +882,12 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     }
 
     #[inline]
+    /// Returns `true` if the array contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.node_count == 0
+    }
+
+    #[inline]
     /// Returns the total number of elements across all nodes.
     pub fn len(&self) -> u32 {
         let result = self.indexes[self.node_count as usize];
@@ -899,5 +913,370 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
 
         self.indexes[cursor.node as usize] + cursor.relative_index
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SegmentedArray;
+    use crate::lsm::node_pool::{NodePool, NodePoolType};
+    use crate::stdx::fastrange::fast_range;
+    use proptest::prelude::*;
+    use proptest::test_runner::{RngAlgorithm, TestRng};
+    use std::fmt::Debug;
+
+    #[repr(C, align(16))]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    struct TestTableInfo {
+        words: [u64; 12],
+    }
+
+    trait TestElement: Copy + Eq + Debug {
+        fn random(rng: &mut TestRng) -> Self;
+    }
+
+    impl TestElement for u32 {
+        fn random(rng: &mut TestRng) -> Self {
+            rng.next_u32()
+        }
+    }
+
+    impl TestElement for TestTableInfo {
+        fn random(rng: &mut TestRng) -> Self {
+            let mut words = [0u64; 12];
+            for word in &mut words {
+                *word = rng.next_u64();
+            }
+            TestTableInfo { words }
+        }
+    }
+
+    fn rng_from_seed(seed: u64, salt: u64) -> TestRng {
+        let mixed = seed ^ salt.wrapping_mul(0x9e3779b97f4a7c15);
+        let mut bytes = [0u8; 32];
+        bytes[0..8].copy_from_slice(&mixed.to_le_bytes());
+        bytes[8..16].copy_from_slice(&seed.rotate_left(17).to_le_bytes());
+        bytes[16..24].copy_from_slice(&salt.to_le_bytes());
+        bytes[24..32].copy_from_slice(&mixed.rotate_left(32).to_le_bytes());
+        TestRng::from_seed(RngAlgorithm::ChaCha, &bytes)
+    }
+
+    fn range_inclusive(rng: &mut TestRng, max: u32) -> u32 {
+        if max == u32::MAX {
+            return rng.next_u32();
+        }
+        let p = (max as u64) + 1;
+        fast_range(rng.next_u64(), p) as u32
+    }
+
+    struct FuzzHarness<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32> {
+        rng: TestRng,
+        pool: P,
+        array: Option<SegmentedArray<T, P, ELEMENT_COUNT_MAX, true>>,
+        reference: Vec<T>,
+        inserts: u64,
+        removes: u64,
+    }
+
+    impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32> Drop
+        for FuzzHarness<T, P, ELEMENT_COUNT_MAX>
+    {
+        fn drop(&mut self) {
+            if let Some(array) = self.array.take() {
+                array.deinit(&mut self.pool);
+            }
+        }
+    }
+
+    impl<T: TestElement, P: NodePool, const ELEMENT_COUNT_MAX: u32>
+        FuzzHarness<T, P, ELEMENT_COUNT_MAX>
+    {
+        fn new(
+            rng: TestRng,
+            pool: P,
+            array: SegmentedArray<T, P, ELEMENT_COUNT_MAX, true>,
+        ) -> Self {
+            Self {
+                rng,
+                pool,
+                array: Some(array),
+                reference: Vec::with_capacity(ELEMENT_COUNT_MAX as usize),
+                inserts: 0,
+                removes: 0,
+            }
+        }
+
+        fn array_ref(&self) -> &SegmentedArray<T, P, ELEMENT_COUNT_MAX, true> {
+            self.array.as_ref().expect("array missing")
+        }
+
+        fn array_mut(&mut self) -> &mut SegmentedArray<T, P, ELEMENT_COUNT_MAX, true> {
+            self.array.as_mut().expect("array missing")
+        }
+
+        fn run_phase(&mut self, steps: usize, insert_weight: u32, remove_weight: u32) {
+            let total = insert_weight + remove_weight;
+            for _ in 0..steps {
+                let roll = range_inclusive(&mut self.rng, total - 1);
+                if roll < insert_weight {
+                    self.insert();
+                } else {
+                    self.remove();
+                }
+            }
+        }
+
+        fn insert(&mut self) {
+            let reference_len = self.reference.len() as u32;
+            let count_free = ELEMENT_COUNT_MAX - reference_len;
+
+            if count_free == 0 {
+                return;
+            }
+
+            let node_capacity = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, true>::NODE_CAPACITY;
+            let count_max = count_free.min(node_capacity.saturating_mul(3));
+            let count = range_inclusive(&mut self.rng, count_max - 1) + 1;
+            let index = range_inclusive(&mut self.rng, reference_len);
+
+            let mut elements = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                elements.push(T::random(&mut self.rng));
+            }
+
+            let array = self.array.as_mut().expect("array missing");
+            array.insert_elements(&mut self.pool, index, &elements);
+            let insert_at = index as usize;
+            let _ = self
+                .reference
+                .splice(insert_at..insert_at, elements.iter().copied());
+
+            self.inserts += count as u64;
+            self.verify();
+        }
+
+        fn remove(&mut self) {
+            let reference_len = self.reference.len() as u32;
+            if reference_len == 0 {
+                return;
+            }
+
+            let node_capacity = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, true>::NODE_CAPACITY;
+            let count_max = reference_len.min(node_capacity.saturating_mul(3));
+            let count = range_inclusive(&mut self.rng, count_max - 1) + 1;
+            let index = range_inclusive(&mut self.rng, reference_len - count);
+
+            let array = self.array.as_mut().expect("array missing");
+            array.remove_elements(&mut self.pool, index, count);
+            let start = index as usize;
+            let end = start + count as usize;
+            self.reference.drain(start..end);
+
+            self.removes += count as u64;
+            self.verify();
+        }
+
+        fn insert_before_first(&mut self) {
+            let insert_index = self
+                .array_ref()
+                .absolute_index_for_cursor(self.array_ref().first());
+            let element = T::random(&mut self.rng);
+
+            let array = self.array.as_mut().expect("array missing");
+            array.insert_elements(&mut self.pool, insert_index, &[element]);
+            self.reference.insert(insert_index as usize, element);
+
+            self.inserts += 1;
+            self.verify();
+        }
+
+        fn remove_last(&mut self) {
+            let remove_index = self
+                .array_ref()
+                .absolute_index_for_cursor(self.array_ref().last());
+
+            let array = self.array.as_mut().expect("array missing");
+            array.remove_elements(&mut self.pool, remove_index, 1);
+            self.reference.remove(remove_index as usize);
+
+            self.removes += 1;
+            self.verify();
+        }
+
+        fn remove_all(&mut self) {
+            while !self.reference.is_empty() {
+                self.remove();
+            }
+
+            assert_eq!(0, self.array_ref().len());
+            assert!(self.inserts > 0);
+            assert_eq!(self.inserts, self.removes);
+
+            self.verify();
+        }
+
+        fn verify(&self) {
+            let array = self.array_ref();
+            array.verify();
+
+            assert_eq!(self.reference.len() as u32, array.len());
+
+            let mut actual = Vec::with_capacity(self.reference.len());
+            for node in 0..array.node_count {
+                actual.extend_from_slice(array.node_elements(node));
+            }
+            assert_eq!(self.reference, actual);
+
+            let mut actual_rev = Vec::with_capacity(self.reference.len());
+            let mut node = array.node_count;
+            while node > 0 {
+                node -= 1;
+                let elements = array.node_elements(node);
+                for element in elements.iter().rev() {
+                    actual_rev.push(*element);
+                }
+            }
+            let mut expected_rev = self.reference.clone();
+            expected_rev.reverse();
+            assert_eq!(expected_rev, actual_rev);
+
+            if !self.reference.is_empty() {
+                for (index, _) in self.reference.iter().enumerate() {
+                    let absolute = index as u32;
+                    let cursor = array.cursor_for_absolute_index(absolute);
+                    assert_eq!(absolute, array.absolute_index_for_cursor(cursor));
+                }
+            }
+
+            if array.len() == 0 {
+                assert_eq!(array.node_count, 0);
+            }
+
+            for node in &array.nodes[array.node_count as usize..] {
+                assert!(node.is_none());
+            }
+
+            let half = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, true>::NODE_CAPACITY / 2;
+            if array.node_count > 1 {
+                for node in 0..array.node_count - 1 {
+                    assert!(array.count(node) >= half);
+                }
+            }
+        }
+    }
+
+    fn run_unsorted_case<
+        T: TestElement,
+        const NODE_SIZE: usize,
+        const NODE_ALIGNMENT: usize,
+        const ELEMENT_COUNT_MAX: u32,
+    >(
+        seed: u64,
+        salt: u64,
+    ) {
+        let rng = rng_from_seed(seed, salt);
+        let node_count_max = SegmentedArray::<
+            T,
+            NodePoolType<{ NODE_SIZE }, { NODE_ALIGNMENT }>,
+            { ELEMENT_COUNT_MAX },
+            true,
+        >::NODE_COUNT_MAX;
+        let pool = NodePoolType::<{ NODE_SIZE }, { NODE_ALIGNMENT }>::init(node_count_max);
+        let array = SegmentedArray::<
+            T,
+            NodePoolType<{ NODE_SIZE }, { NODE_ALIGNMENT }>,
+            { ELEMENT_COUNT_MAX },
+            true,
+        >::new();
+
+        let mut context = FuzzHarness::new(rng, pool, array);
+        let steps = (ELEMENT_COUNT_MAX as usize) * 2;
+
+        context.run_phase(steps, 60, 40);
+        context.run_phase(steps, 40, 60);
+
+        if context.inserts > 0 {
+            context.remove_all();
+        }
+
+        while context.array_ref().len() < ELEMENT_COUNT_MAX {
+            context.insert_before_first();
+        }
+
+        {
+            let array = context.array_ref();
+            assert!(array.node_count >= node_count_max.saturating_sub(1));
+        }
+
+        let last_count = context
+            .array_ref()
+            .count(context.array_ref().node_count - 1);
+        for _ in 0..(last_count.saturating_sub(1) as usize) {
+            context.remove_last();
+            context.insert_before_first();
+        }
+
+        {
+            let array = context.array_ref();
+            assert_eq!(array.node_count, node_count_max);
+        }
+
+        context.remove_all();
+    }
+
+    fn run_all_unsorted_cases(seed: u64) {
+        let mut tested_padding = false;
+        let mut tested_node_capacity_min = false;
+        let mut salt = 0u64;
+
+        macro_rules! run_case {
+            ($ty:ty, $node_size:expr, $node_alignment:expr, $element_count_max:expr) => {{
+                salt = salt.wrapping_add(1);
+                run_unsorted_case::<$ty, $node_size, $node_alignment, $element_count_max>(
+                    seed, salt,
+                );
+                if $node_size % std::mem::size_of::<$ty>() != 0 {
+                    tested_padding = true;
+                }
+                type Array = SegmentedArray<
+                    $ty,
+                    NodePoolType<$node_size, $node_alignment>,
+                    $element_count_max,
+                    true,
+                >;
+                if Array::NODE_CAPACITY == 2 {
+                    tested_node_capacity_min = true;
+                }
+            }};
+        }
+
+        run_case!(u32, 8, 8, 3);
+        run_case!(u32, 8, 8, 4);
+        run_case!(u32, 8, 8, 5);
+        run_case!(u32, 8, 8, 6);
+        run_case!(u32, 8, 8, 1024);
+        run_case!(u32, 16, 8, 1024);
+        run_case!(u32, 32, 8, 1024);
+        run_case!(u32, 64, 8, 1024);
+        run_case!(TestTableInfo, 256, 32, 3);
+        run_case!(TestTableInfo, 256, 32, 4);
+        run_case!(TestTableInfo, 256, 32, 1024);
+        run_case!(TestTableInfo, 512, 32, 1024);
+        run_case!(TestTableInfo, 1024, 32, 1024);
+
+        assert!(tested_padding);
+        assert!(tested_node_capacity_min);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 8,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn segmented_array_unsorted_fuzz(seed in any::<u64>()) {
+            run_all_unsorted_cases(seed);
+        }
     }
 }
