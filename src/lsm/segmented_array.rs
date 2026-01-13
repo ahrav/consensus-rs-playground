@@ -209,7 +209,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
         self.node_count = 0;
         self.nodes.fill(None);
-        self.indexes[0] = 0;
+        self.indexes.fill(0);
 
         if VERIFY {
             self.verify();
