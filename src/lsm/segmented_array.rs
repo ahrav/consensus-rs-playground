@@ -1905,7 +1905,7 @@ mod tests {
                 }
             }
 
-            if array.len() == 0 {
+            if array.is_empty() {
                 assert_eq!(array.base.node_count, 0);
             }
 
@@ -1945,7 +1945,7 @@ mod tests {
                 let mut it = self
                     .array_ref()
                     .iterator_from_cursor(self.array_ref().search(max_key), Direction::Ascending);
-                while let Some(ptr) = it.next() {
+                for ptr in it {
                     let value = unsafe { *ptr };
                     let key =
                         <<T as SortedTestElement>::KeyExtractor as KeyFromValue<T>>::key_from_value(
