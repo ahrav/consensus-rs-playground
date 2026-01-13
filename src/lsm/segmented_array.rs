@@ -12,6 +12,9 @@ use crate::lsm::{
     node_pool::NodePool,
 };
 
+/// Traversal direction for segmented array iteration.
+///
+/// `Ascending` walks from the start toward the end; `Descending` walks in reverse.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub enum Direction {
@@ -30,6 +33,11 @@ impl Direction {
     }
 }
 
+/// Identifies a position within a segmented array node.
+///
+/// `node` is the node index; `relative_index` is the offset within that node.
+/// For the last node, `relative_index` may equal the node's element count to
+/// represent a one-past-the-end insertion point.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct Cursor {
     pub node: u32,
@@ -965,7 +973,9 @@ mod tests {
     }
 
     fn env_u32(name: &str) -> Option<u32> {
-        std::env::var(name).ok().and_then(|value| value.parse().ok())
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
     }
 
     fn proptest_cases() -> u32 {
@@ -973,9 +983,11 @@ mod tests {
     }
 
     fn fuzz_steps(element_count_max: u32) -> usize {
-        let multiplier =
-            env_u32("SEGMENTED_ARRAY_FUZZ_STEPS_MULTIPLIER").unwrap_or(DEFAULT_FUZZ_STEPS_MULTIPLIER);
-        (element_count_max as usize).saturating_mul(multiplier as usize).max(1)
+        let multiplier = env_u32("SEGMENTED_ARRAY_FUZZ_STEPS_MULTIPLIER")
+            .unwrap_or(DEFAULT_FUZZ_STEPS_MULTIPLIER);
+        (element_count_max as usize)
+            .saturating_mul(multiplier as usize)
+            .max(1)
     }
 
     fn range_inclusive(rng: &mut TestRng, max: u32) -> u32 {
