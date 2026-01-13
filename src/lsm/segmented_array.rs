@@ -931,6 +931,9 @@ mod tests {
         words: [u64; 12],
     }
 
+    const DEFAULT_PROPTEST_CASES: u32 = 2;
+    const DEFAULT_FUZZ_STEPS_MULTIPLIER: u32 = 1;
+
     trait TestElement: Copy + Eq + Debug {
         fn random(rng: &mut TestRng) -> Self;
     }
@@ -959,6 +962,20 @@ mod tests {
         bytes[16..24].copy_from_slice(&salt.to_le_bytes());
         bytes[24..32].copy_from_slice(&mixed.rotate_left(32).to_le_bytes());
         TestRng::from_seed(RngAlgorithm::ChaCha, &bytes)
+    }
+
+    fn env_u32(name: &str) -> Option<u32> {
+        std::env::var(name).ok().and_then(|value| value.parse().ok())
+    }
+
+    fn proptest_cases() -> u32 {
+        env_u32("SEGMENTED_ARRAY_PROPTEST_CASES").unwrap_or(DEFAULT_PROPTEST_CASES)
+    }
+
+    fn fuzz_steps(element_count_max: u32) -> usize {
+        let multiplier =
+            env_u32("SEGMENTED_ARRAY_FUZZ_STEPS_MULTIPLIER").unwrap_or(DEFAULT_FUZZ_STEPS_MULTIPLIER);
+        (element_count_max as usize).saturating_mul(multiplier as usize).max(1)
     }
 
     fn range_inclusive(rng: &mut TestRng, max: u32) -> u32 {
@@ -1190,7 +1207,7 @@ mod tests {
         >::new();
 
         let mut context = FuzzHarness::new(rng, pool, array);
-        let steps = (ELEMENT_COUNT_MAX as usize) * 2;
+        let steps = fuzz_steps(ELEMENT_COUNT_MAX);
 
         context.run_phase(steps, 60, 40);
         context.run_phase(steps, 40, 60);
@@ -1269,10 +1286,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig {
-            cases: 8,
-            .. ProptestConfig::default()
-        })]
+        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
 
         #[test]
         fn segmented_array_unsorted_fuzz(seed in any::<u64>()) {
