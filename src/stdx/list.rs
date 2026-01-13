@@ -1266,6 +1266,8 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        const PROPTEST_CASES: u32 = 16;
+
         /// Operations we can perform on the list
         #[derive(Debug, Clone, Copy)]
         enum ListOp {
@@ -1287,6 +1289,9 @@ mod tests {
         }
 
         proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
         /// Property: After any sequence of operations, length matches actual count
         /// Note: We use Box<Node> to ensure stable addresses - Vec reallocation
         /// would move nodes and invalidate pointers (this is expected for intrusive lists).

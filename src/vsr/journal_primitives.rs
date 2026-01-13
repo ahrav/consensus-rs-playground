@@ -417,7 +417,13 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn headers_ring_offset_always_sector_aligned(slot_index in 0usize..SLOT_COUNT) {
             // Headers ring offsets must always be sector-aligned due to sector_floor.

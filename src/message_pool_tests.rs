@@ -545,7 +545,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
 
         /// Property: After any sequence of acquire/release/clone operations,
         /// the pool maintains the invariant that all buffers are either in-use or available.

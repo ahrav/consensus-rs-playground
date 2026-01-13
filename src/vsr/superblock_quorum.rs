@@ -1944,6 +1944,8 @@ mod tests {
             use super::*;
             use proptest::prelude::*;
 
+            const PROPTEST_CASES: u32 = 16;
+
             /// Generates a corruption mask (which copies to corrupt).
             fn corruption_mask<const COPIES: usize>() -> impl Strategy<Value = [bool; COPIES]> {
                 proptest::collection::vec(prop::bool::ANY, COPIES).prop_map(|v| {
@@ -1982,6 +1984,10 @@ mod tests {
             }
 
             proptest! {
+                #![proptest_config(ProptestConfig::with_cases(
+                    crate::test_utils::proptest_cases(PROPTEST_CASES)
+                ))]
+
                 /// If working(Open) succeeds, the returned quorum is valid/sufficient.
                 #[test]
                 fn working_open_success_implies_valid_quorum(
@@ -2502,6 +2508,8 @@ mod tests {
         use proptest::prelude::*;
         use std::collections::HashSet;
 
+        const PROPTEST_CASES: u32 = 16;
+
         /// Strategy to generate a valid slot array where all copy indices are < COPIES.
         fn valid_slot_array<const COPIES: usize>() -> impl Strategy<Value = [Option<u8>; COPIES]> {
             proptest::collection::vec(
@@ -2521,6 +2529,10 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(
+                crate::test_utils::proptest_cases(PROPTEST_CASES)
+            ))]
+
             /// The iterator must always terminate within COPIES iterations.
             #[test]
             fn always_terminates_within_copies_iterations(

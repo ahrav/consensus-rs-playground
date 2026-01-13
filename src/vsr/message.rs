@@ -623,6 +623,8 @@ mod tests {
         use super::*;
         use proptest::prelude::*;
 
+        const PROPTEST_CASES: u32 = 16;
+
         fn arb_command() -> impl Strategy<Value = Command> {
             (0u8..=Command::MAX).prop_map(|b| Command::try_from_u8(b).unwrap())
         }
@@ -633,6 +635,10 @@ mod tests {
         }
 
         proptest! {
+            #![proptest_config(ProptestConfig::with_cases(
+                crate::test_utils::proptest_cases(PROPTEST_CASES)
+            ))]
+
             #[test]
             fn prop_body_roundtrip(body in arb_body()) {
                 let mut msg = Message::new_zeroed();

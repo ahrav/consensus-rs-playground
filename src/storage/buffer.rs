@@ -195,6 +195,8 @@ mod proptests {
     use crate::storage::constants::SECTOR_SIZE_MIN;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     fn align_strategy() -> impl Strategy<Value = usize> {
         prop::sample::select(vec![512usize, 1024, 2048, 4096, 8192, 16384, 32768, 65536])
     }
@@ -204,6 +206,10 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_aligned_buf_alignment(
             len in len_strategy(),

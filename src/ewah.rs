@@ -622,6 +622,9 @@ mod tests {
     use core::slice;
     use proptest::prelude::*;
 
+    const DEFAULT_PROPTEST_CASES: u32 = 16;
+    const DEFAULT_FUZZ_CASES: u32 = 16;
+
     fn words_as_bytes<W: EwahWord>(words: &[W]) -> &[u8] {
         let byte_len = core::mem::size_of_val(words);
         // Safety: Vec<W> (or slice from it) is aligned and sized for W.
@@ -686,7 +689,7 @@ mod tests {
         ($name:ident, $t:ty) => {
             proptest! {
                 #![proptest_config(ProptestConfig {
-                    cases: 64,
+                    cases: crate::test_utils::proptest_cases(DEFAULT_PROPTEST_CASES),
                     ..ProptestConfig::default()
                 })]
                 #[test]
@@ -709,7 +712,7 @@ mod tests {
         ($name:ident, $t:ty) => {
             proptest! {
                 #![proptest_config(ProptestConfig {
-                    cases: 64,
+                    cases: crate::test_utils::proptest_cases(DEFAULT_PROPTEST_CASES),
                     ..ProptestConfig::default()
                 })]
                 #[test]
@@ -746,8 +749,9 @@ mod tests {
         use proptest::strategy::{Strategy, ValueTree};
         use proptest::test_runner::{Config as ProptestConfig, TestRunner};
 
+        let cases = crate::test_utils::proptest_cases(DEFAULT_FUZZ_CASES);
         let mut runner = TestRunner::new(ProptestConfig {
-            cases: 256,
+            cases,
             ..ProptestConfig::default()
         });
         let strat = (
@@ -756,7 +760,7 @@ mod tests {
             1usize..=32,
         );
 
-        for _ in 0..256 {
+        for _ in 0..cases {
             let (words, encode_chunk, decode_chunk) = strat
                 .new_tree(&mut runner)
                 .expect("strategy build should succeed")

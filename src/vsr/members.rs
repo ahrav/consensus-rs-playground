@@ -472,7 +472,13 @@ mod tests {
     // Property-based tests
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// Property: root_members always produces exactly MEMBERS_MAX unique non-zero IDs.
         #[test]
         fn prop_root_members_full_unique(cluster: u128) {

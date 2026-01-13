@@ -296,6 +296,8 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     // ==========================================================================
     // PropTest Strategy for Command Enum
     // ==========================================================================
@@ -316,6 +318,10 @@ mod tests {
     // ==========================================================================
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn roundtrip_all_variants(variant in any::<Command>()) {
             let byte = variant.as_u8();

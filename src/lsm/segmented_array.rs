@@ -18,7 +18,9 @@ use crate::lsm::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub enum Direction {
+    /// Iterate from low to high indices.
     Ascending = 0,
+    /// Iterate from high to low indices.
     Descending = 1,
 }
 
@@ -972,19 +974,8 @@ mod tests {
         TestRng::from_seed(RngAlgorithm::ChaCha, &bytes)
     }
 
-    fn env_u32(name: &str) -> Option<u32> {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-    }
-
-    fn proptest_cases() -> u32 {
-        env_u32("SEGMENTED_ARRAY_PROPTEST_CASES").unwrap_or(DEFAULT_PROPTEST_CASES)
-    }
-
     fn fuzz_steps(element_count_max: u32) -> usize {
-        let multiplier = env_u32("SEGMENTED_ARRAY_FUZZ_STEPS_MULTIPLIER")
-            .unwrap_or(DEFAULT_FUZZ_STEPS_MULTIPLIER);
+        let multiplier = crate::test_utils::proptest_fuzz_multiplier(DEFAULT_FUZZ_STEPS_MULTIPLIER);
         (element_count_max as usize)
             .saturating_mul(multiplier as usize)
             .max(1)
@@ -1298,7 +1289,9 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(proptest_cases()))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(DEFAULT_PROPTEST_CASES)
+        ))]
 
         #[test]
         fn segmented_array_unsorted_fuzz(seed in any::<u64>()) {

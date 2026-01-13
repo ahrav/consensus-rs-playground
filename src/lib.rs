@@ -11,3 +11,6 @@ pub mod stdx;
 pub mod storage;
 pub mod util;
 pub mod vsr;
+
+#[cfg(test)]
+pub mod test_utils;

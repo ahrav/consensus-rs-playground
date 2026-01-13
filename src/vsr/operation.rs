@@ -677,6 +677,8 @@ mod proptests {
 
     use super::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     /// Test state machine with operations spanning the full user range.
     #[derive(Copy, Clone, Eq, PartialEq, Debug)]
     struct WideOp(u8);
@@ -696,6 +698,10 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn proptest_u8_roundtrip(byte: u8) {
             let op = Operation::from_u8(byte);

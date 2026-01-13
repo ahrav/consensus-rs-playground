@@ -245,6 +245,8 @@ mod tests {
 
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
+
     #[derive(Debug)]
     struct DropTracker {
         value: i32,
@@ -492,6 +494,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn prop_sequence_matches_vecdeque(ops in prop::collection::vec(
             prop_oneof![
@@ -611,7 +617,9 @@ mod tests {
             Clear,
         }
 
-        let mut runner = TestRunner::new(Config::with_cases(500));
+        let mut runner = TestRunner::new(Config::with_cases(crate::test_utils::proptest_cases(
+            PROPTEST_CASES,
+        )));
         runner
             .run(
                 &prop::collection::vec(

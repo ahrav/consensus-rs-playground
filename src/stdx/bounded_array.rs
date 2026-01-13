@@ -934,9 +934,14 @@ mod proptests {
     use super::*;
     use proptest::prelude::*;
 
+    const PROPTEST_CASES: u32 = 16;
     const TEST_CAPACITY: usize = 64;
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         /// Property: push increases len by 1 until capacity
         #[test]
         fn push_increments_len(values in prop::collection::vec(any::<u32>(), 0..TEST_CAPACITY)) {

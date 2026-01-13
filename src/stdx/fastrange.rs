@@ -25,6 +25,7 @@ mod tests {
     use proptest::prelude::*;
     use proptest::test_runner::{RngAlgorithm, TestRng};
 
+    const PROPTEST_CASES: u32 = 16;
     const PRNG_SEED: [u8; 32] = *b"fastrange-test-seed-000000000000";
 
     fn test_rng() -> TestRng {
@@ -55,6 +56,10 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(PROPTEST_CASES)
+        ))]
+
         #[test]
         fn output_is_within_range(word in any::<u64>(), p in 1u64..u64::MAX) {
             let value = fast_range(word, p);

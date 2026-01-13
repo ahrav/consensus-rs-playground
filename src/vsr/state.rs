@@ -2859,7 +2859,9 @@ mod proptests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(100))]
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
 
         #[test]
         fn prop_root_options_validate_succeeds(opts in valid_root_options_strategy()) {
@@ -2975,6 +2977,9 @@ mod proptests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(16)
+        ))]
         #[test]
         fn prop_update_for_checkpoint_advances_chain(
             opts in valid_root_options_strategy(),

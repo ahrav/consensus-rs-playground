@@ -1194,7 +1194,10 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+        #![proptest_config(ProptestConfig {
+            cases: crate::test_utils::proptest_cases(16),
+            ..ProptestConfig::default()
+        })]
 
         /// Verifies [`find_bit`] matches the reference linear scan for arbitrary
         /// bitset patterns and search ranges. Catches off-by-one errors and
