@@ -1156,6 +1156,14 @@ pub struct SortedSegmentedArray<
 }
 
 impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, const VERIFY: bool>
+    Default for SortedSegmentedArray<T, P, ELEMENT_COUNT_MAX, KF, VERIFY>
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, const VERIFY: bool>
     SortedSegmentedArray<T, P, ELEMENT_COUNT_MAX, KF, VERIFY>
 {
     /// Maximum number of elements per node, inherited from `SegmentedArray`.
@@ -1200,6 +1208,11 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, co
     /// Returns the total number of elements across all nodes.
     pub fn len(&self) -> u32 {
         self.base.len()
+    }
+
+    /// Returns `true` if the array contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.base.is_empty()
     }
 
     /// Returns the initialized elements slice for `node`.
