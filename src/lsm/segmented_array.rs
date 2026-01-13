@@ -1015,7 +1015,7 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
                     node: 0,
                     relative_index: 0,
                 },
-                done: false,
+                done: true,
                 _marker: PhantomData,
             };
         }
@@ -1057,7 +1057,9 @@ impl<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     ///
     /// The returned pointer remains valid as long as the underlying array is not
     /// structurally modified. Mutating the element's value in place is expected.
-    pub fn next(&mut self) -> Option<*mut T> {
+    ///
+    /// The `std::iter::Iterator` implementation delegates to this method.
+    pub fn next_ptr(&mut self) -> Option<*mut T> {
         if self.done {
             return None;
         }
@@ -1103,6 +1105,17 @@ impl<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
 
         Some(element_ptr)
+    }
+}
+
+impl<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool> std::iter::Iterator
+    for Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY>
+{
+    type Item = *mut T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_ptr()
     }
 }
 
