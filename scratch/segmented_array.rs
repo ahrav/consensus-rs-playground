@@ -962,14 +962,16 @@ impl<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         let node = self.cursor.node;
         let rel = self.cursor.relative_index as usize;
 
-        let elements = array.node_elements(node);
-        assert!(rel < elements.len());
+        let count = array.count(node) as usize;
+        assert!(rel < count);
 
-        let element_ptr = unsafe { elements.as_ptr().add(rel) as *mut T };
+        let node_ptr = array.nodes[node as usize].expect("node missing");
+        let element_ptr =
+            unsafe { (node_ptr.as_ptr() as *mut MaybeUninit<T>).add(rel) as *mut T };
 
         match self.direction {
             Direction::Ascending => {
-                if rel == elements.len() - 1 {
+                if rel == count - 1 {
                     if node == array.node_count - 1 {
                         self.done = true;
                     } else {
