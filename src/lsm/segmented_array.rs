@@ -435,6 +435,123 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Removes a small batch starting at `absolute_index`.
+    ///
+    /// The batch size is capped at `NODE_CAPACITY / 2` so we only touch `a` and
+    /// its right neighbor `b`, and can restore the half-full invariant locally
+    /// (shift within a node, rebalance, or merge) without cascading updates.
+    fn remove_elements_batch(&mut self, pool: &mut P, absolute_index: u32, remove_count: u32) {
+        let half = Self::NODE_CAPACITY / 2;
+
+        assert!(self.node_count > 0);
+        assert!(remove_count > 0);
+        assert!(remove_count <= half);
+        assert!((absolute_index as u64 + remove_count as u64) <= ELEMENT_COUNT_MAX as u64);
+        assert!(absolute_index + remove_count <= self.len());
+
+        let cursor = self.cursor_for_absolute_index(absolute_index);
+        assert!(cursor.node < self.node_count);
+        let a = cursor.node;
+        let a_ptr = self.nodes[a as usize].expect("node missing");
+
+        let a_remaining = cursor.relative_index;
+        let a_count = self.count(a);
+
+        if a_remaining + remove_count <= a_count {
+            // Removal stays within `a`: shift the tail left to fill the gap.
+            let buf = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+
+            let start = a_remaining as usize;
+            let src_start = (a_remaining + remove_count) as usize;
+            let count = a_count as usize;
+
+            let len_to_move = count - src_start;
+            unsafe {
+                ptr::copy(
+                    buf.as_ptr().add(src_start),
+                    buf.as_mut_ptr().add(start),
+                    len_to_move,
+                )
+            };
+
+            self.decrement_indexes_after(a, remove_count);
+            // `a` might have dropped below half full; rebalance with its neighbor.
+            self.maybe_remove_or_merge_node_with_next(pool, a);
+            return;
+        }
+
+        // Removal crosses the boundary: drop the tail of `a` and the head of `b`.
+        let b = a + 1;
+        let b_ptr = self.nodes[b as usize].expect("missing node");
+
+        let removed_from_a = a_count - a_remaining;
+        let removed_from_b = remove_count - removed_from_a;
+        assert!(removed_from_b > 0);
+
+        let b_count = self.count(b);
+        let b_remaining_len = b_count - removed_from_b;
+        assert!(a_remaining > 0 || b_remaining_len > 0);
+
+        if a_remaining >= half {
+            // Keep 'a' (still >= half full), shift remaining of 'b' to left.
+            let buf_b = unsafe { Self::node_buf_from_ptr_mut(b_ptr) };
+
+            let src_start = removed_from_b as usize;
+            let count = b_count as usize;
+            let len_to_move = count - src_start;
+
+            unsafe {
+                ptr::copy(
+                    buf_b.as_ptr().add(src_start),
+                    buf_b.as_mut_ptr(),
+                    len_to_move,
+                )
+            };
+
+            self.indexes[b as usize] = self.indexes[a as usize] + a_remaining;
+            self.decrement_indexes_after(b, remove_count);
+            // `b` may be underfull after shifting; fix by merging/rebalancing with its next.
+            self.maybe_remove_or_merge_node_with_next(pool, b);
+            return;
+        }
+
+        // Snapshot the logical remainder of `b` after removing its prefix.
+        let b_remaining_slice = {
+            let buf_b = unsafe { Self::node_buf_from_ptr(b_ptr) };
+            let start = removed_from_b as usize;
+            let end = (removed_from_b + b_remaining_len) as usize;
+            &buf_b[start..end]
+        };
+
+        if b_remaining_len >= half {
+            // Keep 'b' (still >= half full), maybe rebalance by moving some of 'b' into 'a'.
+            self.indexes[b as usize] = self.indexes[a as usize] + a_remaining;
+            self.decrement_indexes_after(b, remove_count);
+            // Use the sliced remainder as the logical contents of `b` while rebalancing.
+            self.maybe_merge_nodes(pool, a, b_remaining_slice);
+        } else {
+            // Merge all remaining of 'b' into 'a' then remove empty 'b'.
+            let buf_a = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+            let dst_start = a_remaining as usize;
+            let dst_end = (a_remaining + b_remaining_len) as usize;
+            let dst = &mut buf_a[dst_start..dst_end];
+
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    b_remaining_slice.as_ptr(),
+                    dst.as_mut_ptr(),
+                    b_remaining_slice.len(),
+                )
+            };
+
+            self.indexes[b as usize] = self.indexes[a as usize] + a_remaining + b_remaining_len;
+            self.decrement_indexes_after(b, remove_count);
+            self.remove_empty_node_at(pool, b);
+
+            assert!(b == self.node_count || self.count(a) >= half);
+        }
+    }
+
     /// Attempts to merge or rebalance `node` with its right neighbor.
     ///
     /// Returns early if `node` is empty (caller handles removal separately). The
