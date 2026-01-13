@@ -435,6 +435,36 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Removes `remove_count` elements starting at `absolute_index`.
+    ///
+    /// The work is chunked into half-node batches so each step only needs to touch
+    /// `a` and its neighbor `b`, preserving the half-full invariant locally and
+    /// avoiding rebalancing cascades across many nodes.
+    pub fn remove_elements(&mut self, pool: &mut P, absolute_index: u32, remove_count: u32) {
+        if VERIFY {
+            self.verify();
+        }
+
+        assert!(self.node_count > 0);
+        assert!(remove_count > 0);
+        assert!((absolute_index as u64 + remove_count as u64) <= ELEMENT_COUNT_MAX as u64);
+        assert!(absolute_index + remove_count <= self.len());
+
+        let half = Self::NODE_CAPACITY / 2;
+        let mut remaining = remove_count;
+
+        while remaining > 0 {
+            let batch = remaining.min(half);
+            // Always remove at the same absolute index; the next element shifts into place.
+            self.remove_elements_batch(pool, absolute_index, batch);
+            remaining -= batch;
+        }
+
+        if VERIFY {
+            self.verify();
+        }
+    }
+
     /// Removes a small batch starting at `absolute_index`.
     ///
     /// The batch size is capped at `NODE_CAPACITY / 2` so we only touch `a` and
