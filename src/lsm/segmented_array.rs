@@ -435,6 +435,30 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Attempts to merge or rebalance `node` with its right neighbor.
+    ///
+    /// Returns early if `node` is empty (caller handles removal separately). The
+    /// next node's elements are sliced from its backing buffer and forwarded to
+    /// `maybe_merge_nodes`. Caller must ensure `node + 1` is in-bounds.
+    fn maybe_remove_or_merge_node_with_next(&mut self, pool: &mut P, node: u32) {
+        assert!(node < self.node_count);
+
+        if self.count(node) == 0 {
+            return;
+        }
+
+        let next = node + 1;
+        let b_ptr = self.nodes[node as usize].expect("node missing");
+        let b_count = self.count(next) as usize;
+
+        let next_elements = {
+            let b_buf = unsafe { Self::node_buf_from_ptr(b_ptr) };
+            &b_buf[..b_count]
+        };
+
+        self.maybe_merge_nodes(pool, node, next_elements);
+    }
+
     /// Attempts to merge or rebalance node `a` with its right neighbor `b`.
     ///
     /// `elements_next_node` represents the logical contents of `b` after a caller
