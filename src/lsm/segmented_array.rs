@@ -435,6 +435,84 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    fn maybe_merge_nodes(
+        &mut self,
+        pool: &mut P,
+        node: u32,
+        elements_next_node: &[MaybeUninit<T>],
+    ) {
+        // Merge/rebalance `a` with its right neighbor `b`.
+        // `elements_next_node` is the logical contents of `b` after the caller's edits:
+        // it may alias `b`'s buffer or be a temporary slice that has not been written back.
+        let half = Self::NODE_CAPACITY / 2;
+
+        let a = node;
+        let b = node + 1;
+        assert!(b < self.node_count);
+
+        let a_ptr = self.nodes[a as usize].expect("node missing");
+        let b_ptr = self.nodes[b as usize].expect("node missing");
+
+        let a_count = self.count(a);
+
+        assert!(!elements_next_node.is_empty());
+        // Only the last node is allowed to be below half full.
+        assert!((elements_next_node.len() as u32) >= half || b == (self.node_count) - 1);
+
+        let b_buf = unsafe { Self::node_buf_from_ptr(b_ptr) };
+        // If `a` is empty and `elements_next_node` already lives in `b`, the caller should
+        // drop `a` instead of forcing a full copy into `a`.
+        assert!(!(a_count == 0 && ptr::eq(elements_next_node.as_ptr(), b_buf.as_ptr())));
+
+        let total = a_count + (elements_next_node.len() as u32);
+
+        if total <= Self::NODE_CAPACITY {
+            // Full merged: move all of 'b' into the end of 'a' then remove 'b'.
+            let buf_a = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+            let dst = &mut buf_a[(a_count as usize)..(total as usize)];
+            unsafe {
+                ptr::copy_nonoverlapping(elements_next_node.as_ptr(), dst.as_mut_ptr(), dst.len())
+            };
+
+            // Make `b` empty so remove_empty_node_at can validate its precondition.
+            self.indexes[b as usize] = self.indexes[(b + 1) as usize];
+            self.remove_empty_node_at(pool, b);
+
+            return;
+        }
+
+        if a_count < half {
+            // Re-balance by stealing from the front of 'b'.
+            let a_half = total.div_ceil(2);
+
+            let need_from_b = (a_half - a_count) as usize;
+
+            // Copy some elements from the front of 'b_elements' into the end of 'a'.
+            let buf_a = unsafe { Self::node_buf_from_ptr_mut(a_ptr) };
+            let dst = &mut buf_a[(a_count as usize)..(a_half as usize)];
+            unsafe {
+                ptr::copy_nonoverlapping(elements_next_node.as_ptr(), dst.as_mut_ptr(), need_from_b)
+            };
+
+            // Shift the remaining 'b' elements to the start of 'b' buffer.
+            // Use ptr::copy because the source and destination can overlap in `b`.
+            let buf_b = unsafe { Self::node_buf_from_ptr_mut(b_ptr) };
+            let remaining = &elements_next_node[need_from_b..];
+            unsafe { ptr::copy(remaining.as_ptr(), buf_b.as_mut_ptr(), remaining.len()) };
+
+            self.indexes[b as usize] = self.indexes[a as usize] + a_half;
+            assert!(self.count(a) >= half);
+            assert!(self.count(b) >= half);
+
+            return;
+        }
+
+        // Nothing to do: both nodes already satisfy the half-full invariant.
+        // If the caller supplied a temporary slice, they must have written it back first.
+        let b_buf = unsafe { Self::node_buf_from_ptr(b_ptr) };
+        assert!(ptr::eq(elements_next_node.as_ptr(), b_buf.as_ptr()));
+    }
+
     fn insert_empty_node_at(&mut self, pool: &mut P, node: u32) {
         assert!(node <= self.node_count);
         assert!(self.node_count + 1 <= Self::NODE_COUNT_MAX);
