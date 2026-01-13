@@ -1344,17 +1344,20 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, co
 
 #[cfg(test)]
 mod tests {
-    use super::SegmentedArray;
+    use super::{Direction, KeyFromValue, SegmentedArray, SortedSegmentedArray};
+    use crate::lsm::binary_search::{Config, binary_search_values_upsert_index};
     use crate::lsm::node_pool::{NodePool, NodePoolType};
     use crate::stdx::fastrange::fast_range;
     use proptest::prelude::*;
     use proptest::test_runner::{RngAlgorithm, TestRng};
     use std::fmt::Debug;
+    use std::mem::{align_of, size_of};
 
     #[repr(C, align(16))]
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     struct TestTableInfo {
-        words: [u64; 12],
+        address: u64,
+        words: [u64; 11],
     }
 
     const DEFAULT_PROPTEST_CASES: u32 = 2;
@@ -1372,12 +1375,86 @@ mod tests {
 
     impl TestElement for TestTableInfo {
         fn random(rng: &mut TestRng) -> Self {
-            let mut words = [0u64; 12];
+            let address = rng.next_u64();
+            let mut words = [0u64; 11];
             for word in &mut words {
                 *word = rng.next_u64();
             }
-            TestTableInfo { words }
+            TestTableInfo { address, words }
         }
+    }
+
+    trait TestKey: Copy + Ord + Debug {
+        fn min_value() -> Self;
+        fn max_value() -> Self;
+        fn random(rng: &mut TestRng) -> Self;
+    }
+
+    impl TestKey for u32 {
+        fn min_value() -> Self {
+            0
+        }
+
+        fn max_value() -> Self {
+            u32::MAX
+        }
+
+        fn random(rng: &mut TestRng) -> Self {
+            rng.next_u32()
+        }
+    }
+
+    impl TestKey for u64 {
+        fn min_value() -> Self {
+            0
+        }
+
+        fn max_value() -> Self {
+            u64::MAX
+        }
+
+        fn random(rng: &mut TestRng) -> Self {
+            rng.next_u64()
+        }
+    }
+
+    struct U32Key;
+
+    impl KeyFromValue<u32> for U32Key {
+        type Key = u32;
+
+        fn key_from_value(value: &u32) -> Self::Key {
+            *value
+        }
+    }
+
+    struct TestTableInfoKey;
+
+    impl KeyFromValue<TestTableInfo> for TestTableInfoKey {
+        type Key = u64;
+
+        fn key_from_value(value: &TestTableInfo) -> Self::Key {
+            value.address
+        }
+    }
+
+    trait SortedTestElement: TestElement {
+        type Key: TestKey;
+        type KeyExtractor: KeyFromValue<Self, Key = Self::Key>;
+
+        fn random_key(rng: &mut TestRng) -> Self::Key {
+            <Self::Key as TestKey>::random(rng)
+        }
+    }
+
+    impl SortedTestElement for u32 {
+        type Key = u32;
+        type KeyExtractor = U32Key;
+    }
+
+    impl SortedTestElement for TestTableInfo {
+        type Key = u64;
+        type KeyExtractor = TestTableInfoKey;
     }
 
     fn rng_from_seed(seed: u64, salt: u64) -> TestRng {
@@ -1393,6 +1470,7 @@ mod tests {
     fn fuzz_steps(element_count_max: u32) -> usize {
         let multiplier = crate::test_utils::proptest_fuzz_multiplier(DEFAULT_FUZZ_STEPS_MULTIPLIER);
         (element_count_max as usize)
+            .saturating_mul(2)
             .saturating_mul(multiplier as usize)
             .max(1)
     }
@@ -1551,7 +1629,7 @@ mod tests {
             self.verify();
         }
 
-        fn verify(&self) {
+        fn verify(&mut self) {
             let array = self.array_ref();
             array.verify();
 
@@ -1563,18 +1641,26 @@ mod tests {
             }
             assert_eq!(self.reference, actual);
 
-            let mut actual_rev = Vec::with_capacity(self.reference.len());
-            let mut node = array.node_count;
-            while node > 0 {
-                node -= 1;
-                let elements = array.node_elements(node);
-                for element in elements.iter().rev() {
-                    actual_rev.push(*element);
+            {
+                let mut iter = array.iterator_from_index(0, Direction::Ascending);
+                for expected in &self.reference {
+                    let actual = iter.next().expect("iterator ended early");
+                    let actual = unsafe { *actual };
+                    assert_eq!(*expected, actual);
                 }
+                assert!(iter.next().is_none());
             }
-            let mut expected_rev = self.reference.clone();
-            expected_rev.reverse();
-            assert_eq!(expected_rev, actual_rev);
+
+            {
+                let start = array.len().saturating_sub(1);
+                let mut iter = array.iterator_from_index(start, Direction::Descending);
+                for expected in self.reference.iter().rev() {
+                    let actual = iter.next().expect("iterator ended early");
+                    let actual = unsafe { *actual };
+                    assert_eq!(*expected, actual);
+                }
+                assert!(iter.next().is_none());
+            }
 
             if !self.reference.is_empty() {
                 for (index, _) in self.reference.iter().enumerate() {
@@ -1598,6 +1684,301 @@ mod tests {
                     assert!(array.count(node) >= half);
                 }
             }
+        }
+    }
+
+    struct SortedFuzzHarness<T: SortedTestElement, P: NodePool, const ELEMENT_COUNT_MAX: u32> {
+        rng: TestRng,
+        pool: P,
+        array: Option<
+            SortedSegmentedArray<
+                T,
+                P,
+                ELEMENT_COUNT_MAX,
+                <T as SortedTestElement>::KeyExtractor,
+                true,
+            >,
+        >,
+        reference: Vec<T>,
+        inserts: u64,
+        removes: u64,
+    }
+
+    impl<T: SortedTestElement, P: NodePool, const ELEMENT_COUNT_MAX: u32> Drop
+        for SortedFuzzHarness<T, P, ELEMENT_COUNT_MAX>
+    {
+        fn drop(&mut self) {
+            if let Some(array) = self.array.take() {
+                array.deinit(&mut self.pool);
+            }
+        }
+    }
+
+    impl<T: SortedTestElement, P: NodePool, const ELEMENT_COUNT_MAX: u32>
+        SortedFuzzHarness<T, P, ELEMENT_COUNT_MAX>
+    {
+        fn new(
+            rng: TestRng,
+            pool: P,
+            array: SortedSegmentedArray<
+                T,
+                P,
+                ELEMENT_COUNT_MAX,
+                <T as SortedTestElement>::KeyExtractor,
+                true,
+            >,
+        ) -> Self {
+            Self {
+                rng,
+                pool,
+                array: Some(array),
+                reference: Vec::with_capacity(ELEMENT_COUNT_MAX as usize),
+                inserts: 0,
+                removes: 0,
+            }
+        }
+
+        fn array_ref(
+            &self,
+        ) -> &SortedSegmentedArray<
+            T,
+            P,
+            ELEMENT_COUNT_MAX,
+            <T as SortedTestElement>::KeyExtractor,
+            true,
+        > {
+            self.array.as_ref().expect("array missing")
+        }
+
+        fn array_mut(
+            &mut self,
+        ) -> &mut SortedSegmentedArray<
+            T,
+            P,
+            ELEMENT_COUNT_MAX,
+            <T as SortedTestElement>::KeyExtractor,
+            true,
+        > {
+            self.array.as_mut().expect("array missing")
+        }
+
+        fn run_phase(&mut self, steps: usize, insert_weight: u32, remove_weight: u32) {
+            let total = insert_weight + remove_weight;
+            for _ in 0..steps {
+                let roll = range_inclusive(&mut self.rng, total - 1);
+                if roll < insert_weight {
+                    self.insert();
+                } else {
+                    self.remove();
+                }
+            }
+        }
+
+        fn insert(&mut self) {
+            let reference_len = self.reference.len() as u32;
+            let count_free = ELEMENT_COUNT_MAX - reference_len;
+
+            if count_free == 0 {
+                return;
+            }
+
+            let node_capacity = SortedSegmentedArray::<
+                T,
+                P,
+                ELEMENT_COUNT_MAX,
+                <T as SortedTestElement>::KeyExtractor,
+                true,
+            >::NODE_CAPACITY;
+            let count_max = count_free.min(node_capacity.saturating_mul(3));
+            let count = range_inclusive(&mut self.rng, count_max - 1) + 1;
+
+            let mut elements = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                elements.push(T::random(&mut self.rng));
+            }
+
+            for element in elements {
+                let index_actual = {
+                    let (array, pool) = (&mut self.array, &mut self.pool);
+                    let array = array.as_mut().expect("array missing");
+                    array.insert_element(pool, element)
+                };
+                let key =
+                    <<T as SortedTestElement>::KeyExtractor as KeyFromValue<T>>::key_from_value(
+                        &element,
+                    );
+                let index_expect = self.reference_index(key);
+                self.reference.insert(index_expect as usize, element);
+                assert_eq!(index_expect, index_actual);
+            }
+
+            self.inserts += count as u64;
+            self.verify();
+        }
+
+        fn remove(&mut self) {
+            let reference_len = self.reference.len() as u32;
+            if reference_len == 0 {
+                return;
+            }
+
+            let node_capacity = SortedSegmentedArray::<
+                T,
+                P,
+                ELEMENT_COUNT_MAX,
+                <T as SortedTestElement>::KeyExtractor,
+                true,
+            >::NODE_CAPACITY;
+            let count_max = reference_len.min(node_capacity.saturating_mul(3));
+            let count = range_inclusive(&mut self.rng, count_max - 1) + 1;
+            let index = range_inclusive(&mut self.rng, reference_len - count);
+
+            let (array, pool) = (&mut self.array, &mut self.pool);
+            let array = array.as_mut().expect("array missing");
+            array.remove_elements(pool, index, count);
+            let start = index as usize;
+            let end = start + count as usize;
+            self.reference.drain(start..end);
+
+            self.removes += count as u64;
+            self.verify();
+        }
+
+        fn remove_all(&mut self) {
+            while !self.reference.is_empty() {
+                self.remove();
+            }
+
+            assert_eq!(0, self.array_ref().len());
+            assert!(self.inserts > 0);
+            assert_eq!(self.inserts, self.removes);
+
+            self.verify();
+        }
+
+        fn verify(&mut self) {
+            let array = self.array_ref();
+            array.verify();
+
+            assert_eq!(self.reference.len() as u32, array.len());
+
+            {
+                let mut iter = array.iterator_from_index(0, Direction::Ascending);
+                for expected in &self.reference {
+                    let actual = iter.next().expect("iterator ended early");
+                    let actual = unsafe { *actual };
+                    assert_eq!(*expected, actual);
+                }
+                assert!(iter.next().is_none());
+            }
+
+            {
+                let start = array.len().saturating_sub(1);
+                let mut iter = array.iterator_from_index(start, Direction::Descending);
+                for expected in self.reference.iter().rev() {
+                    let actual = iter.next().expect("iterator ended early");
+                    let actual = unsafe { *actual };
+                    assert_eq!(*expected, actual);
+                }
+                assert!(iter.next().is_none());
+            }
+
+            if !self.reference.is_empty() {
+                for (index, _) in self.reference.iter().enumerate() {
+                    let absolute = index as u32;
+                    let cursor = array.base.cursor_for_absolute_index(absolute);
+                    assert_eq!(absolute, array.absolute_index_for_cursor(cursor));
+                }
+            }
+
+            {
+                let mut prior_key = None;
+                for value in &self.reference {
+                    let key =
+                        <<T as SortedTestElement>::KeyExtractor as KeyFromValue<T>>::key_from_value(
+                            value,
+                        );
+                    if let Some(prior_key) = prior_key {
+                        assert!(prior_key <= key);
+                    }
+                    prior_key = Some(key);
+                }
+            }
+
+            if array.len() == 0 {
+                assert_eq!(array.base.node_count, 0);
+            }
+
+            for node in &array.base.nodes[array.base.node_count as usize..] {
+                assert!(node.is_none());
+            }
+
+            let half = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, true>::NODE_CAPACITY / 2;
+            if array.base.node_count > 1 {
+                for node in 0..array.base.node_count - 1 {
+                    assert!(array.base.count(node) >= half);
+                }
+            }
+
+            self.verify_search();
+        }
+
+        fn verify_search(&mut self) {
+            let mut queries = [<T as SortedTestElement>::Key::min_value(); 20];
+            for query in &mut queries {
+                *query = T::random_key(&mut self.rng);
+            }
+
+            queries[0] = <T as SortedTestElement>::Key::min_value();
+            queries[1] = <T as SortedTestElement>::Key::max_value();
+
+            for query in queries {
+                let expect = self.reference_index(query);
+                let actual = self
+                    .array_ref()
+                    .absolute_index_for_cursor(self.array_ref().search(query));
+                assert_eq!(expect, actual);
+            }
+
+            {
+                let max_key = <T as SortedTestElement>::Key::max_value();
+                let mut it = self
+                    .array_ref()
+                    .iterator_from_cursor(self.array_ref().search(max_key), Direction::Ascending);
+                while let Some(ptr) = it.next() {
+                    let value = unsafe { *ptr };
+                    let key =
+                        <<T as SortedTestElement>::KeyExtractor as KeyFromValue<T>>::key_from_value(
+                            &value,
+                        );
+                    assert_eq!(key, max_key);
+                }
+            }
+
+            {
+                let min_key = <T as SortedTestElement>::Key::min_value();
+                let mut it = self
+                    .array_ref()
+                    .iterator_from_cursor(self.array_ref().search(min_key), Direction::Descending);
+                if self.reference.is_empty() {
+                    assert!(it.next().is_none());
+                } else {
+                    assert!(it.next().is_some());
+                    assert!(it.next().is_none());
+                }
+            }
+        }
+
+        fn reference_index(&self, key: <T as SortedTestElement>::Key) -> u32 {
+            let key_from_value = |value: &T| {
+                <<T as SortedTestElement>::KeyExtractor as KeyFromValue<T>>::key_from_value(value)
+            };
+            binary_search_values_upsert_index(
+                &self.reference,
+                key,
+                Config::default(),
+                &key_from_value,
+            )
         }
     }
 
@@ -1660,7 +2041,44 @@ mod tests {
         context.remove_all();
     }
 
-    fn run_all_unsorted_cases(seed: u64) {
+    fn run_sorted_case<
+        T: SortedTestElement,
+        const NODE_SIZE: usize,
+        const NODE_ALIGNMENT: usize,
+        const ELEMENT_COUNT_MAX: u32,
+    >(
+        seed: u64,
+        salt: u64,
+    ) {
+        let rng = rng_from_seed(seed, salt);
+        let node_count_max = SortedSegmentedArray::<
+            T,
+            NodePoolType<{ NODE_SIZE }, { NODE_ALIGNMENT }>,
+            { ELEMENT_COUNT_MAX },
+            <T as SortedTestElement>::KeyExtractor,
+            true,
+        >::NODE_COUNT_MAX;
+        let pool = NodePoolType::<{ NODE_SIZE }, { NODE_ALIGNMENT }>::init(node_count_max);
+        let array = SortedSegmentedArray::<
+            T,
+            NodePoolType<{ NODE_SIZE }, { NODE_ALIGNMENT }>,
+            { ELEMENT_COUNT_MAX },
+            <T as SortedTestElement>::KeyExtractor,
+            true,
+        >::new();
+
+        let mut context = SortedFuzzHarness::new(rng, pool, array);
+        let steps = fuzz_steps(ELEMENT_COUNT_MAX);
+
+        context.run_phase(steps, 60, 40);
+        context.run_phase(steps, 40, 60);
+
+        if context.inserts > 0 {
+            context.remove_all();
+        }
+    }
+
+    fn run_all_cases(seed: u64) {
         let mut tested_padding = false;
         let mut tested_node_capacity_min = false;
         let mut salt = 0u64;
@@ -1671,7 +2089,9 @@ mod tests {
                 run_unsorted_case::<$ty, $node_size, $node_alignment, $element_count_max>(
                     seed, salt,
                 );
-                if $node_size % std::mem::size_of::<$ty>() != 0 {
+                salt = salt.wrapping_add(1);
+                run_sorted_case::<$ty, $node_size, $node_alignment, $element_count_max>(seed, salt);
+                if $node_size % size_of::<$ty>() != 0 {
                     tested_padding = true;
                 }
                 type Array = SegmentedArray<
@@ -1704,14 +2124,80 @@ mod tests {
         assert!(tested_node_capacity_min);
     }
 
+    #[test]
+    fn sorted_segmented_array_duplicate_elements() {
+        type TestPool = NodePoolType<{ 128 * size_of::<u32>() }, { 2 * align_of::<u32>() }>;
+        type TestArray = SortedSegmentedArray<u32, TestPool, 1024, U32Key, true>;
+
+        let mut pool = TestPool::init(TestArray::NODE_COUNT_MAX);
+        let mut array = TestArray::new();
+
+        for index in 0..3 {
+            let inserted_at = array.insert_element(&mut pool, 0);
+            assert_eq!(inserted_at, 0);
+
+            let inserted_at = array.insert_element(&mut pool, 100);
+            assert_eq!(inserted_at, (index + 1) as u32);
+
+            let inserted_at = array.insert_element(&mut pool, u32::MAX);
+            assert_eq!(inserted_at, ((index + 1) * 2) as u32);
+        }
+        assert_eq!(array.len(), 9);
+
+        assert_eq!(array.absolute_index_for_cursor(array.search(0)), 0);
+        assert_eq!(array.absolute_index_for_cursor(array.search(100)), 3);
+        assert_eq!(array.absolute_index_for_cursor(array.search(u32::MAX)), 6);
+
+        {
+            let target = 0;
+            let mut it = array.iterator_from_cursor(array.search(target), Direction::Ascending);
+            assert_eq!(unsafe { *it.next().unwrap() }, 0);
+            assert_eq!(unsafe { *it.next().unwrap() }, 0);
+            assert_eq!(unsafe { *it.next().unwrap() }, 0);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+
+            it = array.iterator_from_cursor(array.search(target), Direction::Descending);
+            assert_eq!(unsafe { *it.next().unwrap() }, 0);
+            assert!(it.next().is_none());
+        }
+
+        {
+            let target = 100;
+            let mut it = array.iterator_from_cursor(array.search(target), Direction::Ascending);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+            assert_eq!(unsafe { *it.next().unwrap() }, u32::MAX);
+
+            it = array.iterator_from_cursor(array.search(target), Direction::Descending);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+            assert_eq!(unsafe { *it.next().unwrap() }, 0);
+        }
+
+        {
+            let target = u32::MAX;
+            let mut it = array.iterator_from_cursor(array.search(target), Direction::Ascending);
+            assert_eq!(unsafe { *it.next().unwrap() }, u32::MAX);
+            assert_eq!(unsafe { *it.next().unwrap() }, u32::MAX);
+            assert_eq!(unsafe { *it.next().unwrap() }, u32::MAX);
+            assert!(it.next().is_none());
+
+            it = array.iterator_from_cursor(array.search(target), Direction::Descending);
+            assert_eq!(unsafe { *it.next().unwrap() }, u32::MAX);
+            assert_eq!(unsafe { *it.next().unwrap() }, 100);
+        }
+
+        array.deinit(&mut pool);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(
             crate::test_utils::proptest_cases(DEFAULT_PROPTEST_CASES)
         ))]
 
         #[test]
-        fn segmented_array_unsorted_fuzz(seed in any::<u64>()) {
-            run_all_unsorted_cases(seed);
+        fn segmented_array_fuzz(seed in any::<u64>()) {
+            run_all_cases(seed);
         }
     }
 }
