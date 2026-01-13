@@ -1135,6 +1135,50 @@ pub trait KeyFromValue<T: Copy> {
     fn key_from_value(value: &T) -> Self::Key;
 }
 
+pub struct SortedSegmentedArray<
+    T: Copy,
+    P: NodePool,
+    const ELEMENT_COUNT_MAX: u32,
+    KF: KeyFromValue<T>,
+    const VERIFY: bool = false,
+> {
+    base: SegmentedArray<T, P, ELEMENT_COUNT_MAX, VERIFY>,
+    _marker: PhantomData<KF>,
+}
+
+impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, const VERIFY: bool>
+    SortedSegmentedArray<T, P, ELEMENT_COUNT_MAX, KF, VERIFY>
+{
+    pub const NODE_CAPACITY: u32 = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, false>::NODE_CAPACITY;
+    pub const NODE_COUNT_MAX_NAIVE: u32 =
+        SegmentedArray::<T, P, ELEMENT_COUNT_MAX, false>::NODE_COUNT_MAX_NAIVE;
+    pub const NODE_COUNT_MAX: u32 =
+        SegmentedArray::<T, P, ELEMENT_COUNT_MAX, VERIFY>::NODE_COUNT_MAX;
+
+    pub fn new() -> Self {
+        let s = Self {
+            base: SegmentedArray::<T, P, ELEMENT_COUNT_MAX, VERIFY>::new(),
+            _marker: PhantomData,
+        };
+
+        if VERIFY {
+            s.verify();
+        }
+
+        s
+    }
+
+    pub fn verify(&self) {
+        self.base.verify();
+
+        assert!(
+            (0..self.base.node_count)
+                .flat_map(|node| self.base.node_elements(node))
+                .is_sorted_by_key(|v| KF::key_from_value(v))
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SegmentedArray;
