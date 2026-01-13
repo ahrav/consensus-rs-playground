@@ -924,6 +924,184 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
         self.indexes[cursor.node as usize] + cursor.relative_index
     }
+
+    pub fn iterator_from_cursor<'a>(
+        &'a self,
+        mut cursor: Cursor,
+        direction: Direction,
+    ) -> Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY> {
+        if self.node_count == 0 {
+            assert_eq!(cursor.node, 0);
+            assert_eq!(cursor.relative_index, 0);
+
+            return Iterator {
+                array: self as *const _,
+                direction,
+                cursor,
+                done: true,
+                _marker: PhantomData,
+            };
+        }
+
+        let last_node = self.node_count - 1;
+
+        if cursor.node == last_node && cursor.relative_index == self.count(last_node) {
+            let done = direction == Direction::Ascending;
+
+            if done {
+                return Iterator {
+                    array: self as *const _,
+                    direction,
+                    cursor,
+                    done: true,
+                    _marker: PhantomData,
+                };
+            }
+
+            cursor.relative_index -= 1;
+            return Iterator {
+                array: self as *const _,
+                direction,
+                cursor,
+                done: false,
+                _marker: PhantomData,
+            };
+        }
+
+        assert!(cursor.node < self.node_count);
+        assert!(cursor.relative_index < self.count(cursor.node));
+
+        Iterator {
+            array: self as *const _,
+            direction,
+            cursor,
+            done: false,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn iterator_from_index<'a>(
+        &'a self,
+        absolute_index: u32,
+        direction: Direction,
+    ) -> Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY> {
+        assert!(absolute_index < ELEMENT_COUNT_MAX);
+
+        if self.node_count == 0 {
+            assert_eq!(absolute_index, 0);
+
+            return Iterator {
+                array: self as *const _,
+                direction,
+                cursor: Cursor {
+                    node: 0,
+                    relative_index: 0,
+                },
+                done: false,
+                _marker: PhantomData,
+            };
+        }
+
+        assert!(absolute_index < self.len());
+        let cursor = self.cursor_for_absolute_index(absolute_index);
+
+        Iterator {
+            array: self as *const _,
+            direction,
+            cursor,
+            done: false,
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Cursor-based traversal over a [`SegmentedArray`] that yields raw element pointers.
+///
+/// This iterator exists so higher-level wrappers (like `SortedSegmentArray`) can walk
+/// elements in order while still performing in-place value updates. Holding a raw
+/// pointer avoids borrowing the array for the duration of the traversal, which keeps
+/// APIs flexible but means callers must not structurally modify the array while
+/// iterating (insert/remove/split/merge).
+pub struct Iterator<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool> {
+    // Raw pointer avoids tying up a borrow of the array during iteration.
+    array: *const SegmentedArray<T, P, ELEMENT_COUNT_MAX, VERIFY>,
+    direction: Direction,
+    cursor: Cursor,
+    /// True once the iterator has reached the terminal element.
+    pub done: bool,
+    _marker: PhantomData<&'a SegmentedArray<T, P, ELEMENT_COUNT_MAX, VERIFY>>,
+}
+
+impl<'a, T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
+    Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY>
+{
+    /// Returns a pointer to the current element and advances the cursor.
+    ///
+    /// The returned pointer remains valid as long as the underlying array is not
+    /// structurally modified. Mutating the element's value in place is expected.
+    pub fn next(&mut self) -> Option<*mut T> {
+        if self.done {
+            return None;
+        }
+
+        let array = unsafe { &*self.array };
+        assert!(array.node_count > 0);
+        assert!(self.cursor.node < array.node_count);
+
+        let node = self.cursor.node;
+        let rel = self.cursor.relative_index as usize;
+
+        let count = array.count(node) as usize;
+        assert!(rel < count);
+
+        let node_ptr = array.nodes[node as usize].expect("node missing");
+        let element_ptr = unsafe { (node_ptr.as_ptr() as *mut MaybeUninit<T>).add(rel) as *mut T };
+
+        match self.direction {
+            Direction::Ascending => {
+                if rel == count - 1 {
+                    if node == array.node_count - 1 {
+                        self.done = true;
+                    } else {
+                        self.cursor.node += 1;
+                        self.cursor.relative_index = 0;
+                    }
+                } else {
+                    self.cursor.relative_index += 1;
+                }
+            }
+            Direction::Descending => {
+                if rel == 0 {
+                    if node == 0 {
+                        self.done = true;
+                    } else {
+                        self.cursor.node -= 1;
+                        self.cursor.relative_index = array.count(self.cursor.node) - 1;
+                    }
+                } else {
+                    self.cursor.relative_index -= 1;
+                }
+            }
+        }
+
+        Some(element_ptr)
+    }
+}
+
+/// Defines how to extract an ordered key from a value stored in a segmented array.
+///
+/// This keeps the core `SegmentedArray` generic while enabling sorted wrappers
+/// (like `SortedSegmentArray`) to compare by key without storing a parallel key
+/// buffer or requiring a bespoke value type.
+pub trait KeyFromValue<T: Copy> {
+    /// Key type used to order values stored in the segmented array.
+    type Key: Ord + Copy;
+
+    /// Extracts the key that determines the value's sorted position.
+    ///
+    /// This indirection lets sorted wrappers (e.g. `SortedSegmentArray`) perform
+    /// binary searches and range scans without storing a parallel key array.
+    fn key_from_value(value: &T) -> Self::Key;
 }
 
 #[cfg(test)]
