@@ -435,6 +435,13 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         }
     }
 
+    /// Attempts to merge or rebalance node `a` with its right neighbor `b`.
+    ///
+    /// `elements_next_node` represents the logical contents of `b` after a caller
+    /// mutation; it may alias `b`'s buffer or be a temporary slice. The method keeps
+    /// the "all but last nodes are at least half full" invariant, either by:
+    /// - fully merging `b` into `a` when the combined total fits, or
+    /// - stealing enough from the front of `b` to make both nodes >= half full.
     fn maybe_merge_nodes(
         &mut self,
         pool: &mut P,
