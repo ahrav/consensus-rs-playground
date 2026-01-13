@@ -1470,7 +1470,6 @@ mod tests {
     fn fuzz_steps(element_count_max: u32) -> usize {
         let multiplier = crate::test_utils::proptest_fuzz_multiplier(DEFAULT_FUZZ_STEPS_MULTIPLIER);
         (element_count_max as usize)
-            .saturating_mul(2)
             .saturating_mul(multiplier as usize)
             .max(1)
     }

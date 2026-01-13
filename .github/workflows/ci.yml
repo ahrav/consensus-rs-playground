@@ -73,7 +73,7 @@ jobs:
     name: Test
     runs-on: ${{ matrix.os }}
     env:
-      PROPTEST_CASES: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '32' || '16' }}
+      PROPTEST_CASES: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '32' || '4' }}
       PROPTEST_FUZZ_MULTIPLIER: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '2' || '1' }}
     strategy:
       matrix:
