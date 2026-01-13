@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::lsm::{
-    binary_search::{Config, binary_search_keys},
+    binary_search::{Config, binary_search_keys, binary_search_values_upsert_index},
     node_pool::NodePool,
 };
 
@@ -179,6 +179,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     }
 
     /// Releases all allocated nodes back to the pool and consumes `self`.
+    ///
+    /// The pool owns node memory, so cleanup must be explicit and needs a
+    /// `&mut P` handle rather than relying on `Drop`.
     pub fn deinit(mut self, pool: &mut P) {
         if VERIFY {
             self.verify();
@@ -192,9 +195,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
 
     /// Releases nodes back to the pool and resets bookkeeping to the empty state.
     ///
-    /// Consumes `self`; intended for teardown paths where `VERIFY` should see an
-    /// empty structure before the value is dropped.
-    pub fn clear(mut self, pool: &mut P) {
+    /// Intended for teardown paths or reuse where `VERIFY` should see an empty
+    /// structure before the value is dropped.
+    pub fn clear(&mut self, pool: &mut P) {
         if VERIFY {
             self.verify();
         }
@@ -217,6 +220,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
     ///
     /// Use only when the pool is reset separately (e.g. bulk teardown), otherwise
     /// unreleased nodes will be treated as leaks by the pool.
+    ///
+    /// Consumes `self` because after a pool reset any outstanding node pointers
+    /// become invalid, so keeping this handle around would invite use-after-free.
     pub fn reset(mut self) {
         self.node_count = 0;
         self.nodes.fill(None);
@@ -1135,6 +1141,9 @@ pub trait KeyFromValue<T: Copy> {
     fn key_from_value(value: &T) -> Self::Key;
 }
 
+/// Sorted wrapper around [`SegmentedArray`] keyed by [`KeyFromValue`].
+///
+/// Ordering is derived from values, so no parallel key buffer is needed.
 pub struct SortedSegmentedArray<
     T: Copy,
     P: NodePool,
@@ -1149,12 +1158,16 @@ pub struct SortedSegmentedArray<
 impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, const VERIFY: bool>
     SortedSegmentedArray<T, P, ELEMENT_COUNT_MAX, KF, VERIFY>
 {
+    /// Maximum number of elements per node, inherited from `SegmentedArray`.
     pub const NODE_CAPACITY: u32 = SegmentedArray::<T, P, ELEMENT_COUNT_MAX, false>::NODE_CAPACITY;
+    /// Naive upper bound on the number of nodes, inherited from `SegmentedArray`.
     pub const NODE_COUNT_MAX_NAIVE: u32 =
         SegmentedArray::<T, P, ELEMENT_COUNT_MAX, false>::NODE_COUNT_MAX_NAIVE;
+    /// Actual maximum number of nodes, inherited from `SegmentedArray`.
     pub const NODE_COUNT_MAX: u32 =
         SegmentedArray::<T, P, ELEMENT_COUNT_MAX, VERIFY>::NODE_COUNT_MAX;
 
+    /// Creates an empty sorted segmented array.
     pub fn new() -> Self {
         let s = Self {
             base: SegmentedArray::<T, P, ELEMENT_COUNT_MAX, VERIFY>::new(),
@@ -1168,6 +1181,56 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, co
         s
     }
 
+    /// Releases all nodes back to the pool and consumes `self`.
+    pub fn deinit(self, pool: &mut P) {
+        self.base.deinit(pool);
+    }
+
+    /// Clears all elements and returns nodes to the pool.
+    pub fn clear(&mut self, pool: &mut P) {
+        if VERIFY {
+            self.verify();
+        }
+        self.base.clear(pool);
+        if VERIFY {
+            self.verify();
+        }
+    }
+
+    /// Returns the total number of elements across all nodes.
+    pub fn len(&self) -> u32 {
+        self.base.len()
+    }
+
+    /// Returns the initialized elements slice for `node`.
+    pub fn node_elements(&self, node: u32) -> &[T] {
+        self.base.node_elements(node)
+    }
+
+    /// Converts a cursor into its absolute index in the logical array.
+    pub fn absolute_index_for_cursor(&self, cursor: Cursor) -> u32 {
+        self.base.absolute_index_for_cursor(cursor)
+    }
+
+    /// Creates an iterator starting at `cursor` and walking in `direction`.
+    pub fn iterator_from_cursor<'a>(
+        &'a self,
+        cursor: Cursor,
+        direction: Direction,
+    ) -> Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY> {
+        self.base.iterator_from_cursor(cursor, direction)
+    }
+
+    /// Creates an iterator starting at the element with `index`.
+    pub fn iterator_from_index<'a>(
+        &'a self,
+        index: u32,
+        direction: Direction,
+    ) -> Iterator<'a, T, P, ELEMENT_COUNT_MAX, VERIFY> {
+        self.base.iterator_from_index(index, direction)
+    }
+
+    /// Asserts base invariants and that keys are globally sorted.
     pub fn verify(&self) {
         self.base.verify();
 
@@ -1176,6 +1239,93 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, KF: KeyFromValue<T>, co
                 .flat_map(|node| self.base.node_elements(node))
                 .is_sorted_by_key(|v| KF::key_from_value(v))
         );
+    }
+
+    /// Finds the cursor where `key` should be inserted.
+    ///
+    /// Binary searches node boundaries by each node's first key, then searches
+    /// within that node.
+    pub fn search(&self, key: KF::Key) -> Cursor {
+        if self.base.node_count == 0 {
+            return Cursor {
+                node: 0,
+                relative_index: 0,
+            };
+        }
+
+        let mut offset: usize = 0;
+        let mut length: usize = self.base.node_count as usize;
+
+        while length > 1 {
+            let half = length / 2;
+            let mid = offset + half;
+
+            let node_first = &self.base.node_elements(mid as u32)[0];
+            if KF::key_from_value(node_first) < key {
+                offset = mid;
+            }
+            length -= half;
+        }
+
+        let node = offset as u32;
+        assert!(node < self.base.node_count);
+        let key_from_value = |value: &T| KF::key_from_value(value);
+        let rel = binary_search_values_upsert_index(
+            self.base.node_elements(node),
+            key,
+            Config::default(),
+            &key_from_value,
+        );
+
+        if node + 1 < self.base.node_count && rel == self.base.count(node) {
+            Cursor {
+                node: node + 1,
+                relative_index: 0,
+            }
+        } else {
+            Cursor {
+                node,
+                relative_index: rel,
+            }
+        }
+    }
+
+    /// Inserts `element` while maintaining key order and returns its absolute index.
+    pub fn insert_element(&mut self, pool: &mut P, element: T) -> u32 {
+        if VERIFY {
+            self.verify();
+        }
+
+        let count_before = self.len();
+        let key = KF::key_from_value(&element);
+        let cursor = self.search(key);
+        let absolute_index = self.base.absolute_index_for_cursor(cursor);
+
+        self.base.insert_elements_at_absolute_index(
+            pool,
+            absolute_index,
+            slice::from_ref(&element),
+        );
+        if VERIFY {
+            self.verify();
+        }
+
+        let count_after = self.len();
+        assert_eq!(count_after, count_before + 1);
+        absolute_index
+    }
+
+    /// Removes `remove_count` elements starting at `absolute_index`.
+    pub fn remove_elements(&mut self, pool: &mut P, absolute_index: u32, remove_count: u32) {
+        if VERIFY {
+            self.verify();
+        }
+
+        self.base
+            .remove_elements(pool, absolute_index, remove_count);
+        if VERIFY {
+            self.verify();
+        }
     }
 }
 
