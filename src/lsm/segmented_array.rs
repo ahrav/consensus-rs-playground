@@ -266,8 +266,9 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         let mut i: usize = 0;
         let node_capacity = Self::NODE_CAPACITY as usize;
 
-        while i < node_capacity {
-            let batch = (elements.len() - 1).min(node_capacity);
+        while i < elements.len() {
+            let remaining = elements.len() - i;
+            let batch = remaining.min(node_capacity);
             let abs = absolute_index + (i as u32);
             self.insert_elements_batch(pool, abs, &elements[i..i + batch]);
             i += batch;
@@ -591,11 +592,16 @@ impl<T: Copy, P: NodePool, const ELEMENT_COUNT_MAX: u32, const VERIFY: bool>
         assert!(node < self.node_count);
 
         if self.count(node) == 0 {
+            self.remove_empty_node_at(pool, node);
+            return;
+        }
+
+        if node == self.node_count - 1 {
             return;
         }
 
         let next = node + 1;
-        let b_ptr = self.nodes[node as usize].expect("node missing");
+        let b_ptr = self.nodes[next as usize].expect("node missing");
         let b_count = self.count(next) as usize;
 
         let next_elements = {
