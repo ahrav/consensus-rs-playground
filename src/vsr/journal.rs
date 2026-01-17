@@ -1366,7 +1366,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `header` is not a valid `Prepare` header (reserved operation or too small)
     /// - The slot would move backwards (`existing.op > header.op`)
-    #[cfg_attr(not(test))]
     fn set_header_as_dirty(&mut self, header: &HeaderPrepare) {
         assert!(matches!(self.status, Status::Recovered));
         assert!(header.command == Command::Prepare);
@@ -1441,7 +1440,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// On failure, the callback is invoked with `None` and **no read I/O is issued**.
     /// This includes cases where the in-memory slot is not inhabited or no exact match exists.
-    #[cfg_attr(not(test))]
     fn read_prepare(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1490,7 +1488,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
     /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
     /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
-    #[cfg_attr(not(test))]
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1784,7 +1781,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `message` is null or not a non-reserved `Prepare` header
     /// - The header does not exist in memory or a write is already in flight
-    #[cfg_attr(not(test))]
     fn write_prepare(
         &mut self,
         callback: WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
