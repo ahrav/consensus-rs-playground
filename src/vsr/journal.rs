@@ -476,6 +476,25 @@ struct RecoveryCase {
     pattern: [Matcher; 11],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DvcHeaderType {
+    Blank,
+    Valid,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ViewRange {
+    min: u32,
+    max: u32,
+}
+
+impl VIewRange {
+    #[inline]
+    fn contains(self, view: u32) -> bool {
+        self.min <= view && view <= self.max
+    }
+}
+
 #[allow(dead_code)]
 impl RecoveryCase {
     #[inline]
@@ -752,6 +771,98 @@ fn header_prepare_as_raw(header: &HeaderPrepare) -> &HeaderPrepareRaw {
 #[inline]
 fn header_prepare_raw_from_typed(header: &HeaderPrepare) -> HeaderPrepareRaw {
     *header_prepare_as_raw(header)
+}
+
+#[inline]
+fn dvc_blank(op: u64) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = Operation::RESERVED;
+    header.op = op;
+    header
+}
+
+#[inline]
+fn dvc_header_type(header: &HeaderPrepare) -> DvcHeaderType {
+    if *header == dvc_blank(header.op) {
+        return DvcHeaderType::Blank;
+    }
+
+    assert!(header.valid_checksum());
+    assert!(header.command == Command::Prepare);
+    assert!(header.operation != Operation::RESERVED);
+    assert!(header.invalid().is_none());
+
+    DvcHeaderType::Valid
+}
+
+/// Returns the inclusive view range that could legitimately contain `op`,
+/// based on the persisted view-change headers.
+///
+/// The headers are expected newest-first (descending op/view), with optional
+/// blank placeholders. The returned range is used during recovery to discard
+/// entries whose `view` cannot be reconciled with view-change history.
+fn view_for_op(headers: ViewChangeSlice<'_>, op: u64, log_view: u32) -> ViewRange {
+    let slice = headers.slice();
+    assert!(!slice.is_empty());
+
+    let header_newest = &slice[0];
+    let mut oldest_index = None;
+    for (index, header) in slice.iter().enumerate() {
+        match dvc_header_type(header) {
+            DvcHeaderType::Blank => {
+                assert!(index > 0);
+            }
+            DvcHeaderType::Valid => {
+                oldest_index = Some(index);
+            }
+        }
+    }
+
+    let header_oldest = &slice[oldest_index.expect("view_headers missing valid header")];
+    assert!(header_newest.view <= log_view);
+    assert!(header_newest.view >= header_oldest.view);
+    assert!(header_newest.op >= header_oldest.op);
+
+    if op < header_oldest.op {
+        return ViewRange {
+            min: 0,
+            max: header_oldest.view,
+        };
+    }
+
+    if op > header_newest.op {
+        return ViewRange {
+            min: log_view,
+            max: log_view,
+        };
+    }
+
+    for header in slice {
+        if dvc_header_type(header) == DvcHeaderType::Valid && header.op == op {
+            return ViewRange {
+                min: header.view,
+                max: header.view,
+            };
+        }
+    }
+
+    let mut header_next = &slice[0];
+    assert!(dvc_header_type(header_next) == DvcHeaderType::Valid);
+
+    for header_prev in &slice[1..] {
+        if dvc_header_type(header_prev) == DvcHeaderType::Valid {
+            if header_prev.op < op && op < header_next.op {
+                return ViewRange {
+                    min: header_prev.view,
+                    max: header_next.view,
+                };
+            }
+            header_next = header_prev;
+        }
+    }
+
+    panic!("view_for_op: no enclosing headers for op {}", op);
 }
 
 /// WAL journal implementing range-locked sector writes.
