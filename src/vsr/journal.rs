@@ -40,6 +40,8 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
+#![allow(dead_code)]
+
 use core::{cmp::min, mem::MaybeUninit, ptr};
 
 #[allow(unused_imports)]
@@ -432,7 +434,6 @@ enum Writing {
     Slot,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Recovery action to take for a header/prepare pair.
 enum RecoveryDecision {
@@ -452,7 +453,6 @@ enum RecoveryDecision {
     Unreachable,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Matcher for a single boolean parameter in a recovery-case pattern.
 enum Matcher {
@@ -476,7 +476,27 @@ struct RecoveryCase {
     pattern: [Matcher; 11],
 }
 
-#[allow(dead_code)]
+/// Classifies view-change headers as either placeholders or real entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DvcHeaderType {
+    Blank,
+    Valid,
+}
+
+/// Inclusive view bounds used to validate a header's view during recovery.
+#[derive(Debug, Clone, Copy)]
+struct ViewRange {
+    min: u32,
+    max: u32,
+}
+
+impl ViewRange {
+    #[inline]
+    fn contains(self, view: u32) -> bool {
+        self.min <= view && view <= self.max
+    }
+}
+
 impl RecoveryCase {
     #[inline]
     const fn decision(&self, solo: bool) -> RecoveryDecision {
@@ -521,13 +541,10 @@ impl RecoveryCase {
 const __: Matcher = Matcher::Any;
 const _0: Matcher = Matcher::IsFalse;
 const _1: Matcher = Matcher::IsTrue;
-#[allow(dead_code)]
 const A0: Matcher = Matcher::AssertFalse;
-#[allow(dead_code)]
 const A1: Matcher = Matcher::AssertTrue;
 
 /// Pseudo-case used when torn prepares are detected during recovery.
-#[allow(dead_code)]
 const CASE_CUT_TORN: RecoveryCase = RecoveryCase {
     label: "@CUT_TORN",
     decision_multiple: RecoveryDecision::CutTorn,
@@ -536,7 +553,6 @@ const CASE_CUT_TORN: RecoveryCase = RecoveryCase {
 };
 
 /// Ordered recovery decision table (first and only match wins).
-#[allow(dead_code)]
 const RECOVERY_CASES: [RecoveryCase; 16] = [
     // @A - both invalid.
     RecoveryCase {
@@ -656,7 +672,6 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
 ///
 /// `op_max` and `op_prepare_max` describe the current recovery head and are used
 /// to decide when to truncate or repair entries.
-#[allow(dead_code)]
 #[inline]
 fn recovery_case(
     header: Option<HeaderPrepare>,
@@ -712,7 +727,6 @@ fn recovery_case(
 
 /// Returns the header only if it has a valid checksum, command=Prepare, expected cluster,
 /// and resides in the correct slot.
-#[allow(dead_code)]
 #[inline]
 fn header_ok(
     cluster: constants::ClusterId,
@@ -752,6 +766,98 @@ fn header_prepare_as_raw(header: &HeaderPrepare) -> &HeaderPrepareRaw {
 #[inline]
 fn header_prepare_raw_from_typed(header: &HeaderPrepare) -> HeaderPrepareRaw {
     *header_prepare_as_raw(header)
+}
+
+#[inline]
+fn dvc_blank(op: u64) -> HeaderPrepare {
+    let mut header = HeaderPrepare::zeroed();
+    header.command = Command::Prepare;
+    header.operation = Operation::RESERVED;
+    header.op = op;
+    header
+}
+
+#[inline]
+fn dvc_header_type(header: &HeaderPrepare) -> DvcHeaderType {
+    if *header == dvc_blank(header.op) {
+        return DvcHeaderType::Blank;
+    }
+
+    assert!(header.valid_checksum());
+    assert!(header.command == Command::Prepare);
+    assert!(header.operation != Operation::RESERVED);
+    assert!(header.invalid().is_none());
+
+    DvcHeaderType::Valid
+}
+
+/// Returns the inclusive view range that could legitimately contain `op`,
+/// based on the persisted view-change headers.
+///
+/// The headers are expected newest-first (descending op/view), with optional
+/// blank placeholders. The returned range is used during recovery to discard
+/// entries whose `view` cannot be reconciled with view-change history.
+fn view_for_op(headers: ViewChangeSlice<'_>, op: u64, log_view: u32) -> ViewRange {
+    let slice = headers.slice();
+    assert!(!slice.is_empty());
+
+    let header_newest = &slice[0];
+    let mut oldest_index = None;
+    for (index, header) in slice.iter().enumerate() {
+        match dvc_header_type(header) {
+            DvcHeaderType::Blank => {
+                assert!(index > 0);
+            }
+            DvcHeaderType::Valid => {
+                oldest_index = Some(index);
+            }
+        }
+    }
+
+    let header_oldest = &slice[oldest_index.expect("view_headers missing valid header")];
+    assert!(header_newest.view <= log_view);
+    assert!(header_newest.view >= header_oldest.view);
+    assert!(header_newest.op >= header_oldest.op);
+
+    if op < header_oldest.op {
+        return ViewRange {
+            min: 0,
+            max: header_oldest.view,
+        };
+    }
+
+    if op > header_newest.op {
+        return ViewRange {
+            min: log_view,
+            max: log_view,
+        };
+    }
+
+    for header in slice {
+        if dvc_header_type(header) == DvcHeaderType::Valid && header.op == op {
+            return ViewRange {
+                min: header.view,
+                max: header.view,
+            };
+        }
+    }
+
+    let mut header_next = &slice[0];
+    assert!(dvc_header_type(header_next) == DvcHeaderType::Valid);
+
+    for header_prev in &slice[1..] {
+        if dvc_header_type(header_prev) == DvcHeaderType::Valid {
+            if header_prev.op < op && op < header_next.op {
+                return ViewRange {
+                    min: header_prev.view,
+                    max: header_next.view,
+                };
+            }
+            header_next = header_prev;
+        }
+    }
+
+    panic!("view_for_op: no enclosing headers for op {}", op);
 }
 
 /// WAL journal implementing range-locked sector writes.
@@ -1260,7 +1366,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `header` is not a valid `Prepare` header (reserved operation or too small)
     /// - The slot would move backwards (`existing.op > header.op`)
-    #[cfg_attr(not(test), allow(dead_code))]
     fn set_header_as_dirty(&mut self, header: &HeaderPrepare) {
         assert!(matches!(self.status, Status::Recovered));
         assert!(header.command == Command::Prepare);
@@ -1335,7 +1440,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// On failure, the callback is invoked with `None` and **no read I/O is issued**.
     /// This includes cases where the in-memory slot is not inhabited or no exact match exists.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1384,7 +1488,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
     /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
     /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
-    #[cfg_attr(not(test), allow(dead_code))]
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1630,7 +1733,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Recovery reads use `options.op` for chunk/slot identity and do not populate
     /// `options.checksum`.
-    #[allow(dead_code)]
     fn read_recovery_acquire(&mut self, op: u64) -> *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> {
         assert!(matches!(self.status, Status::Recovering { .. }));
         assert!(self.reads.available() > 0);
@@ -1679,7 +1781,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `message` is null or not a non-reserved `Prepare` header
     /// - The header does not exist in memory or a write is already in flight
-    #[cfg_attr(not(test), allow(dead_code))]
     fn write_prepare(
         &mut self,
         callback: WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
