@@ -40,6 +40,8 @@
 //! All pointer manipulation occurs on the same thread; the async storage layer
 //! may complete I/O on a different thread but callbacks run on the main thread.
 
+#![allow(dead_code)]
+
 use core::{cmp::min, mem::MaybeUninit, ptr};
 
 #[allow(unused_imports)]
@@ -432,7 +434,6 @@ enum Writing {
     Slot,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Recovery action to take for a header/prepare pair.
 enum RecoveryDecision {
@@ -452,7 +453,6 @@ enum RecoveryDecision {
     Unreachable,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Matcher for a single boolean parameter in a recovery-case pattern.
 enum Matcher {
@@ -476,26 +476,27 @@ struct RecoveryCase {
     pattern: [Matcher; 11],
 }
 
+/// Classifies view-change headers as either placeholders or real entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DvcHeaderType {
     Blank,
     Valid,
 }
 
+/// Inclusive view bounds used to validate a header's view during recovery.
 #[derive(Debug, Clone, Copy)]
 struct ViewRange {
     min: u32,
     max: u32,
 }
 
-impl VIewRange {
+impl ViewRange {
     #[inline]
     fn contains(self, view: u32) -> bool {
         self.min <= view && view <= self.max
     }
 }
 
-#[allow(dead_code)]
 impl RecoveryCase {
     #[inline]
     const fn decision(&self, solo: bool) -> RecoveryDecision {
@@ -540,13 +541,10 @@ impl RecoveryCase {
 const __: Matcher = Matcher::Any;
 const _0: Matcher = Matcher::IsFalse;
 const _1: Matcher = Matcher::IsTrue;
-#[allow(dead_code)]
 const A0: Matcher = Matcher::AssertFalse;
-#[allow(dead_code)]
 const A1: Matcher = Matcher::AssertTrue;
 
 /// Pseudo-case used when torn prepares are detected during recovery.
-#[allow(dead_code)]
 const CASE_CUT_TORN: RecoveryCase = RecoveryCase {
     label: "@CUT_TORN",
     decision_multiple: RecoveryDecision::CutTorn,
@@ -555,7 +553,6 @@ const CASE_CUT_TORN: RecoveryCase = RecoveryCase {
 };
 
 /// Ordered recovery decision table (first and only match wins).
-#[allow(dead_code)]
 const RECOVERY_CASES: [RecoveryCase; 16] = [
     // @A - both invalid.
     RecoveryCase {
@@ -675,7 +672,6 @@ const RECOVERY_CASES: [RecoveryCase; 16] = [
 ///
 /// `op_max` and `op_prepare_max` describe the current recovery head and are used
 /// to decide when to truncate or repair entries.
-#[allow(dead_code)]
 #[inline]
 fn recovery_case(
     header: Option<HeaderPrepare>,
@@ -731,7 +727,6 @@ fn recovery_case(
 
 /// Returns the header only if it has a valid checksum, command=Prepare, expected cluster,
 /// and resides in the correct slot.
-#[allow(dead_code)]
 #[inline]
 fn header_ok(
     cluster: constants::ClusterId,
@@ -1371,7 +1366,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `header` is not a valid `Prepare` header (reserved operation or too small)
     /// - The slot would move backwards (`existing.op > header.op`)
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test))]
     fn set_header_as_dirty(&mut self, header: &HeaderPrepare) {
         assert!(matches!(self.status, Status::Recovered));
         assert!(header.command == Command::Prepare);
@@ -1446,7 +1441,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// On failure, the callback is invoked with `None` and **no read I/O is issued**.
     /// This includes cases where the in-memory slot is not inhabited or no exact match exists.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test))]
     fn read_prepare(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1495,7 +1490,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// This method enforces read IOP accounting (commit vs repair) to prevent repair reads from
     /// starving commit reads. It may complete inline (no I/O) for header-only prepares.
     /// Full validation happens in `read_prepare_with_op_and_checksum_on_read`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test))]
     fn read_prepare_with_op_and_checksum(
         &mut self,
         callback: ReadPrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
@@ -1741,7 +1736,6 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     ///
     /// Recovery reads use `options.op` for chunk/slot identity and do not populate
     /// `options.checksum`.
-    #[allow(dead_code)]
     fn read_recovery_acquire(&mut self, op: u64) -> *mut Read<S, WRITE_OPS, WRITE_OPS_WORDS> {
         assert!(matches!(self.status, Status::Recovering { .. }));
         assert!(self.reads.available() > 0);
@@ -1790,7 +1784,7 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
     /// - The journal is not in `Status::Recovered`
     /// - `message` is null or not a non-reserved `Prepare` header
     /// - The header does not exist in memory or a write is already in flight
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test))]
     fn write_prepare(
         &mut self,
         callback: WritePrepareCallback<S, WRITE_OPS, WRITE_OPS_WORDS>,
