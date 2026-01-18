@@ -1188,6 +1188,31 @@ impl<S: Storage, const WRITE_OPS: usize, const WRITE_OPS_WORDS: usize>
         // TODO: Kick off recover_headers once the recovery pipeline is implemented.
     }
 
+    fn op_maximum_headers_untrusted_raw(cluster: u128, headers: &[HeaderPrepareRaw]) -> u64 {
+        headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header_raw)| header_ok(cluster, Slot::new(index), header_raw))
+            .filter(|header| header.operation != Operation::RESERVED)
+            .map(|header| header.op)
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn op_maximum_headers_untrusted_prepares(&self, cluster: u128) -> u64 {
+        self.headers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, header)| {
+                let header_raw = header_prepare_as_raw(header);
+                header_ok(cluster, Slot::new(index), header_raw)
+            })
+            .filter(|header| header.operation != Operation::RESERVED)
+            .map(|header| header.op)
+            .max()
+            .unwrap_or(0)
+    }
+
     // ---------------------------------------------------------------------
     // Header chunk tracking (recovery)
     // ---------------------------------------------------------------------
