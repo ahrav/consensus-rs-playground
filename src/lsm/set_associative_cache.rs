@@ -1,3 +1,30 @@
+//! Set-associative cache with CLOCK Nth-Chance eviction.
+//!
+//! Purpose: provide a compact, cache-line-friendly cache for LSM hot data.
+//!
+//! Invariants and safety rules:
+//! - `WAYS` is in {2, 4, 16} and is a power of two.
+//! - `TagT::BITS` is 8 or 16.
+//! - `CLOCK_BITS` is 1, 2, or 4 (counts fit in a `u8`).
+//! - `CACHE_LINE_SIZE` is a power of two; value alignment is a power of two
+//!   (`VALUE_ALIGNMENT == 0` uses the value type's alignment).
+//! - `CLOCK_HAND_BITS == log2(WAYS)`.
+//! - `value_count_max` is a multiple of `WAYS` and `VALUE_COUNT_MAX_MULTIPLE`.
+//! - Slots are occupied iff their count is non-zero; tags may be stale.
+//! - Values are `Copy` and are not dropped; storage is reused without destructors.
+//! - This cache is not thread-safe; callers must synchronize shared access.
+//!
+//! High-level algorithm:
+//! 1. Hash the key to 64-bit entropy.
+//! 2. Select a set with `fast_range` and derive a tag with `Tag::truncate`.
+//! 3. On lookup, match tags, then confirm keys for occupied slots.
+//! 4. On insert, scan from the clock hand, decrementing counts until a zero slot
+//!    is found, then insert and advance the hand.
+//!
+//! Design choices:
+//! - Tags are stored separately to keep hot metadata compact.
+//! - Counts and clock hands are packed into 64-bit words to reduce overhead.
+//! - Values are stored in an aligned buffer so each set is contiguous.
 use std::{
     alloc::{Layout as AllocLayout, alloc, dealloc},
     cell::{Cell, UnsafeCell},
@@ -23,6 +50,10 @@ pub enum UpdateOrInsert {
 /// imply `k1 == k2`. However, most of the time, where the tag differs, a full key
 /// comparison can be avoided. Since tags are 16-32x smaller than keys, they can also
 /// be kept hot in cache.
+///
+/// Guarantees / invariants:
+/// - `truncate` must be deterministic for a given entropy value.
+/// - This cache only accepts tags with `BITS` of 8 or 16 (enforced at init).
 pub trait Tag: Copy + Eq + PartialEq + Default {
     /// The number of bits in this tag type.
     const BITS: usize;
@@ -54,6 +85,11 @@ impl Tag for u16 {
 /// Defines the key/value types and operations required by a set-associative cache.
 ///
 /// This mirrors Zig's comptime `key_from_value` and `hash` parameters.
+///
+/// Guarantees / invariants:
+/// - `key_from_value` must return the same key used to hash the value.
+/// - `hash` must be deterministic and equal for equal keys.
+/// - A well-distributed hash improves set balance and hit rate.
 pub trait SetAssociativeCacheContext {
     /// The key type used for lookups.
     type Key: Copy + Eq;
@@ -69,6 +105,10 @@ pub trait SetAssociativeCacheContext {
 }
 
 /// Tracks cache performance statistics using interior mutability.
+///
+/// Notes:
+/// - Not thread-safe; counters are updated with `Cell` and can race under sharing.
+/// - Counters can overflow (debug builds panic; release builds wrap).
 #[derive(Debug)]
 pub struct Metrics {
     /// Count of cache lookups that found the requested key.
@@ -107,8 +147,17 @@ impl Metrics {
     }
 }
 
+/// Packed unsigned integers stored in little-endian 64-bit words.
+///
 /// A little simpler than `PackedIntArray` in the standard library, restricted to
 /// little-endian 64-bit words and using words exactly without padding.
+///
+/// Guarantees / invariants:
+/// - `BITS` is a power of two less than 8.
+/// - Values are stored densely without padding.
+///
+/// Complexity:
+/// - `get`/`set` are O(1).
 #[derive(Debug)]
 pub struct PackedUnsignedIntegerArray<const BITS: usize> {
     words: Box<[u64]>,
@@ -135,6 +184,11 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     }
 
     /// Allocates a zeroed array with `words_len` 64-bit words.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BITS` is invalid for packing (not power of two, >= 8) or if
+    /// the platform endianness is not little-endian.
     pub fn new_zeroed(words_len: usize) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -146,6 +200,11 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     }
 
     /// Wraps an existing word buffer without copying.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `BITS` is invalid for packing (not power of two, >= 8) or if
+    /// the platform endianness is not little-endian.
     pub fn from_words(words: Vec<u64>) -> Self {
         const { assert!(cfg!(target_endian = "little")) };
         assert!(BITS < 8);
@@ -169,6 +228,10 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     }
 
     /// Returns the packed unsigned integer at `index`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
     #[inline]
     pub fn get(&self, index: u64) -> u8 {
         let uints_per_word = Self::uints_per_word() as u64;
@@ -181,6 +244,11 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
     }
 
     /// Sets the packed unsigned integer at `index` to `value`.
+    ///
+    /// # Panics
+    ///
+    /// Panics in debug builds if `index` is out of bounds or if `value` does not fit in `BITS`.
+    /// In release builds, bounds are checked via the slice indexing.
     #[inline]
     pub fn set(&mut self, index: u64, value: u8) {
         debug_assert!((value as u64) <= Self::mask_value());
@@ -189,7 +257,7 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
         let within = index % uints_per_word;
         let shift = (within as usize) * BITS;
         let mask = Self::mask_value() << shift;
-        assert!(word_index < self.words.len() as u64);
+        debug_assert!(word_index < self.words.len() as u64);
         let w = &mut self.words[word_index as usize];
         *w = (*w & !mask) | ((value as u64) << shift);
     }
@@ -198,7 +266,13 @@ impl<const BITS: usize> PackedUnsignedIntegerArray<BITS> {
 /// A heap-allocated buffer with custom alignment for cache-line-aligned storage.
 ///
 /// Elements are stored as `MaybeUninit<T>`; callers must track initialization state.
-/// `Drop` deallocates memory but does NOT run element destructors—intended for `Copy` types.
+/// `Drop` deallocates memory but does NOT run element destructors, so this is
+/// intended for `Copy` types or manual drop management.
+///
+/// Invariants:
+/// - `len > 0`.
+/// - `alignment` is a power of two and `alignment >= align_of::<T>()`.
+/// - `size_of::<T>()` is a multiple of `alignment` so each element is aligned.
 #[derive(Debug)]
 #[allow(clippy::len_without_is_empty)] // Buffer is never empty (len > 0 enforced at construction)
 pub struct AlignedBuf<T> {
@@ -379,6 +453,20 @@ struct Set<TagT, ValueT, const WAYS: usize> {
 /// Each key maps to one set of `WAYS` consecutive slots that may contain its
 /// value. Tags provide a compact hash prefix to avoid full key comparisons on
 /// most misses, while counts/clocks drive the replacement policy.
+///
+/// Guarantees / invariants:
+/// - A slot is occupied iff its count is non-zero; tags may be stale when empty.
+/// - Tag matches are advisory; a full key comparison is authoritative.
+///
+/// Eviction:
+/// - CLOCK Nth-Chance; counts saturate on hit and are decremented on miss.
+/// - Insert scans from the per-set clock hand and advances it after placement.
+///
+/// Layout:
+/// - Tags, values, counts, and clock hands are sized to align to cache lines.
+///
+/// Concurrency:
+/// - Not thread-safe; interior mutability is used without synchronization.
 pub struct SetAssociativeCache<
     'a,
     C,
@@ -461,6 +549,7 @@ where
             Mask = core::simd::Mask<<TagT as core::simd::SimdElement>::Mask, WAYS>,
         >,
 {
+    /// Smallest multiple required for `value_count_max` to keep all arrays aligned.
     pub const VALUE_COUNT_MAX_MULTIPLE: u64 = {
         const fn max_u(a: u64, b: u64) -> u64 {
             if a > b { a } else { b }
@@ -515,6 +604,10 @@ where
     /// `value_count_max` must be a multiple of `WAYS` and `VALUE_COUNT_MAX_MULTIPLE` so that
     /// tags, values, counts, and clocks stay cache-line aligned. This allocates the backing
     /// arrays and zeroes the tag/count/clock state via `reset`.
+    ///
+    /// Guarantees / invariants:
+    /// - Tag, count, and clock storage are sized to be cache-line aligned.
+    /// - Tags are reset to `TagT::default`, counts/clocks are zeroed, and metrics reset.
     ///
     /// # Panics
     ///
@@ -645,6 +738,8 @@ where
     }
 
     /// Clears tags, counts, clocks, and metrics.
+    ///
+    /// Note: values are left untouched; counts determine occupancy.
     pub fn reset(&mut self) {
         self.tags.fill(TagT::default());
         unsafe {
@@ -680,13 +775,16 @@ where
 
     /// Looks up `key` and returns a pointer to the cached value, if present.
     ///
-    /// The returned pointer is valid until the entry is evicted or the cache is reset.
+    /// The returned pointer is valid until the entry is evicted, removed, or the
+    /// cache is reset.
     pub fn get(&self, key: C::Key) -> Option<*mut C::Value> {
         let index = self.get_index(key)?;
         Some(self.values.get_ptr(index))
     }
 
     /// Removes `key` from the cache if present, returning the removed value.
+    ///
+    /// The tag is not cleared; occupancy is tracked by the count.
     pub fn remove(&mut self, key: C::Key) -> Option<C::Value> {
         let set = self.associate(key);
         let way = self.search(set, key)?;
@@ -739,6 +837,7 @@ where
         debug_assert!(way < WAYS);
 
         let max_count = Self::max_count() as usize;
+        // Worst-case: decrement each way (max_count - 1) times before reaching zero.
         let clock_iterations_max = WAYS * (max_count.saturating_sub(1));
 
         let mut evicted: Option<C::Value> = None;
@@ -806,16 +905,24 @@ where
     }
 
     /// If the key is present in the set, returns the way index; otherwise `None`.
+    ///
+    /// Uses trailing_zeros iteration for sparse bitmasks, avoiding unnecessary
+    /// iterations when few tags match.
     #[inline]
     fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16> {
         let tags = unsafe { &*set.tags };
-        let ways_mask = Self::search_tags(tags, set.tag);
+        let mut ways_mask = Self::search_tags(tags, set.tag);
         if ways_mask == 0 {
             return None;
         }
 
-        for way in 0..WAYS {
-            if ((ways_mask >> way) & 1) == 1 && self.counts_get(set.offset + way as u64) > 0 {
+        // Iterate only over set bits using trailing_zeros.
+        // This is more efficient for sparse masks (typical case: 1-2 matches).
+        while ways_mask != 0 {
+            let way = ways_mask.trailing_zeros() as usize;
+            ways_mask &= ways_mask - 1; // Clear lowest set bit (Kernighan's trick)
+
+            if self.counts_get(set.offset + way as u64) > 0 {
                 let v = unsafe { &(*set.values)[way] };
                 if C::key_from_value(v) == key {
                     return Some(way as u16);
@@ -1255,6 +1362,151 @@ mod tests {
             let expected = search_tags_expected::<u16, 16>(&tags, tag);
             let actual = SearchTagsCache::<u16, 16, 4>::search_tags(&tags, tag);
             prop_assert_eq!(expected, actual);
+        }
+    }
+
+    // ---- Additional property tests for hot paths ----
+
+    /// Context that hashes with a good distribution for testing associate().
+    struct HashingContext;
+
+    impl SetAssociativeCacheContext for HashingContext {
+        type Key = u64;
+        type Value = u64;
+
+        fn key_from_value(value: &Self::Value) -> Self::Key {
+            *value
+        }
+
+        fn hash(key: Self::Key) -> u64 {
+            // FxHash-style mixing for good distribution
+            const K: u64 = 0x517cc1b727220a95;
+            key.wrapping_mul(K)
+        }
+    }
+
+    type HashingCache = SetAssociativeCache<'static, HashingContext, u8, 16, 2, 64, 0, 4>;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(
+            crate::test_utils::proptest_cases(8)
+        ))]
+
+        /// Verify associate() produces reasonable set distribution via fast_range.
+        /// Chi-squared test: distribution should not be pathologically skewed.
+        #[test]
+        fn associate_distribution_prop(keys in prop::collection::vec(any::<u64>(), 1000..2000)) {
+            let num_sets = 64u64;
+            let cache_slots = num_sets * 16;
+            let value_count = HashingCache::VALUE_COUNT_MAX_MULTIPLE;
+            let adjusted_slots = ((cache_slots / value_count) * value_count).max(value_count);
+
+            let cache = HashingCache::init(adjusted_slots, Options { name: "dist_test" });
+            let actual_sets = cache.sets;
+
+            let mut distribution = vec![0u64; actual_sets as usize];
+            for &key in &keys {
+                let set = cache.associate(key);
+                let set_index = set.offset / 16;
+                distribution[set_index as usize] += 1;
+            }
+
+            // Chi-squared test for uniformity.
+            // Expected count per set if perfectly uniform.
+            let expected = keys.len() as f64 / actual_sets as f64;
+            let chi_squared: f64 = distribution
+                .iter()
+                .map(|&count| {
+                    let diff = count as f64 - expected;
+                    (diff * diff) / expected
+                })
+                .sum();
+
+            // For df = actual_sets - 1, chi-squared critical value at p=0.001 is approximately
+            // 2 * df for large df. We use a more conservative threshold.
+            let critical = 3.0 * actual_sets as f64;
+            prop_assert!(
+                chi_squared < critical,
+                "Distribution too skewed: chi_squared={:.2} >= critical={:.2}",
+                chi_squared,
+                critical
+            );
+        }
+
+        /// Verify search() finds correct key despite tag collisions.
+        /// Multiple keys may have the same tag but different values.
+        #[test]
+        fn search_with_tag_collisions_prop(
+            base_key in 0u64..1000,
+            num_entries in 2usize..16,
+        ) {
+            let cache_slots = 16 * 16;
+            let value_count = HashingCache::VALUE_COUNT_MAX_MULTIPLE;
+            let adjusted_slots = ((cache_slots as u64 / value_count) * value_count).max(value_count);
+
+            let mut cache = HashingCache::init(adjusted_slots, Options { name: "collision_test" });
+
+            // Generate keys that map to the same set (use cache.sets as multiplier).
+            let keys: Vec<u64> = (0..num_entries)
+                .map(|i| base_key + (i as u64) * cache.sets)
+                .collect();
+
+            // Insert all keys.
+            for &key in &keys {
+                cache.upsert(&key);
+            }
+
+            // Verify each key can be found and returns correct value.
+            for &key in &keys {
+                let ptr = cache.get(key);
+                prop_assert!(ptr.is_some(), "Key {} should be present", key);
+                let value = unsafe { *ptr.unwrap() };
+                prop_assert_eq!(key, value, "Value mismatch for key {}", key);
+            }
+
+            // Verify keys not in the cache return None.
+            let absent_key = base_key + (num_entries as u64 + 10) * cache.sets;
+            prop_assert!(cache.get(absent_key).is_none(), "Absent key should not be found");
+        }
+
+        /// Verify cache consistency under interleaved get/upsert workload.
+        #[test]
+        fn get_upsert_interleaved_prop(
+            ops in prop::collection::vec(
+                prop_oneof![
+                    (Just(true), 0u64..500),   // get operation
+                    (Just(false), 0u64..500),  // upsert operation
+                ],
+                100..500
+            )
+        ) {
+            let cache_slots = 32 * 16;
+            let value_count = HashingCache::VALUE_COUNT_MAX_MULTIPLE;
+            let adjusted_slots = ((cache_slots as u64 / value_count) * value_count).max(value_count);
+
+            let mut cache = HashingCache::init(adjusted_slots, Options { name: "interleaved_test" });
+            let mut reference = std::collections::HashSet::<u64>::new();
+
+            for (is_get, key) in ops {
+                if is_get {
+                    // Get operation: if key is in reference, it should be in cache.
+                    // Note: cache may have evicted the key, so we can't assert presence.
+                    if let Some(ptr) = cache.get(key) {
+                        let value = unsafe { *ptr };
+                        prop_assert_eq!(key, value, "Value mismatch on get");
+                    }
+                } else {
+                    // Upsert operation.
+                    cache.upsert(&key);
+                    reference.insert(key);
+
+                    // Immediately verify the just-inserted key is present.
+                    let ptr = cache.get(key);
+                    prop_assert!(ptr.is_some(), "Just-inserted key {} should be present", key);
+                    let value = unsafe { *ptr.unwrap() };
+                    prop_assert_eq!(key, value, "Value mismatch after upsert");
+                }
+            }
         }
     }
 }

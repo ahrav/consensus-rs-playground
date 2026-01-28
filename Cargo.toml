@@ -30,3 +30,7 @@ tempfile = "3"
 [[bench]]
 name = "binary_search"
 harness = false
+
+[[bench]]
+name = "set_associative_cache"
+harness = false
