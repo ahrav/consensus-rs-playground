@@ -1,10 +1,33 @@
+//! Fast range reduction via multiply-high.
+//!
+//! Purpose: map a 64-bit word into `[0, p)` cheaply without division.
+//!
+//! Invariants:
+//! - Callers must pass `p > 0`.
+//! - This is not equivalent to `% p` for non-uniform inputs.
+//!
+//! Algorithm:
+//! - Compute `((word as u128) * (p as u128)) >> 64` (high 64 bits of the product).
+//!
+//! Design notes:
+//! - For uniform 64-bit input, outputs are close to uniform; there can be slight
+//!   bias unless `p` divides `2^64`.
+//! - For `p` that is a power of two, this is exactly the top `log2(p)` bits.
+//!
+//! References:
+//! - https://github.com/lemire/fastrange/
+//! - https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
+///
 /// Fast alternative to modulo reduction (note: it is not the same as modulo).
 ///
-/// The returned value is always in `[0, p)` when `p > 0`. This is best used with
-/// uniformly distributed 64-bit inputs, such as hashes or PRNG output.
+/// Guarantees:
+/// - Returns a value in `[0, p)` when `p > 0`.
 ///
-/// See: https://github.com/lemire/fastrange/ and
-/// https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
+/// Preconditions:
+/// - `p > 0`. This is enforced with a `debug_assert!`.
+///
+/// Complexity:
+/// - O(1), branch-free aside from the debug assertion.
 ///
 /// # Examples
 /// ```
