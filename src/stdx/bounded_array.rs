@@ -21,7 +21,12 @@ const fn assert_valid_capacity<T, const N: usize>() {
     assert!(N <= isize::MAX as usize);
     let elem_size = core::mem::size_of::<T>();
     if elem_size != 0 {
-        assert!(N <= (isize::MAX as usize) / elem_size);
+        let max = isize::MAX as usize;
+        let bytes = match N.checked_mul(elem_size) {
+            Some(bytes) => bytes,
+            None => panic!("capacity overflow"),
+        };
+        assert!(bytes <= max);
     }
 }
 
