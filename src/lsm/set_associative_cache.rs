@@ -905,17 +905,24 @@ where
     }
 
     /// If the key is present in the set, returns the way index; otherwise `None`.
+    ///
+    /// Uses trailing_zeros iteration for sparse bitmasks, avoiding unnecessary
+    /// iterations when few tags match.
     #[inline]
     fn search(&self, set: Set<TagT, C::Value, WAYS>, key: C::Key) -> Option<u16> {
         let tags = unsafe { &*set.tags };
-        let ways_mask = Self::search_tags(tags, set.tag);
+        let mut ways_mask = Self::search_tags(tags, set.tag);
         if ways_mask == 0 {
             return None;
         }
 
-        // OLD: Linear iteration over all WAYS
-        for way in 0..WAYS {
-            if ((ways_mask >> way) & 1) == 1 && self.counts_get(set.offset + way as u64) > 0 {
+        // Iterate only over set bits using trailing_zeros.
+        // This is more efficient for sparse masks (typical case: 1-2 matches).
+        while ways_mask != 0 {
+            let way = ways_mask.trailing_zeros() as usize;
+            ways_mask &= ways_mask - 1; // Clear lowest set bit (Kernighan's trick)
+
+            if self.counts_get(set.offset + way as u64) > 0 {
                 let v = unsafe { &(*set.values)[way] };
                 if C::key_from_value(v) == key {
                     return Some(way as u16);
